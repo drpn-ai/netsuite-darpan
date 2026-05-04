@@ -6,6 +6,7 @@
 3. Create Script Deployment and capture URL, script ID, deployment ID.
 4. Assign integration role permissions for required inventory/transaction reads.
 5. Configure Darpan `NsAuthConfig` + `NsRestletConfig` for sandbox.
+6. Run `./gradlew loadDarpanData` from `darpan-backend` after deploying setup seed changes so the `netsuite-seed` reader type loads after the Darpan setup data.
 
 ## Sandbox Validation
 1. Run 1-pair request.

@@ -5,7 +5,9 @@
         <description>Reusable NetSuite authentication profile shared by one or more endpoint configs.</description>
         <field name="nsAuthConfigId" type="id" is-pk="true"/>
         <field name="description" type="text-medium"/>
-        <field name="authType" type="text-short" default="NONE"/>
+        <field name="companyUserGroupId" type="id"/>
+        <field name="createdByUserId" type="id"/>
+        <field name="authType" type="text-short" default="'NONE'"/>
         <field name="username" type="text-medium"/>
         <field name="password" type="text-medium" encrypt="true"/>
         <field name="apiToken" type="text-long" encrypt="true"/>
@@ -13,23 +15,29 @@
         <field name="clientId" type="text-medium"/>
         <field name="certId" type="text-medium"/>
         <field name="privateKeyPem" type="text-long" encrypt="true"/>
-        <field name="scope" type="text-medium" default="restlets rest_webservices"/>
-        <field name="isActive" type="text-indicator" default="Y"/>
+        <field name="scope" type="text-medium" default="'restlets rest_webservices'"/>
+        <field name="isActive" type="text-indicator" default="'Y'"/>
+
+        <relationship type="one" title="Company" related="moqui.security.UserGroup">
+            <key-map field-name="companyUserGroupId" related-field-name="userGroupId"/>
+        </relationship>
     </entity>
 
     <entity entity-name="NsRestletConfig" package="darpan.reconciliation" use="configuration">
         <description>NetSuite Restlet endpoint settings for inventory reconciliation.</description>
         <field name="nsRestletConfigId" type="id" is-pk="true"/>
         <field name="description" type="text-medium"/>
+        <field name="companyUserGroupId" type="id"/>
+        <field name="createdByUserId" type="id"/>
         <field name="endpointUrl" type="text-long" cannot-be-null="true"/>
-        <field name="httpMethod" type="text-short" default="POST"/>
+        <field name="httpMethod" type="text-short" default="'POST'"/>
         <field name="nsAuthConfigId" type="id"/>
         <field name="headersJson" type="text-long"/>
         <field name="connectTimeoutSeconds" type="number-integer" default="30"/>
         <field name="readTimeoutSeconds" type="number-integer" default="60"/>
-        <field name="isActive" type="text-indicator" default="Y"/>
+        <field name="isActive" type="text-indicator" default="'Y'"/>
 
-        <field name="authType" type="text-short" default="NONE"/>
+        <field name="authType" type="text-short" default="'NONE'"/>
         <field name="username" type="text-medium"/>
         <field name="password" type="text-medium" encrypt="true"/>
         <field name="apiToken" type="text-long" encrypt="true"/>
@@ -37,8 +45,11 @@
         <field name="clientId" type="text-medium"/>
         <field name="certId" type="text-medium"/>
         <field name="privateKeyPem" type="text-long" encrypt="true"/>
-        <field name="scope" type="text-medium" default="restlets rest_webservices"/>
+        <field name="scope" type="text-medium" default="'restlets rest_webservices'"/>
 
+        <relationship type="one" title="Company" related="moqui.security.UserGroup">
+            <key-map field-name="companyUserGroupId" related-field-name="userGroupId"/>
+        </relationship>
         <relationship type="one" related="darpan.reconciliation.NsAuthConfig">
             <key-map field-name="nsAuthConfigId"/>
         </relationship>

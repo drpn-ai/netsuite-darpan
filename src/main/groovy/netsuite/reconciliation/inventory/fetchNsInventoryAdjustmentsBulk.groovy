@@ -455,6 +455,43 @@ if (normalize(responseBody)) {
     }
 }
 
+def normalizeTxId = { Map tx ->
+    return normalize(tx.id ?: tx.internalid ?: tx.internalId ?: tx.transactionId ?: tx.tranInternalId)
+}
+
+def normalizeTranId = { Map tx ->
+    return normalize(tx.tranid ?: tx.tranId ?: tx.transactionNumber ?: tx.docnum ?: tx.documentNumber ?: tx.tran_num)
+}
+
+def normalizeNsRecordList = { List rawRecords, String fallbackItemId, String fallbackLocationId ->
+    List<Map> normalizedRecords = []
+    (rawRecords ?: []).each { Object recordObj ->
+        if (!(recordObj instanceof Map)) return
+        Map record = new LinkedHashMap((Map) recordObj)
+        Map tx = (record.transaction instanceof Map) ? new LinkedHashMap((Map) record.transaction) : new LinkedHashMap(record)
+
+        String txId = normalizeTxId(tx)
+        String tranId = normalizeTranId(tx)
+        String txType = normalize(tx.type ?: tx.transactionType ?: tx.recordType)
+        String txDate = normalize(tx.date ?: tx.transactionDate ?: tx.trandate ?: tx.trxDate ?: tx.effectiveDate ?: tx.createdAt)
+        String txQty = normalize(tx.qty ?: tx.quantity ?: tx.adjustmentQty ?: tx.qtyDelta)
+
+        if (txId) tx.id = txId
+        if (tranId) tx.tranid = tranId
+        if (txType) tx.type = txType
+        if (txDate) tx.date = txDate
+        if (txQty) tx.qty = txQty
+        if (!normalize(tx.itemId) && fallbackItemId) tx.itemId = fallbackItemId
+        if (!normalize(tx.locationId) && fallbackLocationId) tx.locationId = fallbackLocationId
+
+        record.transaction = tx
+        if (!normalize(record.itemId) && fallbackItemId) record.itemId = fallbackItemId
+        if (!normalize(record.locationId) && fallbackLocationId) record.locationId = fallbackLocationId
+        normalizedRecords << record
+    }
+    return normalizedRecords
+}
+
 def buildResult = { Map pair, Map candidate ->
     Map out = [
             pairId      : pair.pairId,
@@ -487,9 +524,9 @@ def buildResult = { Map pair, Map candidate ->
         if (!(recordObj instanceof List)) recordObj = candidate.results
         if (!(recordObj instanceof List)) recordObj = candidate.items
         if (recordObj instanceof List) {
-            out.records = (List) recordObj
+            out.records = normalizeNsRecordList((List) recordObj, out.itemId, out.locationId)
         } else if (candidate.containsKey("transaction")) {
-            out.records = [[transaction: candidate.transaction]]
+            out.records = normalizeNsRecordList([[transaction: candidate.transaction]], out.itemId, out.locationId)
         }
         if (candidate.recordCount != null) {
             try {

@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
-    <service verb="fetch" noun="NsInventoryAdjustments" type="script" allow-remote="false"
-            location="component://netsuite-darpan/src/main/groovy/netsuite/reconciliation/inventory/fetchNsInventoryAdjustments.groovy">
+    <service verb="fetch" noun="NsInventoryAdjustments" allow-remote="false">
+        <description>Fetch inventory adjustment details for one item/location by delegating to the bulk NetSuite Restlet service.</description>
         <in-parameters>
             <parameter name="nsRestletConfigId" required="true"/>
             <parameter name="itemId" required="true"/>
@@ -17,10 +17,38 @@
             <parameter name="responseBody"/>
             <parameter name="processingWarnings"><parameter name="warningMessage"/></parameter>
         </out-parameters>
+        <actions>
+            <set field="pairItemId" from="darpan.facade.common.FacadeSupport.normalize(itemId)"/>
+            <set field="pairLocationId" from="darpan.facade.common.FacadeSupport.normalize(locationId)"/>
+            <if condition="!pairItemId">
+                <return error="true" message="itemId is required"/>
+            </if>
+            <if condition="!pairLocationId">
+                <return error="true" message="locationId is required"/>
+            </if>
+            <service-call name="reconciliation.NetSuiteInventoryServices.fetch#NsInventoryAdjustmentsBulk"
+                    in-map="[nsRestletConfigId: nsRestletConfigId, itemPairs: [[pairId: 'single', itemId: pairItemId, locationId: pairLocationId]], from: from, to: to, strictMaxPairs: true]" out-map="bulkOut"/>
+            <set field="statusCode" from="bulkOut.statusCode"/>
+            <set field="responseBody" from="bulkOut.responseBody"/>
+            <set field="processingWarnings" from="bulkOut.processingWarnings ?: []"/>
+            <set field="pairResultsList" from="(bulkOut.pairResults ?: []) as List"/>
+            <set field="firstResult" from="pairResultsList.find { Map r -> darpan.facade.common.FacadeSupport.normalize(r?.itemId) == pairItemId &amp;&amp; darpan.facade.common.FacadeSupport.normalize(r?.locationId) == pairLocationId }"/>
+            <if condition="!firstResult &amp;&amp; pairResultsList">
+                <set field="firstResult" from="pairResultsList.find { true }"/>
+            </if>
+            <if condition="firstResult?.status == 'ERROR'">
+                <return error="true" message="NetSuite restlet response error: ${darpan.facade.common.FacadeSupport.normalize(firstResult.errorMessage) ?: darpan.facade.common.FacadeSupport.normalize(firstResult.error) ?: 'Unknown NetSuite pair error'}"/>
+            </if>
+            <set field="pairRecords" from="(firstResult?.records ?: []) as List"/>
+            <set field="records" from="pairRecords.collect { [record: it] }"/>
+            <set field="recordCount" from="records.size()"/>
+            <log level="info" message="NetSuite single-pair fetch delegated to bulk service config=${darpan.facade.common.FacadeSupport.normalize(nsRestletConfigId)} itemId=${pairItemId} locationId=${pairLocationId} records=${recordCount}"/>
+        </actions>
     </service>
 
     <service verb="fetch" noun="NsInventoryAdjustmentsBulk" type="script" allow-remote="false"
             location="component://netsuite-darpan/src/main/groovy/netsuite/reconciliation/inventory/fetchNsInventoryAdjustmentsBulk.groovy">
+        <description>Fetch inventory adjustment details for one or more item/location pairs from the configured NetSuite Restlet endpoint.</description>
         <in-parameters>
             <parameter name="nsRestletConfigId" required="true"/>
             <parameter name="itemPairs" required="true" type="List"/>
@@ -40,6 +68,9 @@
     </service>
 
     <service verb="retrieve" noun="InventoryAdjustmentsByReference" type="script" allow-remote="false"
-            location="component://netsuite-darpan/src/main/groovy/netsuite/reconciliation/inventory/retrieveInventoryAdjustmentsByReference.groovy"/>
+            location="component://netsuite-darpan/src/main/groovy/netsuite/reconciliation/inventory/retrieveInventoryAdjustmentsByReference.groovy">
+        <description>Bulk/chunked reconciliation orchestration with optional persisted NetSuite payload reuse.</description>
+        <implements service="reconciliation.ReconciliationInventoryServices.retrieve#InventoryAdjustmentsByReference"/>
+    </service>
 
 </services>
