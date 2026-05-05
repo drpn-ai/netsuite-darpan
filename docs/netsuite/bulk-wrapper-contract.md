@@ -1,19 +1,13 @@
-# Bulk Wrapper Contract: NetSuite Inventory Retrieval
+# Bulk Contract: NetSuite Inventory Retrieval
 
 ## Overview
-- The public `reconciliation.ReconciliationInventoryServices.fetch#NsInventoryAdjustmentsBulk` verb is a thin wrapper that proxies all input/output attributes to `reconciliation.NetSuiteInventoryServices.fetch#NsInventoryAdjustmentsBulk` inside the `netsuite-darpan` component. This wrapper keeps the public service name stable for any consumer, even though the implementation moved to a dedicated component.
-- The bulk implementation enforces deterministic chunking, backoff-aware retries, and telemetry so that downstream reconciliation flows can reason about the NetSuite ingestion health.
+- The public NetSuite inventory retrieval surface is `reconciliation.NetSuiteInventoryServices.*` inside the `netsuite-darpan` component.
+- The bulk implementation enforces deterministic chunking, backoff-aware retries, and telemetry so that downstream reconciliation flows can reason about NetSuite ingestion health.
 
 ## Service contracts
-### Wrapper (`darpan`)
 | Name | Location | Description |
 | --- | --- | --- |
-| `reconciliation.ReconciliationInventoryServices.fetch#NsInventoryAdjustmentsBulk` | `component://darpan/service/reconciliation/ReconciliationInventoryServices.xml` + `darpan/src/main/groovy/darpan/reconciliation/inventory/fetchNsInventoryAdjustmentsBulk.groovy` | Mirrors every input/output parameter and simply forwards the call to `reconciliation.NetSuiteInventoryServices.fetch#NsInventoryAdjustmentsBulk` so existing callers stay untouched. |
-
-### Implementation (`netsuite-darpan`)
-| Name | Location | Description |
-| --- | --- | --- |
-| `reconciliation.NetSuiteInventoryServices.fetch#NsInventoryAdjustmentsBulk` | `component://netsuite-darpan/service/reconciliation/NetSuiteInventoryServices.xml` + `netsuite/reconciliation/inventory/fetchNsInventoryAdjustmentsBulk.groovy` | Handles RESTlet authentication, validates `NsRestletConfig`, and surfaces bulk results (`pairResults`, `totalPairs`, `successPairCount`, `failedPairCount`, etc.) back to the wrapper. |
+| `reconciliation.NetSuiteInventoryServices.fetch#NsInventoryAdjustmentsBulk` | `component://netsuite-darpan/service/reconciliation/NetSuiteInventoryServices.xml` + `netsuite/reconciliation/inventory/fetchNsInventoryAdjustmentsBulk.groovy` | Handles Restlet authentication, validates `NsRestletConfig`, and surfaces bulk results (`pairResults`, `totalPairs`, `successPairCount`, `failedPairCount`, etc.) to callers. |
 
 ### Inputs
 - `nsRestletConfigId`, `itemPairs`, `from`, `to` (required). `itemPairs` must include `pairId`, `itemId`, and `locationId` for each entry.
@@ -21,7 +15,7 @@
 
 ### Outputs
 - `statusCode`, `totalPairs`, `successPairCount`, `failedPairCount`, and a `pairResults` list where each entry pulls `status`, `records`, `errorCode`, `errorMessage`, and `retryable` flags from NetSuite.
-- `processingWarnings` surfaces implementation-side diagnostics (headers, JWT notes, chunk retries) so the caller can capture the same warnings that were emitted by the wrapper.
+- `processingWarnings` surfaces implementation-side diagnostics (headers, JWT notes, chunk retries) for the caller.
 
 ## Deterministic chunking algorithm
 - Chunk size is configurable via `nsChunkSize` but capped between 1 and 100. The default is 100 to stay within NetSuite request limits while maximizing throughput.
@@ -42,4 +36,4 @@
 | Chunk boundary (≤100 pairs) | Ensure single-chunk execution and success without exceeding NetSuite limits. | `nsChunkCount == 1`, `failedCount == 0`, `pairResults.size() == input pairs`, `summary` has no chunk failure entries. |
 | Multi-chunk determinism (>100 pairs) | Verify that chunk ordering matches sorted `<itemId, locationId>` order and that chunk indexes are sequential. | `itemResults` order matches the sorted source, `nsChunkResults[*].chunkIndex` is contiguous, and `nsChunkResults[*].pairCount == chunk size except final chunk`. |
 | Retry/backoff exercise | Force a retryable HTTP failure (e.g., transient 5xx) on a chunk and confirm `nsTotalRetryCount` increments and `nsChunkResults` captures multiple attempts with `status` eventually `SUCCESS` or `FAILED`. | `nsTotalRetryCount >= 1`, last `nsChunkResults` entry `attempts > 1`, backoff interval honored (observed via log timestamps). |
-| Telemetry parity | Confirm the wrapper surfaces the same chunk metadata for downstream DIFF / truth-set comparisons. | Summary JSON contains `nsChunkResults`, `nsChunkSuccessCount`, `nsChunkFailureCount`, and each `itemResults` row includes `_matchedRuleIds` plus the reason fields described in the [rule explainability contract](../../../darpan/docs/reconciliation/rule-explainability.md). |
+| Telemetry parity | Confirm the retrieve service surfaces chunk metadata for downstream DIFF / truth-set comparisons. | Summary JSON contains `nsChunkResults`, `nsChunkSuccessCount`, `nsChunkFailureCount`, and each `itemResults` row includes `_matchedRuleIds` plus the reason fields described in the [rule explainability contract](../../../darpan/docs/reconciliation/rule-explainability.md). |

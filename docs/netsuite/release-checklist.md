@@ -13,7 +13,7 @@
 2. Run 100-pair request.
 3. Validate pair-level error response shape.
 4. Validate auth failure handling.
-5. Validate retry behavior from Darpan wrapper for transient failures.
+5. Validate retry behavior from the `NetSuiteInventoryServices` retrieve path for transient failures.
 
 ## Production Promotion
 1. Tag `netsuite-darpan` release.

@@ -70,7 +70,106 @@
     <service verb="retrieve" noun="InventoryAdjustmentsByReference" type="script" allow-remote="false"
             location="component://netsuite-darpan/src/main/groovy/netsuite/reconciliation/inventory/retrieveInventoryAdjustmentsByReference.groovy">
         <description>Bulk/chunked reconciliation orchestration with optional persisted NetSuite payload reuse.</description>
-        <implements service="reconciliation.ReconciliationInventoryServices.retrieve#InventoryAdjustmentsByReference"/>
+        <in-parameters>
+            <parameter name="referenceFileLocation" required="true">
+                <description>Discrepancy/reference CSV or JSON file location.</description>
+            </parameter>
+            <parameter name="omsDetailFileLocation" required="true">
+                <description>OMS detail CSV or JSON file location used for the second side of the comparison.</description>
+            </parameter>
+            <parameter name="referenceFileType">
+                <description>CSV or JSON. When empty, inferred from referenceFileLocation.</description>
+            </parameter>
+            <parameter name="omsDetailFileType">
+                <description>CSV or JSON. When empty, inferred from omsDetailFileLocation.</description>
+            </parameter>
+            <parameter name="referenceHasHeader" type="Boolean" default-value="true"/>
+            <parameter name="omsDetailHasHeader" type="Boolean" default-value="true"/>
+            <parameter name="itemIdField" default-value="itemId"/>
+            <parameter name="locationIdField" default-value="locationId"/>
+            <parameter name="discrepancyNsItemIdField"/>
+            <parameter name="discrepancyLocationIdField"/>
+            <parameter name="nsItemIdField"/>
+            <parameter name="nsLocationIdField"/>
+            <parameter name="omsItemIdField" default-value="itemId"/>
+            <parameter name="omsLocationIdField" default-value="locationId"/>
+            <parameter name="omsTxnDateField"/>
+            <parameter name="omsQuantityField"/>
+            <parameter name="omsSupplementalDirLocation" default-value="runtime://tmp/reconciliation/inventory/input/oms-supplemental"/>
+            <parameter name="omsSupplementalHasHeader" type="Boolean" default-value="true"/>
+            <parameter name="from" required="true">
+                <description>Start date in yyyy-MM-dd format.</description>
+            </parameter>
+            <parameter name="to" required="true">
+                <description>End date in yyyy-MM-dd format.</description>
+            </parameter>
+            <parameter name="nsRestletConfigId" required="true"/>
+            <parameter name="persistedNsOutputLocation">
+                <description>Optional prior NS output JSON to reuse instead of fetching all pairs again.</description>
+            </parameter>
+            <parameter name="fetchMissingNsPairs" type="Boolean" default-value="false"/>
+            <parameter name="comparisonRuleSetId" required="true">
+                <description>Drools RuleSet ID used for comparison classification.</description>
+            </parameter>
+            <parameter name="compareStatusField" default-value="compareStatus"/>
+            <parameter name="reasonCodeField" default-value="reasonCode"/>
+            <parameter name="reasonTextField" default-value="reasonText"/>
+            <parameter name="matchedRuleIdsField" default-value="_matchedRuleIds"/>
+            <parameter name="missingInNsStatus" default-value="MISSING_IN_NS"/>
+            <parameter name="missingInReadDbStatus" default-value="MISSING_IN_READ_DB"/>
+            <parameter name="countMismatchStatus" default-value="COUNT_MISMATCH"/>
+            <parameter name="matchedStatus" default-value="MATCHED_COUNT"/>
+            <parameter name="noRecordStatus" default-value="NO_RECORDS"/>
+            <parameter name="errorStatus" default-value="ERROR"/>
+            <parameter name="maxItems" type="Integer"/>
+            <parameter name="nsChunkSize" type="Integer" default-value="100"/>
+            <parameter name="nsMaxRetries" type="Integer" default-value="2"/>
+            <parameter name="nsRetryBackoffMs" type="Integer" default-value="1000"/>
+            <parameter name="nsBackoffMultiplier" type="BigDecimal" default-value="2.0"/>
+            <parameter name="continueOnNsChunkFailure" type="Boolean" default-value="true"/>
+            <parameter name="nsDelayMs" type="Integer" default-value="0"/>
+            <parameter name="runId"/>
+            <parameter name="nsDetailCacheLocation"/>
+            <parameter name="forceRefreshNsDetails" type="Boolean" default-value="false"/>
+            <parameter name="outputLocation" default-value="runtime://tmp/reconciliation/inventory/retrieval"/>
+            <parameter name="outputBaseName" default-value="inventory-adjustments"/>
+            <parameter name="sparkMaster" default-value="local[*]"/>
+            <parameter name="sparkAppName" default-value="InventoryReferenceRetrieval"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="runId"/>
+            <parameter name="referenceItemCount" type="Integer"/>
+            <parameter name="processedItemCount" type="Integer"/>
+            <parameter name="nsRecordCount" type="Integer"/>
+            <parameter name="readDbRecordCount" type="Integer"/>
+            <parameter name="missingInNsCount" type="Integer"/>
+            <parameter name="missingInReadDbCount" type="Integer"/>
+            <parameter name="countMismatchCount" type="Integer"/>
+            <parameter name="matchedCount" type="Integer"/>
+            <parameter name="noRecordCount" type="Integer"/>
+            <parameter name="errorItemCount" type="Integer"/>
+            <parameter name="explainedItemCount" type="Integer"/>
+            <parameter name="unexplainedItemCount" type="Integer"/>
+            <parameter name="strictCycleConfirmedCount" type="Integer"/>
+            <parameter name="strictCycleGuardReclassifiedCount" type="Integer"/>
+            <parameter name="nsChunkCount" type="Integer"/>
+            <parameter name="nsChunkSuccessCount" type="Integer"/>
+            <parameter name="nsChunkFailureCount" type="Integer"/>
+            <parameter name="nsTotalRetryCount" type="Integer"/>
+            <parameter name="nsDetailCacheHitCount" type="Integer"/>
+            <parameter name="nsDetailComputedCount" type="Integer"/>
+            <parameter name="nsDetailErrorCount" type="Integer"/>
+            <parameter name="nsDataSource"/>
+            <parameter name="nsChunkResults"><parameter name="nsChunkResult"/></parameter>
+            <parameter name="reasonCounts"><parameter name="reasonCount"/></parameter>
+            <parameter name="summaryLocation"/>
+            <parameter name="nsOutputLocation"/>
+            <parameter name="nsDetailOutputLocation"/>
+            <parameter name="readDbOutputLocation"/>
+            <parameter name="reviewCsvLocation"/>
+            <parameter name="itemResults"><parameter name="itemResult"/></parameter>
+            <parameter name="processingWarnings"><parameter name="warningMessage"/></parameter>
+        </out-parameters>
     </service>
 
 </services>

@@ -51,10 +51,10 @@ Rules:
 ```
 
 ## Failure Taxonomy
-- Validation/config/auth failures: fail HTTP call (wrapper retries only if transient transport/http).
+- Validation/config/auth failures: fail the HTTP call; callers should retry only transient transport/HTTP failures.
 - Pair-level business failures: return `status=ERROR` in `results[]`; do not fail entire response.
 
-## Wrapper Expectations
-- Darpan chunks deterministically (sorted pairs, max 100).
-- Darpan retries transient chunk failures with backoff.
-- Darpan persists per-chunk telemetry and per-pair results in output files.
+## Caller Expectations
+- `NetSuiteInventoryServices.retrieve#InventoryAdjustmentsByReference` chunks deterministically (sorted pairs, max 100).
+- The retrieve service retries transient chunk failures with backoff.
+- The retrieve service persists per-chunk telemetry and per-pair results in output files.

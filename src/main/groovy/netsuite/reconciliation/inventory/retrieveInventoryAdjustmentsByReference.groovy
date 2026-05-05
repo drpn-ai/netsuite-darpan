@@ -326,18 +326,6 @@ def rowMatchesItemFacilityScope = { Map rowMap, Set<String> itemCandidates, Set<
 
 String refLocation = normalize(referenceFileLocation)
 String omsDetailLocation = normalize(omsDetailFileLocation)
-boolean twoCsvMode = !!omsDetailLocation
-
-if (!twoCsvMode) {
-    Map legacyInMap = [:]
-    context.each { k, v -> if (!(k in ["context", "ec"])) legacyInMap[k] = v }
-    Map legacyOut = ec.service.sync()
-            .name("reconciliation.ReconciliationInventoryServices.retrieve#InventoryAdjustmentsByReferenceLegacy")
-            .parameters(legacyInMap)
-            .call()
-    (legacyOut ?: [:]).each { k, v -> this."${k}" = v }
-    return
-}
 
 String refTypeRaw = normalize(referenceFileType)
 boolean refHasHeader = (referenceHasHeader != null) ? (referenceHasHeader as Boolean) : true
@@ -939,7 +927,7 @@ try {
     }
 
     Map ruleOut = ec.service.sync()
-            .name("reconciliation.ReconciliationInventoryServices.evaluate#InventoryAdjustmentComparisonRules")
+            .name("reconciliation.ReconciliationRuleEngineServices.execute#RuleSet")
             .parameters([
                     ruleSetId     : comparisonRuleSetIdToUse,
                     dataList      : itemResultRows,
@@ -969,9 +957,9 @@ try {
 
     Map<String, Map> nsSecondaryDetailCacheByPair = [:]
     Map<String, Map> nsSecondaryDetailByPair = [:]
-    int nsDetailCacheHitCount = 0
-    int nsDetailComputedCount = 0
-    int nsDetailErrorCount = 0
+    int nsDetailCacheHitCountValue = 0
+    int nsDetailComputedCountValue = 0
+    int nsDetailErrorCountValue = 0
     String nsDetailDataSourceValue = "DERIVED_PRIMARY"
 
     if (nsDetailCacheLocationValue && !forceRefreshNsDetailsEnabled) {
@@ -1007,15 +995,15 @@ try {
                 warningList.add("Loaded NS secondary detail cache from ${nsDetailCacheLocationValue} for ${nsSecondaryDetailCacheByPair.size()} pair(s).")
             }
         } catch (Exception e) {
-            nsDetailErrorCount++
+            nsDetailErrorCountValue++
             warningList.add("Unable to parse nsDetailCacheLocation ${nsDetailCacheLocationValue}: ${normalize(e.message) ?: e.class.simpleName}")
         }
     } else if (nsDetailCacheLocationValue && forceRefreshNsDetailsEnabled) {
         warningList.add("forceRefreshNsDetails=true; ignoring nsDetailCacheLocation ${nsDetailCacheLocationValue}.")
     }
 
-    int strictCycleGuardReclassifiedCount = 0
-    int strictCycleConfirmedCount = 0
+    int strictCycleGuardReclassifiedCountValue = 0
+    int strictCycleConfirmedCountValue = 0
     ruledRows.each { Map row ->
         String statusValue = normalize(row[compareStatusFieldName])
         if (!normalize(row[reasonCodeFieldName]) && statusValue) {
@@ -1100,7 +1088,7 @@ try {
         Map nsSecondaryDetails
         if (cachedSecondary instanceof Map) {
             nsSecondaryDetails = new LinkedHashMap((Map) cachedSecondary)
-            nsDetailCacheHitCount++
+            nsDetailCacheHitCountValue++
         } else {
             nsSecondaryDetails = [
                     pairId              : rowPairId,
@@ -1133,7 +1121,7 @@ try {
                         ]
                     }
             ]
-            nsDetailComputedCount++
+            nsDetailComputedCountValue++
         }
         row.nsSecondaryDetails = nsSecondaryDetails
         if (rowPairId) nsSecondaryDetailByPair[rowPairId] = nsSecondaryDetails
@@ -1664,6 +1652,11 @@ try {
     nsTotalRetryCount = totalRetries
     nsDataSource = nsDataSourceValue
     nsChunkResults = nsChunkResultsList
+    strictCycleConfirmedCount = strictCycleConfirmedCountValue
+    strictCycleGuardReclassifiedCount = strictCycleGuardReclassifiedCountValue
+    nsDetailCacheHitCount = nsDetailCacheHitCountValue
+    nsDetailComputedCount = nsDetailComputedCountValue
+    nsDetailErrorCount = nsDetailErrorCountValue
 
     String outputBaseLocation = normalize(outputLocation) ?: "runtime://tmp/reconciliation/inventory/retrieval"
     def outputRef = ec.resource.getLocationReference(outputBaseLocation)
@@ -1886,15 +1879,15 @@ try {
                     explainedItemCount   : explainedItemCount,
                     unexplainedItemCount : unexplainedItemCount,
                     reasonCounts         : reasonCounts,
-                    strictCycleConfirmedCount: strictCycleConfirmedCount,
-                    strictCycleGuardReclassifiedCount: strictCycleGuardReclassifiedCount,
+                    strictCycleConfirmedCount: strictCycleConfirmedCountValue,
+                    strictCycleGuardReclassifiedCount: strictCycleGuardReclassifiedCountValue,
                     nsChunkCount         : nsChunkCount,
                     nsChunkSuccessCount  : nsChunkSuccessCount,
                     nsChunkFailureCount  : nsChunkFailureCount,
                     nsTotalRetryCount    : nsTotalRetryCount,
-                    nsDetailCacheHitCount: nsDetailCacheHitCount,
-                    nsDetailComputedCount: nsDetailComputedCount,
-                    nsDetailErrorCount   : nsDetailErrorCount
+                    nsDetailCacheHitCount: nsDetailCacheHitCountValue,
+                    nsDetailComputedCount: nsDetailComputedCountValue,
+                    nsDetailErrorCount   : nsDetailErrorCountValue
             ],
             nsChunkResults: nsChunkResultsList,
             reviewRows: reviewRows,
