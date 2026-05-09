@@ -48,6 +48,13 @@ def toDecimal = { Object value ->
     }
 }
 def warningList = [] as List<String>
+List<Map> dateFormats = [
+        [formatter: DateTimeFormatter.ofPattern("yyyy-MM-dd"), hasTime: false],
+        [formatter: DateTimeFormatter.ofPattern("M/d/yyyy"), hasTime: false],
+        [formatter: DateTimeFormatter.ofPattern("M/d/yy"), hasTime: false],
+        [formatter: DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"), hasTime: true],
+        [formatter: DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"), hasTime: true]
+]
 
 def detectFileTypeFromLocation = { String location ->
     String lower = location?.toLowerCase()
@@ -114,10 +121,6 @@ def collectDistinctValues = { List<Map> rows, String fieldName, int limit ->
     }
     List<String> valueList = new ArrayList<>(values)
     return valueList.take(limit)
-}
-
-def hasOmsSignal = { List<Map> rows, String fieldName ->
-    rows.any { Map row -> normalize(row[fieldName]) }
 }
 
 def isRetryableFailure = { String message ->
@@ -221,15 +224,8 @@ def normalizeNsRecords = { List rawRecords, String fallbackItemId, String fallba
 def parseDateEpoch = { String rawDate ->
     String raw = normalize(rawDate)
     if (!raw) return Long.MAX_VALUE
-    List<Map> formats = [
-            [pattern: "yyyy-MM-dd", hasTime: false],
-            [pattern: "M/d/yyyy", hasTime: false],
-            [pattern: "M/d/yy", hasTime: false],
-            [pattern: "yyyy-MM-dd HH:mm:ss", hasTime: true],
-            [pattern: "yyyy-MM-dd'T'HH:mm:ss", hasTime: true]
-    ]
-    for (Map fmt in formats) {
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(fmt.pattern as String)
+    for (Map fmt in dateFormats) {
+        DateTimeFormatter formatter = (DateTimeFormatter) fmt.formatter
         try {
             if (fmt.hasTime) {
                 LocalDateTime ldt = LocalDateTime.parse(raw, formatter)
@@ -303,25 +299,31 @@ def buildInitialSignalFlags = { List<Map> nsRecords, List<Map> omsRows, Map supp
     ]
 }
 
+List<String> itemScopeKeys = [
+        "netsuite_product_id", "INVENTORY_ITEM_ID", "inventory_item_id", "inventoryItemId",
+        "product_id", "itemId", "nsItemId", "oms_item_id", "omsItemId"
+]
+List<String> facilityScopeKeys = [
+        "facility_id", "external_facility_id", "locationId", "nsLocationId",
+        "oms_location_id", "facilityId", "location_id"
+]
+
 def rowMatchesItemFacilityScope = { Map rowMap, Set<String> itemCandidates, Set<String> facilityCandidates ->
     if (!(rowMap instanceof Map)) return false
-    List<String> itemKeys = [
-            "netsuite_product_id", "INVENTORY_ITEM_ID", "inventory_item_id", "inventoryItemId",
-            "product_id", "itemId", "nsItemId", "oms_item_id", "omsItemId"
-    ]
-    List<String> facilityKeys = [
-            "facility_id", "external_facility_id", "locationId", "nsLocationId",
-            "oms_location_id", "facilityId", "location_id"
-    ]
-    boolean itemMatch = itemCandidates.isEmpty() || itemKeys.any { String key ->
+    boolean itemMatch = itemCandidates.isEmpty() || itemScopeKeys.any { String key ->
         String value = normalize(rowMap[key])
         value && itemCandidates.contains(value)
     }
-    boolean facilityMatch = facilityCandidates.isEmpty() || facilityKeys.any { String key ->
+    boolean facilityMatch = facilityCandidates.isEmpty() || facilityScopeKeys.any { String key ->
         String value = normalize(rowMap[key])
         value && facilityCandidates.contains(value)
     }
     return itemMatch && facilityMatch
+}
+
+def scopedRows = { List<Map> rows, Set<String> itemCandidates, Set<String> facilityCandidates ->
+    List<Map> matches = rows.findAll { Map row -> rowMatchesItemFacilityScope(row, itemCandidates, facilityCandidates) } as List<Map>
+    return matches.isEmpty() ? rows : matches
 }
 
 String refLocation = normalize(referenceFileLocation)
@@ -512,21 +514,23 @@ try {
             ]
     ]
 
-    def resolveSupplementalFilesForPrefix = { File directory, String prefix ->
-        if (directory == null || !prefix) return [] as List<File>
-        List<File> pagedFiles = (directory.listFiles() ?: [] as File[]).findAll { File f ->
+    File omsSupplementalDir = (omsSupplementalDirPath ? new File(omsSupplementalDirPath) : null)
+    boolean omsSupplementalDirReady = omsSupplementalDir != null && omsSupplementalDir.exists() && omsSupplementalDir.isDirectory()
+    List<File> omsSupplementalFiles = omsSupplementalDirReady ? ((omsSupplementalDir.listFiles() ?: [] as File[]) as List<File>) : []
+    def resolveSupplementalFilesForPrefix = { String prefix ->
+        if (!prefix) return [] as List<File>
+        List<File> pagedFiles = omsSupplementalFiles.findAll { File f ->
             String fileName = f?.name
             return fileName && fileName.startsWith("${prefix}_") && fileName.toLowerCase().endsWith(".csv")
         } as List<File>
         if (!pagedFiles.isEmpty()) return (pagedFiles.sort { File a, File b -> a.name <=> b.name } as List<File>)
         String canonicalName = "${prefix}.csv"
-        File canonicalFile = new File(directory, canonicalName)
-        if (canonicalFile.exists() && canonicalFile.isFile()) return [canonicalFile]
+        File canonicalFile = omsSupplementalFiles.find { File f -> f?.name == canonicalName && f.isFile() }
+        if (canonicalFile) return [canonicalFile]
         return [] as List<File>
     }
 
-    File omsSupplementalDir = (omsSupplementalDirPath ? new File(omsSupplementalDirPath) : null)
-    if (omsSupplementalDir != null && omsSupplementalDir.exists() && omsSupplementalDir.isDirectory()) {
+    if (omsSupplementalDirReady) {
         supplementalConfigs.each { Map cfg ->
             String datasetKey = cfg.key as String
             List<String> filePrefixes = []
@@ -538,7 +542,7 @@ try {
             List<File> datasetFiles = []
             String matchedPrefix = null
             for (String candidatePrefix in filePrefixes) {
-                List<File> candidateFiles = resolveSupplementalFilesForPrefix(omsSupplementalDir, candidatePrefix)
+                List<File> candidateFiles = resolveSupplementalFilesForPrefix(candidatePrefix)
                 if (!candidateFiles.isEmpty()) {
                     datasetFiles = candidateFiles
                     matchedPrefix = candidatePrefix
@@ -871,8 +875,9 @@ try {
         int nsCount = nsRow.recordCount != null ? toInt(nsRow.recordCount) : nsRecords.size()
 
         BigDecimal omsQtyTotal = omsRows.collect { Map r -> toDecimal(r.__omsQty) }.inject(BigDecimal.ZERO) { a, b -> a + b }
-        String omsMinDate = omsRows.collect { Map r -> normalize(r.__omsTxnDate) }.findAll { it }.sort().with { it ? it.first() : null }
-        String omsMaxDate = omsRows.collect { Map r -> normalize(r.__omsTxnDate) }.findAll { it }.sort().with { it ? it.last() : null }
+        List<String> omsDates = omsRows.collect { Map r -> normalize(r.__omsTxnDate) }.findAll { it }.sort()
+        String omsMinDate = omsDates ? omsDates.first() : null
+        String omsMaxDate = omsDates ? omsDates.last() : null
 
         BigDecimal nsQtyTotal = nsRecords.collect { Map r -> extractQty(r) }.inject(BigDecimal.ZERO) { a, b -> a + b }
         List<String> nsDates = nsRecords.collect { Map r -> extractTxnDate(r) }.findAll { it }
@@ -1027,26 +1032,19 @@ try {
         LinkedHashSet<String> facilityScopeCandidates = new LinkedHashSet<>()
         [normalize(row.nsLocationId), normalize(row.locationId), normalize(discrepancy.facility_id), normalize(discrepancy.external_facility_id)].findAll { it }.each { facilityScopeCandidates.add(it) }
 
-        List<Map> discrepancyRows = discrepancyRowsRaw.findAll { Map dRow -> rowMatchesItemFacilityScope(dRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (discrepancyRows.isEmpty()) discrepancyRows = discrepancyRowsRaw
-        List<Map> omsRows = omsRowsRaw.findAll { Map oRow -> rowMatchesItemFacilityScope(oRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (omsRows.isEmpty()) omsRows = omsRowsRaw
+        List<Map> discrepancyRows = scopedRows(discrepancyRowsRaw, itemScopeCandidates, facilityScopeCandidates)
+        List<Map> omsRows = scopedRows(omsRowsRaw, itemScopeCandidates, facilityScopeCandidates)
         List<Map> transferLifecycleRowsRaw = (supplementalRowsRaw.transferLifecycle instanceof List) ? (List<Map>) supplementalRowsRaw.transferLifecycle : []
         List<Map> returnRefundRowsRaw = (supplementalRowsRaw.returnRefundLinkage instanceof List) ? (List<Map>) supplementalRowsRaw.returnRefundLinkage : []
         List<Map> orderFulfillmentRowsRaw = (supplementalRowsRaw.orderFulfillmentBackorder instanceof List) ? (List<Map>) supplementalRowsRaw.orderFulfillmentBackorder : []
         List<Map> cycleCountRowsRaw = (supplementalRowsRaw.cycleCountAudit instanceof List) ? (List<Map>) supplementalRowsRaw.cycleCountAudit : []
         List<Map> itemFacilityRowsRaw = (supplementalRowsRaw.itemFacilityMapping instanceof List) ? (List<Map>) supplementalRowsRaw.itemFacilityMapping : []
 
-        List<Map> transferLifecycleRows = transferLifecycleRowsRaw.findAll { Map sRow -> rowMatchesItemFacilityScope(sRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (transferLifecycleRows.isEmpty()) transferLifecycleRows = transferLifecycleRowsRaw
-        List<Map> returnRefundRows = returnRefundRowsRaw.findAll { Map sRow -> rowMatchesItemFacilityScope(sRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (returnRefundRows.isEmpty()) returnRefundRows = returnRefundRowsRaw
-        List<Map> orderFulfillmentRows = orderFulfillmentRowsRaw.findAll { Map sRow -> rowMatchesItemFacilityScope(sRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (orderFulfillmentRows.isEmpty()) orderFulfillmentRows = orderFulfillmentRowsRaw
-        List<Map> cycleCountRows = cycleCountRowsRaw.findAll { Map sRow -> rowMatchesItemFacilityScope(sRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (cycleCountRows.isEmpty()) cycleCountRows = cycleCountRowsRaw
-        List<Map> itemFacilityRows = itemFacilityRowsRaw.findAll { Map sRow -> rowMatchesItemFacilityScope(sRow, itemScopeCandidates, facilityScopeCandidates) } as List<Map>
-        if (itemFacilityRows.isEmpty()) itemFacilityRows = itemFacilityRowsRaw
+        List<Map> transferLifecycleRows = scopedRows(transferLifecycleRowsRaw, itemScopeCandidates, facilityScopeCandidates)
+        List<Map> returnRefundRows = scopedRows(returnRefundRowsRaw, itemScopeCandidates, facilityScopeCandidates)
+        List<Map> orderFulfillmentRows = scopedRows(orderFulfillmentRowsRaw, itemScopeCandidates, facilityScopeCandidates)
+        List<Map> cycleCountRows = scopedRows(cycleCountRowsRaw, itemScopeCandidates, facilityScopeCandidates)
+        List<Map> itemFacilityRows = scopedRows(itemFacilityRowsRaw, itemScopeCandidates, facilityScopeCandidates)
 
         row.discrepancyRows = discrepancyRows
         row.omsDetailRows = omsRows
@@ -1278,11 +1276,12 @@ try {
         List<Map> eventTimeline = []
         nsRows.each { Map nsRecord ->
             Map tx = extractTransaction(nsRecord)
+            String txnDate = extractTxnDate(nsRecord)
             eventTimeline << [
                     source      : "NS_PRIMARY",
                     eventType   : normalize(tx.type) ?: "UNKNOWN",
-                    txnDate     : extractTxnDate(nsRecord),
-                    epochMillis : parseDateEpoch(extractTxnDate(nsRecord)),
+                    txnDate     : txnDate,
+                    epochMillis : parseDateEpoch(txnDate),
                     id          : extractTxnId(nsRecord),
                     tranid      : extractTranId(nsRecord),
                     status      : normalize(tx.transferStatus ?: tx.status ?: tx.orderStatus),

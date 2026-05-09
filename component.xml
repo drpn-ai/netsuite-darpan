@@ -2,5 +2,4 @@
 <component xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/moqui-conf-3.xsd" name="netsuite-darpan" version="0.1.0">
     <entity-file location="entity"/>
     <service-directory location="service"/>
-    <screen-file location="screen"/>
 </component>

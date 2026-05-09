@@ -22,6 +22,7 @@ import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 
 @Field Map<String, Map> NS_TOKEN_CACHE = new ConcurrentHashMap<>()
+@Field SecureRandom RNG = new SecureRandom()
 
 def logger = LoggerFactory.getLogger("netsuite.reconciliation.inventory.fetchNsInventoryAdjustmentsBulk")
 
@@ -182,9 +183,8 @@ def base64UrlEncode = { byte[] raw ->
 
 def randomJti = { int len ->
     String chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    SecureRandom rng = new SecureRandom()
     StringBuilder sb = new StringBuilder(len)
-    (0..<len).each { sb.append(chars.charAt(rng.nextInt(chars.length()))) }
+    (0..<len).each { sb.append(chars.charAt(RNG.nextInt(chars.length()))) }
     return sb.toString()
 }
 
@@ -346,10 +346,6 @@ def fetchOauthAccessToken = { String tokenUrl, String clientAssertion, int timeo
 String authCacheKey = linkedAuthConfigId ?: nsConfigId
 if (!authCacheKey) throw new IllegalArgumentException("Auth cache key is missing for ${nsConfigId}")
 Map<String, Map> tokenCache = NS_TOKEN_CACHE
-if (tokenCache == null) {
-    tokenCache = new ConcurrentHashMap<>()
-    NS_TOKEN_CACHE = tokenCache
-}
 def resolveOauthToken = { ->
     String tokenUrl = normalize(authSource.tokenUrl)
     String clientId = normalize(authSource.clientId)
@@ -544,6 +540,7 @@ def buildResult = { Map pair, Map candidate ->
 }
 
 Map<String, Map> pairById = normalizedPairs.collectEntries { Map pair -> [(pair.pairId): pair] }
+Map<String, Map> pairByItemLocation = normalizedPairs.collectEntries { Map pair -> [("${pair.itemId}|${pair.locationId}".toString()): pair] }
 Map<String, Map> resultByPairId = [:]
 
 if (parsedBody instanceof Map && parsedBody.containsKey("ok") && !(parsedBody.ok in [true, "true", "Y", "y", 1])) {
@@ -598,7 +595,7 @@ responseRows.each { Object rowObj ->
     if (!pair) {
         String rowItem = normalize(row.itemId)
         String rowLoc = normalize(row.locationId)
-        pair = normalizedPairs.find { Map req -> req.itemId == rowItem && req.locationId == rowLoc }
+        pair = pairByItemLocation["${rowItem}|${rowLoc}".toString()]
     }
     if (!pair && normalizedPairs.size() == 1) pair = normalizedPairs[0]
     if (!pair) return
