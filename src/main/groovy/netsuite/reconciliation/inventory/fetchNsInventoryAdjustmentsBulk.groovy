@@ -19,9 +19,9 @@ import java.security.spec.PSSParameterSpec
 import java.time.Duration
 import java.util.Arrays
 import java.util.Base64
-import java.util.concurrent.ConcurrentHashMap
 
-@Field Map<String, Map> NS_TOKEN_CACHE = new ConcurrentHashMap<>()
+// Audit H6.1 — the previous @Field NS_TOKEN_CACHE was reborn each script invocation; replaced with
+// the JVM-singleton in netsuite.reconciliation.inventory.NsTokenCache.
 @Field SecureRandom RNG = new SecureRandom()
 
 def logger = LoggerFactory.getLogger("netsuite.reconciliation.inventory.fetchNsInventoryAdjustmentsBulk")
@@ -345,7 +345,9 @@ def fetchOauthAccessToken = { String tokenUrl, String clientAssertion, int timeo
 
 String authCacheKey = linkedAuthConfigId ?: nsConfigId
 if (!authCacheKey) throw new IllegalArgumentException("Auth cache key is missing for ${nsConfigId}")
-Map<String, Map> tokenCache = NS_TOKEN_CACHE
+// Audit H6.1 — Hoisted to a static JVM-singleton in NsTokenCache (the previous @Field cache was
+// per-script-instance and effectively died after every batch). resolveOauthToken now always goes
+// through NsTokenCache, and the 401-retry path below evicts the entry to force a fresh mint.
 def resolveOauthToken = { ->
     String tokenUrl = normalize(authSource.tokenUrl)
     String clientId = normalize(authSource.clientId)
@@ -358,29 +360,20 @@ def resolveOauthToken = { ->
     if (!certId) throw new IllegalArgumentException("Auth config ${authCacheKey} requires certId for OAUTH2_M2M_JWT")
     if (!privateKeyPem) throw new IllegalArgumentException("Auth config ${authCacheKey} requires privateKeyPem for OAUTH2_M2M_JWT")
 
-    long nowSec = (System.currentTimeMillis() / 1000L) as long
-    Map cached = tokenCache[authCacheKey]
-    if (cached && cached.tokenUrl == tokenUrl && cached.expiresAtSec instanceof Number &&
-            ((cached.expiresAtSec as Number).longValue() > nowSec)) {
-        return cached.accessToken as String
-    }
+    String cached = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl)
+    if (cached) return cached
 
-    synchronized (tokenCache) {
-        nowSec = (System.currentTimeMillis() / 1000L) as long
-        cached = tokenCache[authCacheKey]
-        if (cached && cached.tokenUrl == tokenUrl && cached.expiresAtSec instanceof Number &&
-                ((cached.expiresAtSec as Number).longValue() > nowSec)) {
-            return cached.accessToken as String
-        }
+    // Single-flight token mint per (authCacheKey, tokenUrl). Multiple concurrent threads here
+    // would otherwise burn extra token-endpoint calls; cheap synchronized block is fine because
+    // OAuth2 tokens are normally cached for 50+ minutes — this synchronizes only on cache miss.
+    synchronized (NsTokenCache) {
+        cached = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl)
+        if (cached) return cached
 
         Map assertionOut = signClientAssertionJwt(tokenUrl, clientId, certId, privateKeyPem, scope)
         warningList.add("NS OAuth2 JWT assertion generated using ${assertionOut.alg}.")
         Map tokenOut = fetchOauthAccessToken(tokenUrl, assertionOut.jwt as String, readTimeoutSeconds)
-        tokenCache[authCacheKey] = [
-                tokenUrl    : tokenUrl,
-                accessToken : tokenOut.accessToken,
-                expiresAtSec: tokenOut.expiresAtSec
-        ]
+        NsTokenCache.put(authCacheKey, tokenUrl, tokenOut.accessToken as String, (tokenOut.expiresAtSec as Number).longValue())
         return tokenOut.accessToken as String
     }
 }
@@ -436,6 +429,21 @@ logger.info("Calling NetSuite bulk restlet endpointConfig={} authConfig={} pairC
 HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
 statusCode = response.statusCode()
 responseBody = response.body()
+
+// Audit H6.1 — 401 means the cached token has been revoked or rotated on the NetSuite side
+// (admin-revoke, scope change, token TTL race). Previously the call failed permanently and the
+// next batch picked up the same dead cached token. Now: evict the cached entry and retry the
+// request ONCE with a freshly minted bearer. Only OAUTH2_M2M_JWT carries a token in our cache.
+if (statusCode == 401 && authType == "OAUTH2_M2M_JWT") {
+    logger.info("NetSuite restlet returned 401 for ${nsConfigId}; evicting cached OAuth2 token and retrying once.")
+    NsTokenCache.evict(authCacheKey)
+    String freshAccessToken = resolveOauthToken()
+    requestBuilder.setHeader("Authorization", "Bearer ${freshAccessToken}".toString())
+    response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+    statusCode = response.statusCode()
+    responseBody = response.body()
+}
+
 if (statusCode < 200 || statusCode > 299) {
     String errorBody = normalize(responseBody)
     if (errorBody && errorBody.length() > 400) errorBody = errorBody.substring(0, 400) + "..."
