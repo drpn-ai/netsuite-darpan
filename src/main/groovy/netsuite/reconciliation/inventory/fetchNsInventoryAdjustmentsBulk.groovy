@@ -110,6 +110,12 @@ def authSource = nsAuthConfig ?: nsConfig
 
 String endpointUrl = normalize(nsConfig.endpointUrl)
 if (!endpointUrl) throw new IllegalArgumentException("NsRestletConfig ${nsConfigId} is missing endpointUrl")
+// Audit 2026-06-11 #15: re-validate the stored endpoint at request time, not only at config-save
+// time. A config row mutated out-of-band (direct DB write, data import, or a row created before the
+// save guard shipped) would otherwise reach the HTTP client unchecked and could target loopback /
+// link-local / RFC1918 / cloud-metadata addresses (SSRF). Same allow-list the save path enforces.
+def __endpointCheck = darpan.facade.common.OutboundHttpPolicy.validate(endpointUrl, ['.suitetalk.api.netsuite.com', '.app.netsuite.com'])
+if (!__endpointCheck.ok) throw new IllegalStateException("NetSuite endpoint URL blocked by outbound policy: ${__endpointCheck.error}")
 
 String httpMethod = (normalize(nsConfig.httpMethod) ?: "POST").toUpperCase()
 if (!["POST", "PUT", "GET"].contains(httpMethod)) {
@@ -356,6 +362,9 @@ def resolveOauthToken = { ->
     String scope = unquote(authSource.scope?.toString()) ?: "restlets rest_webservices"
 
     if (!tokenUrl) throw new IllegalArgumentException("Auth config ${authCacheKey} requires tokenUrl for OAUTH2_M2M_JWT")
+    // Audit 2026-06-11 #15: re-validate the OAuth token endpoint at request time (SSRF backstop).
+    def __tokenCheck = darpan.facade.common.OutboundHttpPolicy.validate(tokenUrl, ['.suitetalk.api.netsuite.com', '.app.netsuite.com'])
+    if (!__tokenCheck.ok) throw new IllegalStateException("NetSuite token URL blocked by outbound policy: ${__tokenCheck.error}")
     if (!clientId) throw new IllegalArgumentException("Auth config ${authCacheKey} requires clientId for OAUTH2_M2M_JWT")
     if (!certId) throw new IllegalArgumentException("Auth config ${authCacheKey} requires certId for OAUTH2_M2M_JWT")
     if (!privateKeyPem) throw new IllegalArgumentException("Auth config ${authCacheKey} requires privateKeyPem for OAUTH2_M2M_JWT")
