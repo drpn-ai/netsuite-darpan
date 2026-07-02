@@ -1,0 +1,107 @@
+/*
+ * Darpan NetSuite integration component.
+ *
+ * Mirrors the sibling integration components (darpan-hotwax, shopify-darpan): the Groovy under
+ * src/main/groovy is compiled and jarred into lib/ so Moqui's component class loader can pick it up
+ * (Moqui only adds <component>/classes and <component>/lib/*.jar to the runtime classpath — it does
+ * not compile src/ on its own). Without this, the NsTokenCache helper class referenced by the
+ * fetch#NsInventoryAdjustmentsBulk script would never reach the classpath.
+ */
+
+apply plugin: 'groovy'
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+
+def componentNode = parseComponent(project)
+version = componentNode.'@version'
+def jarBaseName = componentNode.'@name'
+def moquiDir = projectDir.parentFile.parentFile.parentFile
+def frameworkDir = file(moquiDir.absolutePath + '/framework')
+
+repositories {
+    flatDir name: 'localLib', dirs: frameworkDir.absolutePath + '/lib'
+    mavenCentral()
+    // jitpack only serves the transitive com.github.saasquatch:json-schema-inferrer inherited via :darpan;
+    // scoped so it cannot shadow anything else (dependency confusion).
+    maven {
+        url = 'https://jitpack.io'
+        content { includeModule('com.github.saasquatch', 'json-schema-inferrer') }
+    }
+}
+
+sourceSets {
+    main {
+        groovy { srcDirs = ['src/main/groovy'] }
+    }
+    test {
+        groovy { srcDirs = ['src/test/groovy'] }
+    }
+}
+
+tasks.withType(JavaCompile) { options.compilerArgs << "-proc:none" }
+tasks.withType(GroovyCompile) { options.compilerArgs << "-proc:none" }
+
+dependencies {
+    implementation project(':framework')
+    implementation project(':runtime:component:darpan')
+    // retrieveInventoryAdjustmentsByReference.groovy imports Spark SQL at compile time; the runtime
+    // copy is supplied by the :darpan component's lib/, so keep it compileOnly here to avoid copying
+    // Spark's transitive jars into this component's lib/.
+    compileOnly 'org.apache.spark:spark-sql_2.12:3.5.1'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
+    testImplementation project(':runtime:component:darpan').sourceSets.test.output
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.9.2' // Gradle 8/9 no longer auto-provides the launcher
+    testRuntimeOnly 'jakarta.servlet:jakarta.servlet-api:6.1.0' // Moqui 4 boots a jakarta servlet context; framework supplies it as provided
+}
+
+// by default the Java plugin runs test on build; change to not do that (only run tests on demand).
+// Mirrors the :darpan sibling so component builds stay fast and tests are an explicit task.
+check.dependsOn.clear()
+
+// Apache Spark requires these JDK module openings on Java 17+/21; integration tests that boot the
+// retrieve service (Spark SQL) need them or Spark throws IllegalAccessError at SparkContext init.
+ext.sparkJava21Opens = [
+        '--add-opens=java.base/java.lang=ALL-UNNAMED',
+        '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
+        '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED',
+        '--add-opens=java.base/java.io=ALL-UNNAMED',
+        '--add-opens=java.base/java.net=ALL-UNNAMED',
+        '--add-opens=java.base/java.nio=ALL-UNNAMED',
+        '--add-opens=java.base/java.util=ALL-UNNAMED',
+        '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
+        '--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+        '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED',
+        '--add-opens=java.base/sun.nio.cs=ALL-UNNAMED',
+        '--add-opens=java.base/sun.security.action=ALL-UNNAMED',
+        '--add-opens=java.base/sun.util.calendar=ALL-UNNAMED',
+        '--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED'
+]
+
+test {
+    useJUnitPlatform()
+    // Moqui keeps process-global state; isolate test classes so fixture state does not leak.
+    maxParallelForks = 1
+    forkEvery = 1
+    jvmArgs(sparkJava21Opens + ['-XX:+EnableDynamicAgentLoading', '--enable-native-access=ALL-UNNAMED'])
+}
+
+task cleanLib(type: Delete) { delete fileTree(dir: projectDir.absolutePath + '/lib', include: '*') }
+clean.dependsOn cleanLib
+
+jar {
+    destinationDirectory = file(projectDir.absolutePath + '/lib')
+    archiveBaseName = jarBaseName
+}
+
+task copyDependencies { doLast {
+    copy { from (configurations.runtimeClasspath
+            - project(':framework').configurations.runtimeClasspath
+            - project(':framework').tasks.named('jar').get().archiveFile.get().asFile
+            - project(':runtime:component:darpan').configurations.runtimeClasspath
+            - project(':runtime:component:darpan').tasks.named('jar').get().archiveFile.get().asFile)
+        into file(projectDir.absolutePath + '/lib') }
+} }
+copyDependencies.dependsOn cleanLib
+jar.dependsOn copyDependencies
