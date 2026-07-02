@@ -1,0 +1,6 @@
+build/
+lib/
+moqui_logs/
+.gradle/
+.DS_Store
+*.class
