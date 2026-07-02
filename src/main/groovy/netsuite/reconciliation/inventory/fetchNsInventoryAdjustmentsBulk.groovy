@@ -114,8 +114,8 @@ if (!endpointUrl) throw new IllegalArgumentException("NsRestletConfig ${nsConfig
 // time. A config row mutated out-of-band (direct DB write, data import, or a row created before the
 // save guard shipped) would otherwise reach the HTTP client unchecked and could target loopback /
 // link-local / RFC1918 / cloud-metadata addresses (SSRF). Same allow-list the save path enforces.
-def __endpointCheck = darpan.facade.common.OutboundHttpPolicy.validate(endpointUrl, ['.suitetalk.api.netsuite.com', '.app.netsuite.com'])
-if (!__endpointCheck.ok) throw new IllegalStateException("NetSuite endpoint URL blocked by outbound policy: ${__endpointCheck.error}")
+def endpointPolicyCheck = darpan.facade.common.OutboundHttpPolicy.validate(endpointUrl, ['.suitetalk.api.netsuite.com', '.app.netsuite.com'])
+if (!endpointPolicyCheck.ok) throw new IllegalStateException("NetSuite endpoint URL blocked by outbound policy: ${endpointPolicyCheck.error}")
 
 String httpMethod = (normalize(nsConfig.httpMethod) ?: "POST").toUpperCase()
 if (!["POST", "PUT", "GET"].contains(httpMethod)) {
@@ -363,8 +363,8 @@ def resolveOauthToken = { ->
 
     if (!tokenUrl) throw new IllegalArgumentException("Auth config ${authCacheKey} requires tokenUrl for OAUTH2_M2M_JWT")
     // Audit 2026-06-11 #15: re-validate the OAuth token endpoint at request time (SSRF backstop).
-    def __tokenCheck = darpan.facade.common.OutboundHttpPolicy.validate(tokenUrl, ['.suitetalk.api.netsuite.com', '.app.netsuite.com'])
-    if (!__tokenCheck.ok) throw new IllegalStateException("NetSuite token URL blocked by outbound policy: ${__tokenCheck.error}")
+    def tokenPolicyCheck = darpan.facade.common.OutboundHttpPolicy.validate(tokenUrl, ['.suitetalk.api.netsuite.com', '.app.netsuite.com'])
+    if (!tokenPolicyCheck.ok) throw new IllegalStateException("NetSuite token URL blocked by outbound policy: ${tokenPolicyCheck.error}")
     if (!clientId) throw new IllegalArgumentException("Auth config ${authCacheKey} requires clientId for OAUTH2_M2M_JWT")
     if (!certId) throw new IllegalArgumentException("Auth config ${authCacheKey} requires certId for OAUTH2_M2M_JWT")
     if (!privateKeyPem) throw new IllegalArgumentException("Auth config ${authCacheKey} requires privateKeyPem for OAUTH2_M2M_JWT")
@@ -413,50 +413,57 @@ headersMap.each { key, value ->
 }
 requestBuilder.header("X-Darpan-Pair-Count", normalizedPairs.size().toString())
 
-String username = normalize(authSource.username)
-String password = authSource.password?.toString()
-String apiToken = authSource.apiToken?.toString() ?: password
-if (authType == "BASIC") {
-    if (!username || password == null) {
-        throw new IllegalArgumentException("NsRestletConfig ${nsConfigId} requires username and password for BASIC auth")
+// The JDK 21 HttpClient is AutoCloseable; close it once the request/response exchange (including the
+// single 401 retry) finishes so its selector thread and connection pool are released deterministically
+// rather than lingering until GC on every bulk invocation.
+try {
+    String username = normalize(authSource.username)
+    String password = authSource.password?.toString()
+    String apiToken = authSource.apiToken?.toString() ?: password
+    if (authType == "BASIC") {
+        if (!username || password == null) {
+            throw new IllegalArgumentException("NsRestletConfig ${nsConfigId} requires username and password for BASIC auth")
+        }
+        String token = Base64.getEncoder().encodeToString("${username}:${password}".getBytes(StandardCharsets.UTF_8))
+        requestBuilder.setHeader("Authorization", "Basic ${token}")
     }
-    String token = Base64.getEncoder().encodeToString("${username}:${password}".getBytes(StandardCharsets.UTF_8))
-    requestBuilder.setHeader("Authorization", "Basic ${token}")
-}
-if (authType == "BEARER") {
-    if (!apiToken) throw new IllegalArgumentException("NsRestletConfig ${nsConfigId} requires apiToken (or password) for BEARER auth")
-    requestBuilder.setHeader("Authorization", "Bearer ${apiToken}")
-}
-if (authType == "OAUTH2_M2M_JWT") {
-    String accessToken = resolveOauthToken()
-    requestBuilder.setHeader("Authorization", "Bearer ${accessToken}")
-}
+    if (authType == "BEARER") {
+        if (!apiToken) throw new IllegalArgumentException("NsRestletConfig ${nsConfigId} requires apiToken (or password) for BEARER auth")
+        requestBuilder.setHeader("Authorization", "Bearer ${apiToken}")
+    }
+    if (authType == "OAUTH2_M2M_JWT") {
+        String accessToken = resolveOauthToken()
+        requestBuilder.setHeader("Authorization", "Bearer ${accessToken}")
+    }
 
-logger.info("Calling NetSuite bulk restlet endpointConfig={} authConfig={} pairCount={} from={} to={} method={} authType={}",
-        nsConfigId, (linkedAuthConfigId ?: "LEGACY_EMBEDDED"), normalizedPairs.size(), fromDate, toDate, httpMethod, authType)
+    logger.info("Calling NetSuite bulk restlet endpointConfig={} authConfig={} pairCount={} from={} to={} method={} authType={}",
+            nsConfigId, (linkedAuthConfigId ?: "LEGACY_EMBEDDED"), normalizedPairs.size(), fromDate, toDate, httpMethod, authType)
 
-HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
-statusCode = response.statusCode()
-responseBody = response.body()
-
-// Audit H6.1 — 401 means the cached token has been revoked or rotated on the NetSuite side
-// (admin-revoke, scope change, token TTL race). Previously the call failed permanently and the
-// next batch picked up the same dead cached token. Now: evict the cached entry and retry the
-// request ONCE with a freshly minted bearer. Only OAUTH2_M2M_JWT carries a token in our cache.
-if (statusCode == 401 && authType == "OAUTH2_M2M_JWT") {
-    logger.info("NetSuite restlet returned 401 for ${nsConfigId}; evicting cached OAuth2 token and retrying once.")
-    NsTokenCache.evict(authCacheKey)
-    String freshAccessToken = resolveOauthToken()
-    requestBuilder.setHeader("Authorization", "Bearer ${freshAccessToken}".toString())
-    response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+    HttpResponse<String> response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
     statusCode = response.statusCode()
     responseBody = response.body()
-}
 
-if (statusCode < 200 || statusCode > 299) {
-    String errorBody = normalize(responseBody)
-    if (errorBody && errorBody.length() > 400) errorBody = errorBody.substring(0, 400) + "..."
-    throw new IllegalArgumentException("NetSuite restlet bulk call failed for ${nsConfigId} with HTTP ${statusCode}${errorBody ? ': ' + errorBody : ''}")
+    // Audit H6.1 — 401 means the cached token has been revoked or rotated on the NetSuite side
+    // (admin-revoke, scope change, token TTL race). Previously the call failed permanently and the
+    // next batch picked up the same dead cached token. Now: evict the cached entry and retry the
+    // request ONCE with a freshly minted bearer. Only OAUTH2_M2M_JWT carries a token in our cache.
+    if (statusCode == 401 && authType == "OAUTH2_M2M_JWT") {
+        logger.info("NetSuite restlet returned 401 for ${nsConfigId}; evicting cached OAuth2 token and retrying once.")
+        NsTokenCache.evict(authCacheKey)
+        String freshAccessToken = resolveOauthToken()
+        requestBuilder.setHeader("Authorization", "Bearer ${freshAccessToken}".toString())
+        response = client.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        statusCode = response.statusCode()
+        responseBody = response.body()
+    }
+
+    if (statusCode < 200 || statusCode > 299) {
+        String errorBody = normalize(responseBody)
+        if (errorBody && errorBody.length() > 400) errorBody = errorBody.substring(0, 400) + "..."
+        throw new IllegalArgumentException("NetSuite restlet bulk call failed for ${nsConfigId} with HTTP ${statusCode}${errorBody ? ': ' + errorBody : ''}")
+    }
+} finally {
+    try { client.close() } catch (Exception ignored) {}
 }
 
 Object parsedBody = null
