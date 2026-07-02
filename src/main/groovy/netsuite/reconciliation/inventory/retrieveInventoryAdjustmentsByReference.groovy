@@ -961,7 +961,6 @@ try {
     }
 
     Map<String, Map> nsSecondaryDetailCacheByPair = [:]
-    Map<String, Map> nsSecondaryDetailByPair = [:]
     int nsDetailCacheHitCountValue = 0
     int nsDetailComputedCountValue = 0
     int nsDetailErrorCountValue = 0
@@ -1122,7 +1121,6 @@ try {
             nsDetailComputedCountValue++
         }
         row.nsSecondaryDetails = nsSecondaryDetails
-        if (rowPairId) nsSecondaryDetailByPair[rowPairId] = nsSecondaryDetails
         List<Map> nsDetailRows = (nsSecondaryDetails.detailRows instanceof List) ? ((List) nsSecondaryDetails.detailRows).collect { it instanceof Map ? new LinkedHashMap((Map) it) : [value: it] } : []
 
         LinkedHashSet<String> nsTxnTypes = new LinkedHashSet<>()
@@ -1479,7 +1477,7 @@ try {
         String finalSubReason = "MISSING_EVIDENCE"
         int finalScore = 0
 
-        boolean coreCriticalMissing = (!hasItemFulfillmentSignal && !hasSalesOrderSignal && !hasTransferSignal && !hasOmsReturnSignal && nsRecordCount == 0 && omsRecordCount == 0 && nsTransactionRefs.isEmpty())
+        boolean coreCriticalMissing = (!hasItemFulfillmentSignal && !hasSalesOrderSignal && !hasTransferSignal && !hasOmsReturnSignal && toInt(row.nsRecordCount) == 0 && toInt(row.omsRecordCount) == 0 && nsTransactionRefs.isEmpty())
 
         if (coreCriticalMissing) {
             finalFamily = "UNCLASSIFIED_REVIEW_REQUIRED"
@@ -1504,9 +1502,9 @@ try {
         row.scoreBreakdown = [margin: margin, bestScore: bestScore, secondScore: secondScore]
 
         String effectiveReasonCode = finalFamily
-        if (effectiveReasonCode == "HG_RETURN_MISSING_IN_NS") row[compareStatusFieldName] = "MISSING_IN_NS"
-        else if (effectiveReasonCode == "UNCLASSIFIED_REVIEW_REQUIRED") row[compareStatusFieldName] = "ERROR"
-        else row[compareStatusFieldName] = "COUNT_MISMATCH"
+        if (effectiveReasonCode == "HG_RETURN_MISSING_IN_NS") row[compareStatusFieldName] = missingInNsStatusValue
+        else if (effectiveReasonCode == "UNCLASSIFIED_REVIEW_REQUIRED") row[compareStatusFieldName] = errorStatusValue
+        else row[compareStatusFieldName] = countMismatchStatusValue
 
         String actionHint = ""
         if (effectiveReasonCode == "UNCLASSIFIED_REVIEW_REQUIRED") actionHint = "Action: Review required by Reconciliation Analyst."
@@ -1640,7 +1638,9 @@ try {
         String reasonCodeValue = normalize(row[reasonCodeFieldName])
         if (reasonCodeValue) reasonCountMap[reasonCodeValue] = reasonCountMap[reasonCodeValue] + 1
     }
-    explainedItemCount = reasonCountMap.values().sum() ?: 0
+    // "Explained" = rows that received a concrete reason family. UNCLASSIFIED_REVIEW_REQUIRED is the
+    // catch-all for rows still needing manual review, so it counts toward unexplained, not explained.
+    explainedItemCount = reasonCountMap.findAll { code, count -> code != "UNCLASSIFIED_REVIEW_REQUIRED" }.values().sum() ?: 0
     unexplainedItemCount = processedItemCount - explainedItemCount
     reasonCounts = reasonCountMap.collect { k, v -> [reasonCode: k, count: v] }
 
@@ -1699,7 +1699,7 @@ try {
                 reasonText                 : normalize(row[reasonTextFieldName]),
                 confidenceScore            : row.confidenceScore instanceof Number ? (Number) row.confidenceScore : 0,
                 confidenceTier             : normalize(row.confidenceTier),
-                marginSummary              : (row.scoreBreakdown instanceof Map) ? "Best: \${row.scoreBreakdown.bestScore}, Next: \${row.scoreBreakdown.secondScore}, Margin: \${row.scoreBreakdown.margin}" : "",
+                marginSummary              : (row.scoreBreakdown instanceof Map) ? "Best: ${row.scoreBreakdown.bestScore}, Next: ${row.scoreBreakdown.secondScore}, Margin: ${row.scoreBreakdown.margin}" : "",
                 scoreBreakdown             : row.scoreBreakdown,
                 conclusion                 : normalize(row.conclusion),
                 strictCycleCountSignal     : signalFlags.strictCycleCountSignal,
