@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="extract" noun="NetSuiteOrders" type="script" transaction="ignore" allow-remote="false" authenticate="true"
+            location="component://netsuite-darpan/src/main/groovy/netsuite/reconciliation/orders/extractNetSuiteOrders.groovy">
+        <description>Extract NetSuite sales orders for a reconciliation window over SuiteQL (REST Web
+            Services), writing normalized JSON to the automation data-manager folder. Same in/out
+            contract and same on-disk {records, metadata} file shape as the OMS and Shopify getters,
+            so the automation edge and the Spark compare stage are unchanged (DAR-BE-032).
+
+            TRANSPORT: SuiteQL, not a SuiteScript RESTlet. Measured against a live account on
+            2026-09-02: 1000 rows per page (the documented ceiling, honoured) at ~880 rows/sec, so a
+            161k-order month enumerates in about three minutes. A RESTlet would additionally require a
+            script record, a deployment and a role grant inside the CLIENT's production NetSuite and
+            buys nothing for a presence check. No NetSuite-side deployment is needed for this service.
+
+            CREDENTIAL: the existing NsAuthConfig OAuth2 M2M profile, whose scope already defaults to
+            "restlets rest_webservices". The SuiteQL endpoint host is derived from that profile's
+            tokenUrl, so the account id is never configured twice and the request URL stays inside
+            OutboundHttpPolicy's allow-list by construction.
+
+            POPULATION AND PROJECTION ARE CONFIGURATION (DAR-BE-044), not constants in the extractor.
+            The record type, the table, the window column and the column-to-record-field mapping all
+            come from the NsSuiteQlSourceQuery named by nsSuiteQlSourceQueryId. That is what lets one
+            connector row serve every NetSuite pair, including the within-NetSuite pairs, instead of
+            minting a systemEnumId, a connector row and an extract service per endpoint.
+
+            JOIN KEY: for the OMS order-presence pair the emitted orderId carries NetSuite's
+            custbody_hc_order_id — the column the HotWax integration itself writes — so a match means
+            "this NetSuite order came from that OMS order" rather than "these two strings are equal".
+            Orders keyed in directly in NetSuite carry no such value; when the query declares an
+            originFieldName every record also carries it (HOTWAX or NETSUITE_NATIVE) so those can be
+            excluded by a configured rule, because an exclusion rule cannot match an absent field.
+
+            WINDOW: NetSuite's trandate is DATE-granular and stored in the account's timezone, so the
+            window is applied as half-open [windowStart, windowEnd) on whole days. Give day-aligned
+            windows; a sub-day window will not narrow the result.</description>
+        <in-parameters>
+            <parameter name="nsSuiteQlSourceQueryId" required="true">
+                <description>Tenant-owned NsSuiteQlSourceQuery identifier. Says which NetSuite
+                    population this side enumerates (record type, table, window column) and how its
+                    columns map onto reconciliation record fields, and carries the NsAuthConfig that
+                    supplies the OAuth2 M2M credential and — via its tokenUrl host — the SuiteQL
+                    endpoint. Before DAR-BE-044 this parameter was the auth config directly and the
+                    population was hardcoded, which is why every new NetSuite pair needed a new
+                    service.</description>
+            </parameter>
+            <parameter name="automationExecutionId">
+                <description>Automation execution id used to choose the default data-manager output folder.</description>
+            </parameter>
+            <parameter name="companyUserGroupId">
+                <description>Trusted automation owner tenant. When present, config access is checked
+                    against this tenant instead of a user-session active tenant.</description>
+            </parameter>
+            <parameter name="windowStart" required="true">
+                <description>Start of the window (inclusive); accepts Timestamp, ISO-8601 text, SQL
+                    timestamp text, epoch millis or yyyy-MM-dd. Reduced to a whole date.</description>
+            </parameter>
+            <parameter name="windowEnd" required="true">
+                <description>End of the window, EXCLUSIVE — an order dated exactly at the bound belongs
+                    to the next window, so consecutive chunks do not double-count their boundary.</description>
+            </parameter>
+            <parameter name="outputLocation">
+                <description>Optional output directory. Defaults to runtime://datamanager/reconciliation-runs/{automationExecutionId}/{timestamp}/.</description>
+            </parameter>
+            <parameter name="fileName">
+                <description>Optional output file name. Defaults to netsuite-orders-{from}-{thru}.json.</description>
+            </parameter>
+            <parameter name="pageSize" type="Integer">
+                <description>Optional page size, capped at NetSuite's SuiteQL ceiling of 1000. A larger
+                    request is capped server-side anyway, which would otherwise make a caller believe
+                    it had read further than it had.</description>
+            </parameter>
+            <parameter name="keepRecordFields" type="List">
+                <parameter name="fieldName"/>
+                <description>Optional projection: top-level record fields to keep in the output file.
+                    Applied after exclusion rules so narrowing the output cannot silently disable a rule.
+                    The connector no longer drives this — since DAR-BE-044 the field mapping IS the
+                    projection, exactly as the SELECT list is for DATABASE — but a direct caller may
+                    still narrow.</description>
+            </parameter>
+            <parameter name="sourceFilters" type="List">
+                <parameter name="filterRule" type="Map">
+                    <parameter name="sequenceNum" type="Integer"/>
+                    <parameter name="fieldExpression"/>
+                    <parameter name="operator"/>
+                    <parameter name="filterValues"/>
+                </parameter>
+                <description>Optional record-exclusion rules, same semantics as the OMS getters. These
+                    run client-side: SuiteQL has no knowledge of tenant exclusion rules.</description>
+            </parameter>
+            <parameter name="reconciliationRunResultId">
+                <description>Optional observability run id for progress heartbeats. Advisory only.</description>
+            </parameter>
+            <parameter name="progressStageCode">
+                <description>Which extract stage this run is: EXTRACT_FILE1 or EXTRACT_FILE2. Defaults to EXTRACT_FILE2.</description>
+            </parameter>
+            <parameter name="expectedRecordCount" type="Integer">
+                <description>Optional expected total, which adds a progress percent alongside the count.</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="dataAvailable" type="Boolean"/>
+            <parameter name="fileLocation"/>
+            <parameter name="fileName"/>
+            <parameter name="recordCount" type="Integer"/>
+            <parameter name="requestMetadata" type="Map"/>
+            <parameter name="warnings" type="List"/>
+            <parameter name="errors" type="List"/>
+        </out-parameters>
+    </service>
+
+</services>
