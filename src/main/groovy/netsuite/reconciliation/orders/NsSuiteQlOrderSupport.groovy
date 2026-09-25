@@ -51,6 +51,34 @@ class NsSuiteQlOrderSupport {
 
     /** Defaults matching the transaction shape every NetSuite transaction pair starts from. */
     static final String DEFAULT_FROM_TABLE = "transaction"
+
+    /**
+     * VETTED QUERY TEMPLATES (DAR-BE-053). The SHAPES live here, in code; configuration picks one and
+     * names its record types.
+     *
+     * WHY NOT A QUERY COLUMN. Every within-NetSuite chain check is an anti-join across the transaction
+     * LINK TABLE, which the assembled-parts model had no slot for. But DAR-BE-044 refused raw query text
+     * for two reasons that still hold: the window bounds are interpolated as TEXT rather than bound as
+     * parameters, and `ORDER BY id` is what makes offset paging safe. A free-form SELECT would put both
+     * in operator hands. Templates keep every interpolated fragment identifier-checked and keep the
+     * ordering out of configuration, at the cost of only ever expressing shapes that were shipped.
+     */
+    static final String TEMPLATE_RECORDS = "RECORDS"
+    /** Parent rows with NO linked child of a given type — "orders that never shipped". */
+    static final String TEMPLATE_LINKED_CHILD_ABSENT = "LINKED_CHILD_ABSENT"
+    /** Parent rows WITH one linked child type and WITHOUT another — "shipped but never billed". */
+    static final String TEMPLATE_LINKED_CHILD_PRESENT_ABSENT = "LINKED_CHILD_PRESENT_ABSENT"
+    private static final List<String> QUERY_TEMPLATES =
+            [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
+    private static final List<String> LINK_TEMPLATES =
+            [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
+
+    /**
+     * Transaction-to-transaction linkage lives in a link table, NOT in a `createdfrom` column on
+     * `transaction` — NetSuite answers `Unknown identifier 'createdfrom'` there (measured against gorjana
+     * 2026-09-17). Hardcoded rather than configured: it is the data model, not a choice.
+     */
+    private static final String LINK_TABLE = "nexttransactionlink"
     static final String DEFAULT_DATE_COLUMN = "trandate"
 
     /**
@@ -107,7 +135,13 @@ class NsSuiteQlOrderSupport {
 
         String recordType = text(query.get("recordType"))
         if (!recordType) throw new IllegalArgumentException("NsSuiteQlSourceQuery.recordType is required")
-        requireSafeFragment(recordType, "recordType")
+        // TIGHTENED FROM requireSafeFragment TO requireIdentifier (DAR-BE-053). A "safe fragment" allows
+        // BALANCED quotes and does not forbid OR, so `ItemShip' OR '1'='1` passed every check and
+        // widened `type = '<recordType>'` to every transaction type in the account — a read-only scope
+        // escalation from an operator-editable field. Every NetSuite record-type code is alphanumeric
+        // (SalesOrd, ItemShip, CustInvc, RtnAuth, CustCred, CustRfnd, CashSale, ItemRcpt), so the
+        // stricter check refuses nothing legitimate.
+        requireIdentifier(recordType, "recordType")
 
         String fromTable = text(query.get("fromTable")) ?: DEFAULT_FROM_TABLE
         requireIdentifier(fromTable, "fromTable")
@@ -148,6 +182,45 @@ class NsSuiteQlOrderSupport {
             joinKeyRowKey = (String) joinField.get("rowKey")
         }
 
+        String queryTemplate = (text(query.get("queryTemplate")) ?: TEMPLATE_RECORDS).toUpperCase()
+        if (!QUERY_TEMPLATES.contains(queryTemplate)) {
+            // Deliberately not defaulting to RECORDS: a typo'd template would silently run a plain
+            // windowed extract and report every row as a finding.
+            throw new IllegalArgumentException("NsSuiteQlSourceQuery ${query.get('nsSuiteQlSourceQueryId')} " +
+                    "has unsupported queryTemplate ${query.get('queryTemplate')}. Supported values: ${QUERY_TEMPLATES.join(', ')}")
+        }
+        boolean linkTemplate = LINK_TEMPLATES.contains(queryTemplate)
+
+        String absentChildRecordType = text(query.get("absentChildRecordType"))
+        String presentChildRecordType = text(query.get("presentChildRecordType"))
+        if (linkTemplate) {
+            // The link table relates TRANSACTIONS. Pointing a link template at another table assembles
+            // a query that parses and means nothing.
+            if (fromTable != DEFAULT_FROM_TABLE) {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} reads the ${LINK_TABLE} " +
+                        "link table, which relates transactions, so fromTable must be ${DEFAULT_FROM_TABLE}, got: ${fromTable}")
+            }
+            if (!absentChildRecordType) {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} requires absentChildRecordType")
+            }
+            requireIdentifier(absentChildRecordType, "absentChildRecordType")
+        } else if (absentChildRecordType) {
+            throw new IllegalArgumentException("absentChildRecordType is only meaningful on " +
+                    "${LINK_TEMPLATES.join(' or ')}; queryTemplate is ${queryTemplate}")
+        }
+        if (queryTemplate == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT) {
+            if (!presentChildRecordType) {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} requires presentChildRecordType")
+            }
+            requireIdentifier(presentChildRecordType, "presentChildRecordType")
+        } else if (presentChildRecordType) {
+            // Rejected rather than ignored: silently dropping it is how an operator comes to believe a
+            // filter is applied that is not.
+            throw new IllegalArgumentException("presentChildRecordType is only meaningful on " +
+                    "${TEMPLATE_LINKED_CHILD_PRESENT_ABSENT}; queryTemplate is ${queryTemplate}")
+        }
+        boolean requireFulfillableOpenLine = "Y".equalsIgnoreCase(text(query.get("requireFulfillableOpenLine")) ?: "N")
+
         String originFieldName = text(query.get("originFieldName"))
         if (originFieldName) {
             requireIdentifier(originFieldName, "originFieldName")
@@ -166,6 +239,10 @@ class NsSuiteQlOrderSupport {
                 joinKeyFieldName      : joinKeyFieldName,
                 joinKeyRowKey         : joinKeyRowKey,
                 originFieldName       : originFieldName,
+                queryTemplate         : queryTemplate,
+                absentChildRecordType : absentChildRecordType,
+                presentChildRecordType: presentChildRecordType,
+                requireFulfillableOpenLine: requireFulfillableOpenLine,
         ] as Map<String, Object>
     }
 
@@ -229,12 +306,59 @@ class NsSuiteQlOrderSupport {
         requireIsoDate(fromDate, "fromDate")
         requireIsoDate(toDate, "toDate")
         String dateColumn = (String) spec.get("dateColumn")
-        return "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} " +
-                "WHERE type = '${spec.get('recordType')}' " +
-                "AND ${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
-                "AND ${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') " +
-                "ORDER BY id"
+        String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
+
+        // RECORDS stays BYTE-IDENTICAL to what shipped for DAR-BE-032/044, alias and all (there is
+        // none). Every stored row predates the template field, so a default that even reformatted this
+        // query would change an extract already proven against gorjana production.
+        if (template == TEMPLATE_RECORDS) {
+            return "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} " +
+                    "WHERE type = '${spec.get('recordType')}' " +
+                    "AND ${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
+                    "AND ${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') " +
+                    "ORDER BY id"
+        }
+
+        StringBuilder sql = new StringBuilder()
+        sql << "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} t "
+        sql << "WHERE t.type = '${spec.get('recordType')}' "
+        sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
+        sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
+        if (template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT) {
+            sql << "AND ${linkedChildPredicate(true, (String) spec.get('presentChildRecordType'), '')} "
+        }
+        sql << "AND NOT ${linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '')} "
+        if (spec.get("requireFulfillableOpenLine")) sql << "AND ${FULFILLABLE_OPEN_LINE_PREDICATE} "
+        sql << "ORDER BY t.id"
+        return sql.toString()
     }
+
+    /**
+     * "Is there ANY link from this parent to a child of this type."
+     *
+     * NO LINKTYPE FILTER, deliberately: a stage is reachable by SEVERAL linktypes — gorjana's
+     * fulfillments arrive as both ShipRcpt and KitShip — so pinning one silently drops 48 kit shipments
+     * a day. And the subquery is NOT windowed: the child transaction is dated later than its parent
+     * (fulfillment p99 4 days, invoice p99 36), so bounding it would report every order near the end of
+     * the window as having no child, which is the false positive this feature exists to avoid.
+     */
+    private static String linkedChildPredicate(boolean present, String childRecordType, String suffix) {
+        String link = "l${suffix}", child = "c${suffix}"
+        return "EXISTS (SELECT 1 FROM ${LINK_TABLE} ${link} " +
+                "JOIN transaction ${child} ON ${child}.id = ${link}.nextdoc " +
+                "WHERE ${link}.previousdoc = t.id AND ${child}.type = '${childRecordType}')"
+    }
+
+    /**
+     * THE TRIAGE GATE, and it is the difference between 97 findings and 5 (measured, gorjana 2026-09-17).
+     * An order with no fulfillment is not a defect if no line was ever fulfillable — service and
+     * non-inventory orders can never have one — or if its lines were deliberately closed. Both are read
+     * from the line, which is why this cannot be a post-extraction sourceFilters rule: a filter can only
+     * match a field the extractor already emitted.
+     */
+    private static final String FULFILLABLE_OPEN_LINE_PREDICATE =
+            "EXISTS (SELECT 1 FROM transactionline tl WHERE tl.transaction = t.id " +
+                    "AND tl.fulfillable = 'T' AND tl.isclosed = 'F')"
 
     /**
      * The dates are interpolated into SuiteQL text, so the format is enforced rather than escaped —

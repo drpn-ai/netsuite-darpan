@@ -114,9 +114,17 @@ try {
     suiteQlUrl = NsSuiteQlOrderSupport.suiteQlUrlFromTokenUrl(authConfig.tokenUrl?.toString())
     // Validates every configured fragment BEFORE it can reach the interpolated query text.
     querySpec = NsSuiteQlOrderSupport.normalizeSpec(
+            // EVERY configured field must be listed here. This map is named rather than the row passed
+            // wholesale, so a field added to NsSuiteQlSourceQuery and not added here is SILENTLY IGNORED
+            // — an operator would set queryTemplate=LINKED_CHILD_ABSENT and get a plain windowed extract
+            // that reports every order as a finding (DAR-BE-053).
             [nsSuiteQlSourceQueryId: queryIdValue, recordType: queryRow.recordType,
              fromTable             : queryRow.fromTable, dateColumn: queryRow.dateColumn,
-             joinKeyFieldName      : queryRow.joinKeyFieldName, originFieldName: queryRow.originFieldName],
+             joinKeyFieldName      : queryRow.joinKeyFieldName, originFieldName: queryRow.originFieldName,
+             queryTemplate         : queryRow.queryTemplate,
+             absentChildRecordType : queryRow.absentChildRecordType,
+             presentChildRecordType: queryRow.presentChildRecordType,
+             requireFulfillableOpenLine: queryRow.requireFulfillableOpenLine],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
