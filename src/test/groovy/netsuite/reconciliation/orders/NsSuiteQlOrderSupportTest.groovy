@@ -3,6 +3,7 @@ package netsuite.reconciliation.orders
 import org.junit.jupiter.api.Test
 
 import static org.junit.jupiter.api.Assertions.assertEquals
+import static org.junit.jupiter.api.Assertions.assertFalse
 import static org.junit.jupiter.api.Assertions.assertNull
 import static org.junit.jupiter.api.Assertions.assertThrows
 import static org.junit.jupiter.api.Assertions.assertTrue
@@ -363,6 +364,73 @@ class NsSuiteQlOrderSupportTest {
 
         assertEquals(2, result.recordCount)
         assertEquals(1, result.excludedCount)
+    }
+
+    @Test
+    void anIncludeRuleKeepsOnlyListedStatusesAndCountsAbsentSeparately() {
+        // DAR-BE-054. statusId is a mapped field, so it is genuinely missing on a row NetSuite
+        // returned without one — unlike orderOrigin, which is stamped on every record. That makes
+        // this the realistic shape for the FIELD_ABSENT bucket on this connector.
+        StringWriter out = new StringWriter()
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec       : salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000,
+                 filterRules: [[sequenceNum: 1, fieldExpression: "statusId",
+                                operator   : "INCLUDE_IN", filterValues: "A,B,G"]]],
+                { String q, int limit, int offset ->
+                    [items  : [[id: "1", custbody_hc_order_id: "A", status: "B"],
+                               [id: "2", custbody_hc_order_id: "B", status: "H"],
+                               [id: "3", custbody_hc_order_id: "C"]],
+                     hasMore: false]
+                })
+
+        assertEquals(1, result.recordCount, "only the status-B order qualifies")
+        // The flat total keeps its meaning: every record the configured rules rejected, any reason.
+        assertEquals(2, result.excludedCount)
+
+        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        Map entry = (Map) ((List) ((Map) parsed.metadata).configuredExclusions)[0]
+        assertEquals(1, entry.sequenceNum)
+        assertEquals("statusId", entry.fieldExpression)
+        assertEquals("INCLUDE_IN", entry.operator)
+        assertEquals(["A", "B", "G"], entry.values)
+        assertEquals(1, entry.excludedCount, "status H, dropped on its value")
+        assertEquals(1, entry.fieldAbsentCount, "no status column at all")
+    }
+
+    @Test
+    void metadataNamesARuleThatRejectedNothingRatherThanOmittingIt() {
+        // Until DAR-BE-054 this connector reported one flat excludedCount and no per-rule block, so
+        // "the rule matched nothing" and "this build predates the rule" were the same observation.
+        StringWriter out = new StringWriter()
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec       : salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000,
+                 filterRules: [[sequenceNum: 1, fieldExpression: "orderOrigin",
+                                operator   : "EXCLUDE_IN", filterValues: "NETSUITE_NATIVE"]]],
+                { String q, int limit, int offset ->
+                    [items: [[id: "1", custbody_hc_order_id: "A"]], hasMore: false]
+                })
+
+        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        List configured = (List) ((Map) parsed.metadata).configuredExclusions
+        assertEquals(1, configured.size(), "a rule that rejected nothing must still be reported")
+        assertEquals(0, ((Map) configured[0]).excludedCount)
+        // Structurally zero on an exclude rule, but present, so a reader need not know which keys
+        // apply to which mode.
+        assertEquals(0, ((Map) configured[0]).fieldAbsentCount)
+    }
+
+    @Test
+    void metadataOmitsConfiguredExclusionsEntirelyWhenNoRulesAreConfigured() {
+        StringWriter out = new StringWriter()
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000],
+                { String q, int limit, int offset ->
+                    [items: [[id: "1", custbody_hc_order_id: "A"]], hasMore: false]
+                })
+
+        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        assertFalse(((Map) parsed.metadata).containsKey("configuredExclusions"),
+                "absent entirely, not an empty list — a block on every extract would read as always-applies")
     }
 
     @Test

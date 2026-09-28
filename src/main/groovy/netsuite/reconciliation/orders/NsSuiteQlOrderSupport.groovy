@@ -382,6 +382,31 @@ class NsSuiteQlOrderSupport {
      * unexplainable. They are removed by a configured sourceFilters rule instead, so the exclusion is
      * the operator's decision and shows up in the run's filter reporting.
      */
+    /**
+     * One metadata entry per configured rule, including rules that rejected nothing.
+     *
+     * This connector reported only a flat excludedCount until DAR-BE-054, which made "the rule
+     * matched nothing" and "this build predates the rule" the same observation — the ambiguity that
+     * made a withdrawn Shopify pill undiagnosable for a day. Mirrors the shape the OMS and Shopify
+     * getters emit, so one diagnosis works across all four.
+     */
+    protected static List<Map<String, Object>> buildConfiguredExclusions(
+            List<Map<String, Object>> rules,
+            Map<Integer, Integer> excludedByRuleCounts,
+            Map<Integer, Integer> fieldAbsentByRuleCounts) {
+        return (rules ?: []).collect { Map<String, Object> rule ->
+            Object sequenceNum = rule.get("sequenceNum")
+            return [
+                    sequenceNum     : sequenceNum,
+                    fieldExpression : rule.get("fieldExpression"),
+                    operator        : rule.get("operator"),
+                    values          : new ArrayList<String>((List<String>) rule.get("values")),
+                    excludedCount   : (excludedByRuleCounts?.get(sequenceNum) ?: 0),
+                    fieldAbsentCount: (fieldAbsentByRuleCounts?.get(sequenceNum) ?: 0),
+            ] as Map<String, Object>
+        } as List<Map<String, Object>>
+    }
+
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
         if (row == null) return [:]
         Map<String, Object> record = [:]
@@ -390,10 +415,13 @@ class NsSuiteQlOrderSupport {
         }
         String originFieldName = (String) spec.get("originFieldName")
         if (originFieldName) {
-            // Present on EVERY record on purpose. SourceFilterSupport keeps a record that lacks the
+            // Present on EVERY record on purpose. An EXCLUDE_IN rule keeps a record that lacks the
             // field it filters on ("exclude these values" cannot match an absent value), so a null
             // join key is not by itself excludable. This gives the operator a concrete value to write
             // a rule against: EXCLUDE_IN orderOrigin = NETSUITE_NATIVE.
+            // Since DAR-BE-054 an INCLUDE_IN rule DOES reject a record with no usable value, but that
+            // is no reason to stop stamping this one — a rule reading "only HOTWAX" should say so on
+            // its own terms, not work by accident because the field happened to be missing.
             record.put(originFieldName,
                     row.get(spec.get("joinKeyRowKey")) != null ? ORIGIN_HOTWAX : ORIGIN_NETSUITE_NATIVE)
         }
@@ -430,6 +458,8 @@ class NsSuiteQlOrderSupport {
         List<String> warnings = []
         int recordCount = 0
         int excludedCount = 0
+        Map<Integer, Integer> excludedByRuleCounts = [:]
+        Map<Integer, Integer> fieldAbsentByRuleCounts = [:]
         int pageCount = 0
         int offset = 0
         boolean hasMore = true
@@ -444,7 +474,18 @@ class NsSuiteQlOrderSupport {
                 // Exclusions run client-side because SuiteQL has no knowledge of tenant rules, and
                 // they run AFTER mapping so a rule names the reconciliation field an operator sees
                 // (orderOrigin), not the raw NetSuite column.
-                if (SourceFilterSupport.firstMatchingRule(record, rules) != null) { excludedCount++; continue }
+                Map<String, Object> verdict = SourceFilterSupport.evaluate(record, rules)
+                if (verdict != null) {
+                    Integer sequenceNum = (Integer) ((Map) verdict.get("rule")).get("sequenceNum")
+                    Map<Integer, Integer> bucket = SourceFilterSupport.REASON_FIELD_ABSENT == verdict.get("reason")
+                            ? fieldAbsentByRuleCounts
+                            : excludedByRuleCounts
+                    bucket.put(sequenceNum, (bucket.get(sequenceNum) ?: 0) + 1)
+                    // The flat total keeps its existing meaning: every record the configured rules
+                    // rejected, for any reason. Callers read it off the returned map.
+                    excludedCount++
+                    continue
+                }
                 // Projection runs AFTER exclusion so a rule can filter on a field the caller did not
                 // ask to keep — otherwise narrowing the output would silently disable the rule.
                 if (keepFields != null) record = project(record, keepFields)
@@ -460,7 +501,7 @@ class NsSuiteQlOrderSupport {
                     "narrow the window or raise maxPages.")
         }
         writer.write('],"metadata":')
-        writer.write(JsonOutput.toJson([
+        Map<String, Object> metadata = [
                 source       : "NETSUITE_SUITEQL",
                 recordType   : spec.get("recordType"),
                 query        : query,
@@ -471,7 +512,14 @@ class NsSuiteQlOrderSupport {
                 recordCount  : recordCount,
                 excludedCount: excludedCount,
                 warnings     : warnings,
-        ]))
+        ] as Map<String, Object>
+        // Absent entirely when no rules are configured, matching the OMS and Shopify getters: a
+        // block that appeared on every extract would read as "this always applies".
+        if (rules) {
+            metadata.put("configuredExclusions",
+                    buildConfiguredExclusions(rules, excludedByRuleCounts, fieldAbsentByRuleCounts))
+        }
+        writer.write(JsonOutput.toJson(metadata))
         writer.write('}')
         writer.flush()
 
