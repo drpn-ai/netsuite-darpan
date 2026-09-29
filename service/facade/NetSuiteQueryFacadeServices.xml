@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DAR-BE-058: create, read and list NetSuite SuiteQL check definitions from the SPA.
+
+     WHY THESE LIVE IN netsuite-darpan AND NOT BESIDE THE ENTITY. The entity is declared in darpan,
+     but the only complete statement of what makes a row VALID is
+     NsSuiteQlOrderSupport.normalizeSpec, here. netsuite-darpan depends-on darpan and not the other
+     way round, so a save service in darpan could not call it — it would have to restate every
+     format rule, and two copies of "what is a legal record type" is exactly how an operator ends
+     up with a row that saves and then answers a different question forever.
+
+     So save#NsSuiteQlSourceQuery VALIDATES BY CONSTRUCTION: it builds the same spec map the
+     extractor builds and runs normalizeSpec over it, then writes only if that returns. If it
+     saved, it will run.
+
+     The `facade.` prefix is load-bearing. Moqui names a service from its path under service/, so
+     this file yields facade.NetSuiteQueryFacadeServices.*, which the DARPAN_APP artifact group
+     already admits via its `facade\..*` AT_SERVICE pattern. Putting the file anywhere else would
+     need a SecuritySeedData change to be reachable at all. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="list" noun="NsSuiteQlSourceQueries" allow-remote="true" authenticate="true">
+        <description>Every NetSuite SuiteQL check definition the active tenant can see.</description>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="messages" type="List"><parameter name="message"/></parameter>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="queries" type="List">
+                <parameter name="query" type="Map">
+                    <parameter name="nsSuiteQlSourceQueryId"/>
+                    <parameter name="nsAuthConfigId"/>
+                    <parameter name="description"/>
+                    <parameter name="recordType"/>
+                    <parameter name="queryTemplate"/>
+                    <parameter name="isActive"/>
+                    <parameter name="fieldCount" type="Integer"/>
+                </parameter>
+            </parameter>
+        </out-parameters>
+        <actions>
+            <set field="queries" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.listQueries(ec)"/>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="messages" from="ec.message.messages"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
+
+    <service verb="get" noun="NsSuiteQlSourceQuery" allow-remote="true" authenticate="true">
+        <description>One check definition with its full column projection, for editing.</description>
+        <in-parameters>
+            <parameter name="nsSuiteQlSourceQueryId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="messages" type="List"><parameter name="message"/></parameter>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="query" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="query" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.getQuery(ec, nsSuiteQlSourceQueryId)"/>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="messages" from="ec.message.messages"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
+
+    <service verb="save" noun="NsSuiteQlSourceQuery" allow-remote="true" authenticate="true">
+        <description>Create or update a NetSuite SuiteQL check definition and its column projection.
+
+            Rejects anything the extractor would reject, by running the extractor's own
+            normalizeSpec over the submitted values before writing a row.</description>
+        <in-parameters>
+            <parameter name="nsSuiteQlSourceQueryId" required="true"/>
+            <parameter name="nsAuthConfigId" required="true"/>
+            <parameter name="description"/>
+            <parameter name="recordType" required="true"/>
+            <parameter name="fromTable" default-value="transaction"/>
+            <parameter name="dateColumn" default-value="trandate"/>
+            <parameter name="queryTemplate" default-value="RECORDS"/>
+            <parameter name="absentChildRecordType"/>
+            <parameter name="presentChildRecordType"/>
+            <parameter name="requireFulfillableOpenLine" type="Boolean" default-value="false"/>
+            <parameter name="requireOverdueShipDate" type="Boolean" default-value="false"/>
+            <parameter name="pendingStates"/>
+            <parameter name="statesExpectingShipment"/>
+            <parameter name="statesExpectingInvoice"/>
+            <parameter name="disallowedStates"/>
+            <parameter name="overdueExcludedShipMethods"/>
+            <parameter name="requireParentRecordType"/>
+            <parameter name="amountColumn"/>
+            <parameter name="minAmount"/>
+            <parameter name="joinKeyFieldName"/>
+            <parameter name="originFieldName"/>
+            <parameter name="isActive" type="Boolean" default-value="true"/>
+            <parameter name="fields" type="List" required="true">
+                <parameter name="field" type="Map">
+                    <parameter name="recordFieldName"/>
+                    <parameter name="sourceColumn"/>
+                    <parameter name="sequenceNum" type="Integer"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="messages" type="List"><parameter name="message"/></parameter>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="savedQuery" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="savedQuery" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.saveQuery(ec, context)"/>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="messages" from="ec.message.messages"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
+
+</services>
