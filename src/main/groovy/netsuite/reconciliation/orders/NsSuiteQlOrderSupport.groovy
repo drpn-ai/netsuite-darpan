@@ -68,8 +68,22 @@ class NsSuiteQlOrderSupport {
     static final String TEMPLATE_LINKED_CHILD_ABSENT = "LINKED_CHILD_ABSENT"
     /** Parent rows WITH one linked child type and WITHOUT another — "shipped but never billed". */
     static final String TEMPLATE_LINKED_CHILD_PRESENT_ABSENT = "LINKED_CHILD_PRESENT_ABSENT"
+    /**
+     * STATE_CONTRADICTION asks the question the other templates only approximate: does the order's own
+     * STATUS agree with its transaction chain? The status is NetSuite's claim about state and the chain
+     * is the evidence; a finding is a disagreement, not merely a missing child.
+     *
+     * Why that matters, measured on gorjana 2026-09-29 over two days and 8,882 orders: a plain
+     * "no ItemShip" check returned 1042 findings for yesterday, every one status B — orders NetSuite
+     * itself records as Pending Fulfillment, with 0 past their promised ship date. Nothing was wrong
+     * with any of them. Meanwhile 53 (Aug 1) and 26 (Sep 28) orders sat at status G — invoiced in
+     * 100% of 8,882 cases, so unambiguously Billed — with no fulfillment at all, and the line-level
+     * triage gate was discarding exactly those as "no fulfillable line".
+     */
+    static final String TEMPLATE_STATE_CONTRADICTION = "STATE_CONTRADICTION"
     private static final List<String> QUERY_TEMPLATES =
-            [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
+            [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
+             TEMPLATE_STATE_CONTRADICTION].asImmutable()
     private static final List<String> LINK_TEMPLATES =
             [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
 
@@ -220,6 +234,76 @@ class NsSuiteQlOrderSupport {
                     "${TEMPLATE_LINKED_CHILD_PRESENT_ABSENT}; queryTemplate is ${queryTemplate}")
         }
         boolean requireFulfillableOpenLine = "Y".equalsIgnoreCase(text(query.get("requireFulfillableOpenLine")) ?: "N")
+        // Read as a VALUE, never for truth: "N" is a non-empty String and therefore truthy in Groovy.
+        // Status codes reach interpolated SQL, so they are format-enforced rather than escaped — the
+        // same decision recordType took after `ItemShip' OR '1'='1` widened a type predicate.
+        List<String> pendingStates = parseStatusList(query.get("pendingStates"), "pendingStates")
+        List<String> statesExpectingShipment = parseStatusList(query.get("statesExpectingShipment"), "statesExpectingShipment")
+        List<String> statesExpectingInvoice = parseStatusList(query.get("statesExpectingInvoice"), "statesExpectingInvoice")
+        List<String> disallowedStates = parseStatusList(query.get("disallowedStates"), "disallowedStates")
+        if (queryTemplate == TEMPLATE_STATE_CONTRADICTION && pendingStates.isEmpty()
+                && statesExpectingShipment.isEmpty() && statesExpectingInvoice.isEmpty()
+                && disallowedStates.isEmpty()) {
+            // With no expectations every order matches, which is not a reconciliation.
+            throw new IllegalArgumentException("${TEMPLATE_STATE_CONTRADICTION} needs at least one of " +
+                    "pendingStates, statesExpectingShipment, statesExpectingInvoice or disallowedStates; " +
+                    "with none set it would report every order in the window")
+        }
+        if (queryTemplate != TEMPLATE_STATE_CONTRADICTION
+                && (pendingStates || statesExpectingShipment || statesExpectingInvoice || disallowedStates)) {
+            throw new IllegalArgumentException("status expectations are only meaningful on " +
+                    "${TEMPLATE_STATE_CONTRADICTION}; queryTemplate is ${queryTemplate}")
+        }
+
+        List<String> overdueExcludedShipMethods = parseShipMethodList(
+                query.get("overdueExcludedShipMethods"), "overdueExcludedShipMethods")
+
+        boolean requireOverdueShipDate = "Y".equalsIgnoreCase(text(query.get("requireOverdueShipDate")) ?: "N")
+        if (requireOverdueShipDate && !(queryTemplate in LINK_TEMPLATES)) {
+            // Refused rather than ignored, like the child types above: silently dropping a gate is how
+            // an operator comes to believe a run is filtered when it is not.
+            throw new IllegalArgumentException("requireOverdueShipDate is only meaningful on " +
+                    "${LINK_TEMPLATES.join(' or ')}; queryTemplate is ${queryTemplate}")
+        }
+
+        // A SCOPE qualifier rather than an expectation: it says which records the check is about
+        // ("invoices that came from a sales order"), where the state lists say what is wrong with
+        // them. Only STATE_CONTRADICTION reads it today; refused elsewhere rather than ignored, the
+        // same call taken for requireOverdueShipDate.
+        String requireParentRecordType = text(query.get("requireParentRecordType"))
+        if (requireParentRecordType) {
+            requireIdentifier(requireParentRecordType, "requireParentRecordType")
+            if (queryTemplate != TEMPLATE_STATE_CONTRADICTION) {
+                throw new IllegalArgumentException("requireParentRecordType is only meaningful on " +
+                        "${TEMPLATE_STATE_CONTRADICTION}; queryTemplate is ${queryTemplate}")
+            }
+        }
+
+        // A FLOOR, not an expectation: below it the record is not worth an operator's attention.
+        // Measured on gorjana 2026-09-01, 257 of 272 open invoices owed under $1 — rounding
+        // residue, the same false-positive floor the exchange exclusion has. Column and threshold
+        // are required together; a threshold with no column would silently gate nothing.
+        String amountColumn = text(query.get("amountColumn"))
+        String minAmount = text(query.get("minAmount"))
+        if (amountColumn || minAmount) {
+            if (!amountColumn) {
+                throw new IllegalArgumentException("minAmount ${minAmount} needs amountColumn: " +
+                        "a threshold with no column to read would gate nothing and report success")
+            }
+            if (!minAmount) {
+                throw new IllegalArgumentException("amountColumn ${amountColumn} needs minAmount: " +
+                        "naming a column with no floor would gate nothing and report success")
+            }
+            requireIdentifier(amountColumn, "amountColumn")
+            if (!(minAmount ==~ /\d{1,12}(\.\d{1,4})?/)) {
+                throw new IllegalArgumentException("minAmount must be a non-negative decimal " +
+                        "(it is interpolated into SuiteQL, not bound), got: ${minAmount}")
+            }
+            if (queryTemplate != TEMPLATE_STATE_CONTRADICTION) {
+                throw new IllegalArgumentException("amountColumn/minAmount are only meaningful on " +
+                        "${TEMPLATE_STATE_CONTRADICTION}; queryTemplate is ${queryTemplate}")
+            }
+        }
 
         String originFieldName = text(query.get("originFieldName"))
         if (originFieldName) {
@@ -243,6 +327,15 @@ class NsSuiteQlOrderSupport {
                 absentChildRecordType : absentChildRecordType,
                 presentChildRecordType: presentChildRecordType,
                 requireFulfillableOpenLine: requireFulfillableOpenLine,
+                requireOverdueShipDate    : requireOverdueShipDate,
+                pendingStates             : pendingStates,
+                statesExpectingShipment   : statesExpectingShipment,
+                statesExpectingInvoice    : statesExpectingInvoice,
+                disallowedStates          : disallowedStates,
+                requireParentRecordType   : requireParentRecordType,
+                amountColumn              : amountColumn,
+                minAmount                 : minAmount,
+                overdueExcludedShipMethods: overdueExcludedShipMethods,
         ] as Map<String, Object>
     }
 
@@ -302,7 +395,7 @@ class NsSuiteQlOrderSupport {
      * SuiteQL table, and letting a config choose a non-unique sort would reintroduce exactly the
      * page-skew this prevents.
      */
-    static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate) {
+    static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate, String asOfDate = null) {
         requireIsoDate(fromDate, "fromDate")
         requireIsoDate(toDate, "toDate")
         String dateColumn = (String) spec.get("dateColumn")
@@ -319,6 +412,10 @@ class NsSuiteQlOrderSupport {
                     "ORDER BY id"
         }
 
+        if (template == TEMPLATE_STATE_CONTRADICTION) {
+            return buildStateContradictionQuery(spec, fromDate, toDate, asOfDate, dateColumn)
+        }
+
         StringBuilder sql = new StringBuilder()
         sql << "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} t "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
@@ -329,6 +426,15 @@ class NsSuiteQlOrderSupport {
         }
         sql << "AND NOT ${linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '')} "
         if (spec.get("requireFulfillableOpenLine")) sql << "AND ${FULFILLABLE_OPEN_LINE_PREDICATE} "
+        if (spec.get("requireOverdueShipDate")) {
+            if (!asOfDate) {
+                throw new IllegalArgumentException("requireOverdueShipDate needs an asOfDate: the gate " +
+                        "compares shipdate against the day the run is taken, and omitting it would " +
+                        "silently drop the gate rather than fail")
+            }
+            requireIsoDate(asOfDate, "asOfDate")
+            sql << "AND t.shipdate IS NOT NULL AND t.shipdate < TO_DATE('${asOfDate}', 'YYYY-MM-DD') "
+        }
         sql << "ORDER BY t.id"
         return sql.toString()
     }
@@ -342,6 +448,177 @@ class NsSuiteQlOrderSupport {
      * (fulfillment p99 4 days, invoice p99 36), so bounding it would report every order near the end of
      * the window as having no child, which is the false positive this feature exists to avoid.
      */
+    /**
+     * Does the order's status agree with its chain?
+     *
+     * <p>Three branches, each a different disagreement, OR-ed together. A status named in no list is
+     * not reported at all — that is how H (closed with neither child 39 times in 55, i.e. cancelled)
+     * stays out without needing an exclusion rule.
+     *
+     * <p>Only the pending branch is time-sensitive. An order at a post-billing status with no
+     * fulfillment is wrong today; an order still pending is wrong only once it passes the date
+     * NetSuite itself promised.
+     */
+    private static String buildStateContradictionQuery(Map<String, Object> spec, String fromDate,
+                                                       String toDate, String asOfDate, String dateColumn) {
+        List<String> pending = (List<String>) spec.get("pendingStates")
+        List<String> expectShipment = (List<String>) spec.get("statesExpectingShipment")
+        List<String> expectInvoice = (List<String>) spec.get("statesExpectingInvoice")
+        // Wrong on its own terms rather than in disagreement with the chain: "nothing should sit in
+        // Pending Billing" holds whether or not an invoice exists, so this is the one expectation
+        // here that needs no chain lookup at all.
+        List<String> disallowed = (List<String>) spec.get("disallowedStates")
+        String noShipment = "NOT " + linkedChildPredicate(false, "ItemShip", "")
+        String noInvoice = "NOT " + linkedChildPredicate(false, "CustInvc", "2")
+
+        if (pending && !asOfDate) {
+            throw new IllegalArgumentException("pendingStates needs an asOfDate: those rows are a " +
+                    "finding only once past the promised ship date, and omitting it would report every " +
+                    "pending order in the window")
+        }
+        if (asOfDate) requireIsoDate(asOfDate, "asOfDate")
+
+        // Collected-in-store orders have no ship deadline to miss. A NOT EXISTS rather than a join so
+        // the FROM stays single-table like every other predicate here. Pending branch ONLY: a picked-up
+        // order is still fulfilled and still invoiced, and excluding it from those would hide real
+        // failures behind a delivery choice.
+        List<String> excludedMethods = (List<String>) spec.get("overdueExcludedShipMethods")
+        String notCollected = excludedMethods
+                ? " AND NOT EXISTS (SELECT 1 FROM shipitem sm WHERE sm.id = t.shipmethod " +
+                  "AND sm.itemid IN ${inList(excludedMethods)})"
+                : ""
+
+        // The shipment branch alone carries the line gate. An order with nothing shippable on it was
+        // never going to have a fulfillment — measured: every "billed, not shipped" finding on
+        // 2026-08-01 was a gift-card order, and NetSuite's own fulfillable flag already separates
+        // them (6803 of 6856 status-G orders had an open fulfillable line; the 53 that did not were
+        // exactly those findings). Reading the flag beats naming the SKU: it generalises to every
+        // unshippable item and does not rot when the item id changes.
+        String shippableLine = spec.get("requireFulfillableOpenLine") ? " AND ${FULFILLABLE_OPEN_LINE_PREDICATE}" : ""
+
+        // Condition, code and wording travel together so a branch cannot reach the WHERE without a
+        // matching label. They were three parallel lists before, which is how the first cut of this
+        // template shipped a CASE whose ELSE claimed NOT_INVOICED for rows that had reached the
+        // result some other way.
+        //
+        // Wording is deliberately generic across each status list — "billed, never shipped" reads
+        // better but is only true for D and G, and would be a lie on E and F. It has to stay generic
+        // across RECORD TYPES too: this template ran only on sales orders until NS_INVOICE_OPEN, and
+        // the STATUS_NOT_ALLOWED brief said "Order is in a status ..." on a CustInvc for exactly one
+        // live run. Name no noun the config can contradict. The brief is written
+        // by the QUERY rather than composed in the UI, so it is frozen into the run document: a
+        // result re-opened in six months says what it said the day it ran.
+        List<List<String>> findings = []
+        if (pending) {
+            findings.add([("t.status IN ${inList(pending)} AND t.shipdate IS NOT NULL " +
+                    "AND t.shipdate < TO_DATE('${asOfDate}', 'YYYY-MM-DD') AND ${noShipment}" +
+                    "${notCollected}").toString(),
+                          "OVERDUE_NOT_SHIPPED", "Past its ship date, not shipped"])
+        }
+        if (expectShipment) {
+            findings.add(["t.status IN ${inList(expectShipment)} AND ${noShipment}${shippableLine}".toString(),
+                          "NOT_SHIPPED", "Status expects a shipment; none recorded"])
+        }
+        if (expectInvoice) {
+            findings.add(["t.status IN ${inList(expectInvoice)} AND ${noInvoice}".toString(),
+                          "NOT_INVOICED", "Status expects an invoice; none recorded"])
+        }
+        // Last, so that where it overlaps a chain expectation the more specific reason wins the
+        // label: "billed but never shipped" tells an operator what to go fix, where "should not be
+        // in this status" only tells them where it is sitting.
+        if (disallowed) {
+            findings.add(["t.status IN ${inList(disallowed)}".toString(),
+                          "STATUS_NOT_ALLOWED", "In a status it should never rest in"])
+        }
+
+        List<String> branches = findings.collect { "(${it[0]})".toString() }
+
+        // Codes are code-owned, not configurable: a finding that does not say WHICH contradiction it
+        // is leaves the operator to re-derive it from the status, and the config layer cannot express
+        // a CASE anyway (COLUMN_EXPRESSION allows a column or one aliased function call).
+        //
+        // A single-branch query needs no CASE at all — and must not emit one, since `CASE ELSE x END`
+        // is not SQL. Otherwise every branch but the last is a WHEN and the last is the ELSE, which
+        // keeps the generated SQL the same shape it had before disallowedStates existed.
+        String contradiction = caseOver(findings, 1)
+        String briefColumn = caseOver(findings, 2)
+
+        StringBuilder sql = new StringBuilder()
+        sql << "SELECT ${selectColumns(spec).join(', ')}, ${contradiction} AS contradiction, " +
+                "${briefColumn} AS contradiction_brief "
+        sql << "FROM ${spec.get('fromTable')} t "
+        sql << "WHERE t.type = '${spec.get('recordType')}' "
+        sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
+        sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
+        String parentType = (String) spec.get("requireParentRecordType")
+        if (parentType) sql << "AND ${linkedParentPredicate(parentType)} "
+        // IS NOT NULL is redundant against SQL's three-valued logic — `NULL >= 1` is unknown and
+        // already drops the row — but written out so which way the gate falls is readable without
+        // knowing that. gorjana has no null balances today, so the behaviour is otherwise untested.
+        String amountCol = (String) spec.get("amountColumn")
+        if (amountCol) {
+            sql << "AND t.${amountCol} IS NOT NULL AND t.${amountCol} >= ${spec.get('minAmount')} "
+        }
+        sql << "AND (${branches.join(' OR ')}) "
+        sql << "ORDER BY t.id"
+        return sql.toString()
+    }
+
+    /**
+     * Renders one of the parallel label columns: the value at {@code slot} in each finding triple,
+     * keyed by that finding's condition. Every branch but the last becomes a WHEN and the last
+     * becomes the ELSE, so a row in the result always leaves with a reason.
+     */
+    private static String caseOver(List<List<String>> findings, int slot) {
+        if (findings.size() == 1) return "'${findings[0][slot]}'".toString()
+        List<String> whens = findings[0..-2].collect { "WHEN ${it[0]} THEN '${it[slot]}'".toString() }
+        return "CASE ${whens.join(' ')} ELSE '${findings[-1][slot]}' END".toString()
+    }
+
+    /**
+     * Shipping method NAMES, which carry spaces ("Store Pickup") and so cannot use the identifier
+     * check the status codes use. Still a whitelist rather than escaping: these are interpolated into
+     * SuiteQL text, and a quote or semicolon is refused outright.
+     */
+    private static List<String> parseShipMethodList(Object raw, String label) {
+        String value = text(raw)
+        if (!value) return []
+        return value.split(",").collect { it.trim() }.findAll { it }.collect { String name ->
+            if (!(name ==~ /[A-Za-z0-9][A-Za-z0-9 _\-]{0,40}/)) {
+                throw new IllegalArgumentException("${label} must be comma-separated shipping method " +
+                        "names (letters, digits, spaces, dashes), got: ${name}")
+            }
+            return name
+        }
+    }
+
+    /** Plain NetSuite status codes only: letters and digits, comma separated. */
+    private static List<String> parseStatusList(Object raw, String label) {
+        String value = text(raw)
+        if (!value) return []
+        return value.split(",").collect { it.trim() }.findAll { it }.collect { String code ->
+            if (!(code ==~ /[A-Za-z0-9]{1,8}/)) {
+                throw new IllegalArgumentException("${label} must be comma-separated status codes, got: ${code}")
+            }
+            return code.toUpperCase()
+        }
+    }
+
+    private static String inList(List<String> codes) {
+        return "(" + codes.collect { "'${it}'" }.join(",") + ")"
+    }
+
+    /**
+     * The link read backwards: nextdoc is the record under test, previousdoc is what produced it.
+     * Alias suffix 0 because l/c and l2/c2 are already taken by the child predicates, and a silent
+     * alias collision inside a correlated subquery changes which row it tests.
+     */
+    private static String linkedParentPredicate(String parentRecordType) {
+        return "EXISTS (SELECT 1 FROM ${LINK_TABLE} l0 " +
+                "JOIN transaction p ON p.id = l0.previousdoc " +
+                "WHERE l0.nextdoc = t.id AND p.type = '${parentRecordType}')"
+    }
+
     private static String linkedChildPredicate(boolean present, String childRecordType, String suffix) {
         String link = "l${suffix}", child = "c${suffix}"
         return "EXISTS (SELECT 1 FROM ${LINK_TABLE} ${link} " +
@@ -355,6 +632,16 @@ class NsSuiteQlOrderSupport {
      * non-inventory orders can never have one — or if its lines were deliberately closed. Both are read
      * from the line, which is why this cannot be a post-extraction sourceFilters rule: a filter can only
      * match a field the extractor already emitted.
+     */
+    /**
+     * THE OVERDUE GATE. "Has no fulfillment" and "is late" are the same question only at distance: run
+     * over a day eight weeks back the answer was 4, run over YESTERDAY it was 1042 — every one status
+     * B, a whole day's order book that simply had not shipped yet. Measured lag is p50 0 / p95 2 /
+     * max 15 days, so any recent window is mostly pipeline.
+     *
+     * shipdate is the date NetSuite itself committed to, which beats trandate-plus-a-guessed-lag: it
+     * is the business's own promise rather than our estimate of one. A null shipdate is NOT overdue —
+     * an order nobody promised a date for cannot be late.
      */
     private static final String FULFILLABLE_OPEN_LINE_PREDICATE =
             "EXISTS (SELECT 1 FROM transactionline tl WHERE tl.transaction = t.id " +
@@ -407,12 +694,30 @@ class NsSuiteQlOrderSupport {
         } as List<Map<String, Object>>
     }
 
+    /**
+     * Row key -> record field for columns a template contributes itself. They are not in
+     * NsSuiteQlSourceQueryField because an operator does not choose them: the template emits them or
+     * it does not, and a projection that could omit them would let a run report findings with no
+     * stated reason.
+     */
+    private static final Map<String, String> TEMPLATE_RECORD_COLUMNS = [
+            contradiction      : "contradiction",
+            contradiction_brief: "contradictionBrief",
+    ].asImmutable()
+
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
         if (row == null) return [:]
         Map<String, Object> record = [:]
         for (Map<String, Object> field : (List<Map<String, Object>>) spec.get("fields")) {
             record.put((String) field.get("recordFieldName"), text(row.get(field.get("rowKey"))))
         }
+        // Columns the TEMPLATE adds, as opposed to the ones an operator configured. Without this the
+        // query selected `contradiction` and the record dropped it — 57 findings arrived with no
+        // disagreement value at all, because mapping only walked the configured projection.
+        TEMPLATE_RECORD_COLUMNS.each { String rowKey, String recordFieldName ->
+            if (row.containsKey(rowKey)) record.put(recordFieldName, text(row.get(rowKey)))
+        }
+
         String originFieldName = (String) spec.get("originFieldName")
         if (originFieldName) {
             // Present on EVERY record on purpose. An EXCLUDE_IN rule keeps a record that lacks the
@@ -454,7 +759,11 @@ class NsSuiteQlOrderSupport {
         List<Map<String, Object>> rules = SourceFilterSupport.parseRules(options.get("filterRules"))
         List<String> keepFields = normalizeKeepFields(options.get("keepFields"))
 
-        String query = buildRecordsQuery(spec, fromDate, toDate)
+        // The day the run is taken, for the time-sensitive branches. Supplied by the caller rather
+        // than read here from the clock: a query built from a hidden "now" is not reproducible, and
+        // the same run replayed for an audit would quietly answer a different question.
+        String asOfDate = (String) options.get("asOfDate")
+        String query = buildRecordsQuery(spec, fromDate, toDate, asOfDate)
         List<String> warnings = []
         int recordCount = 0
         int excludedCount = 0

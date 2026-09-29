@@ -106,9 +106,14 @@ List<Map<String, Object>> queryFieldRows = ec.entity.find("darpan.reconciliation
         .collect { [recordFieldName  : it.recordFieldName, sourceColumn: it.sourceColumn,
                     sourceColumnAlias: it.sourceColumnAlias, sequenceNum: it.sequenceNum] as Map<String, Object> }
 
-String fromDate, thruDate, suiteQlUrl
+String fromDate, thruDate, suiteQlUrl, asOfDateValue
 Map<String, Object> querySpec
 try {
+    // Today, in the tenant's zone rather than the JVM's — the same lesson DAR-BE-057 taught about the
+    // window bounds: a calendar day derived in the wrong zone is off by one for anyone east of UTC.
+    asOfDateValue = java.time.LocalDate.now(
+            java.time.ZoneId.of(darpan.facade.common.TenantAccessSupport.resolveActiveTenantTimeZone(ec) as String)
+    ).toString()
     fromDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowStart)
     thruDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowEnd)
     suiteQlUrl = NsSuiteQlOrderSupport.suiteQlUrlFromTokenUrl(authConfig.tokenUrl?.toString())
@@ -124,7 +129,16 @@ try {
              queryTemplate         : queryRow.queryTemplate,
              absentChildRecordType : queryRow.absentChildRecordType,
              presentChildRecordType: queryRow.presentChildRecordType,
-             requireFulfillableOpenLine: queryRow.requireFulfillableOpenLine],
+             requireFulfillableOpenLine: queryRow.requireFulfillableOpenLine,
+             requireOverdueShipDate: queryRow.requireOverdueShipDate,
+             pendingStates         : queryRow.pendingStates,
+             statesExpectingShipment: queryRow.statesExpectingShipment,
+             statesExpectingInvoice: queryRow.statesExpectingInvoice,
+             disallowedStates      : queryRow.disallowedStates,
+             requireParentRecordType: queryRow.requireParentRecordType,
+             amountColumn          : queryRow.amountColumn,
+             minAmount             : queryRow.minAmount,
+             overdueExcludedShipMethods: queryRow.overdueExcludedShipMethods],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
@@ -198,6 +212,10 @@ try {
                  fromDate   : fromDate,
                  toDate     : thruDate,
                  pageSize   : (pageSize != null ? pageSize as Integer : null),
+                 // The run's own day, resolved in the window's zone rather than the JVM's. The
+                 // time-sensitive branches compare a promised ship date against it, and reading a
+                 // clock deeper in the stack would make the query depend on where it executed.
+                 asOfDate   : asOfDateValue,
                  keepFields : (keepRecordFields instanceof List ? keepRecordFields : null),
                  filterRules: (sourceFilters instanceof List ? sourceFilters : null)],
                 { String query, int limit, int offset ->
