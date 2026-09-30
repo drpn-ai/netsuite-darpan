@@ -2,6 +2,7 @@ import darpan.facade.common.DataManagerSupport
 import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.facade.reconciliation.RunObservability
+import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import netsuite.reconciliation.inventory.NsTokenCache
@@ -138,7 +139,10 @@ try {
              requireParentRecordType: queryRow.requireParentRecordType,
              amountColumn          : queryRow.amountColumn,
              minAmount             : queryRow.minAmount,
-             overdueExcludedShipMethods: queryRow.overdueExcludedShipMethods],
+             overdueExcludedShipMethods: queryRow.overdueExcludedShipMethods,
+             // Guarded: EntityValue.get THROWS on a field the entity does not declare, and a
+             // deployment whose entity predates lineKeyColumn must keep running every other check.
+             lineKeyColumn         : queryRow.isField("lineKeyColumn") ? queryRow.get("lineKeyColumn") : null],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
@@ -262,6 +266,12 @@ try {
     fileName = outputFileName
     fileLocation = DataManagerSupport.childLocation(outputBaseLocation, outputFileName)
     DataManagerSupport.moveIntoLocation(ec, workFile, fileLocation as String)
+    // DAR-UI-044: what the source filters dropped, beside the extract, for the conclude pass.
+    try {
+        ExcludedRecordsSidecar.writeBeside(ec, (Map) extraction.excludedCollector, outputBaseLocation, outputFileName, outputDirectory)
+    } catch (Exception sidecarError) {
+        warnings = ((warnings ?: []) as List) + ["Excluded-records sidecar not written: ${sidecarError.message}".toString()]
+    }
 } catch (Exception e) {
     errors = [e.message ?: e.toString()]
     dataAvailable = false

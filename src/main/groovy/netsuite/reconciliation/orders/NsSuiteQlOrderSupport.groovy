@@ -2,6 +2,7 @@ package netsuite.reconciliation.orders
 
 import darpan.facade.common.OutboundHttpPolicy
 import darpan.reconciliation.source.SourceFilterSupport
+import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
 import groovy.json.JsonOutput
 import groovy.transform.CompileStatic
 
@@ -81,9 +82,23 @@ class NsSuiteQlOrderSupport {
      * triage gate was discarding exactly those as "no fulfillable line".
      */
     static final String TEMPLATE_STATE_CONTRADICTION = "STATE_CONTRADICTION"
+    /**
+     * One record per KEYED sales-order line, keyed by the header join key plus a configured line key
+     * (tri-system order runs, D6). The OMS and Shopify legs reconcile at line grain; a header-grain
+     * NetSuite extract cannot say WHICH line of an order failed to ship.
+     *
+     * The line-key gate is the only line gate, and that is measured, not assumed (gorjana, 2026-09-30).
+     * It drops shipping, payment and tax-variance lines and kit components, none of which carry the hc
+     * line id. A first cut also gated on `fulfillable = 'T'`, and the first live run showed why that is
+     * wrong: e-gift cards are NonInvtPart lines with fulfillable 'F' that NetSuite nevertheless records
+     * as shipped, so every gift-card line read as "completed in OMS, never shipped" - 73 false findings
+     * over two days. Discount lines DO carry their parent's line id; the template projects itemType so
+     * a rule set excludes them by name rather than by a gate nobody can see.
+     */
+    static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
-             TEMPLATE_STATE_CONTRADICTION].asImmutable()
+             TEMPLATE_STATE_CONTRADICTION, TEMPLATE_SALES_LINES].asImmutable()
     private static final List<String> LINK_TEMPLATES =
             [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
 
@@ -205,6 +220,43 @@ class NsSuiteQlOrderSupport {
         }
         boolean linkTemplate = LINK_TEMPLATES.contains(queryTemplate)
 
+        // Read through containsKey, never a bare get: the row may be a Moqui EntityValue, whose get()
+        // THROWS on a field its entity does not declare, and a deployment whose entity predates this
+        // column must keep running every other template. containsKey answers false there.
+        String lineKeyColumn = query.containsKey("lineKeyColumn") ? text(query.get("lineKeyColumn")) : null
+        if (queryTemplate == TEMPLATE_SALES_LINES) {
+            // The template joins transactionline to its TRANSACTION, like the link templates.
+            if (fromTable != DEFAULT_FROM_TABLE) {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} joins transactionline to " +
+                        "its transaction, so fromTable must be ${DEFAULT_FROM_TABLE}, got: ${fromTable}")
+            }
+            if (!lineKeyColumn) {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} requires lineKeyColumn: " +
+                        "the transactionline column that names the line on the other side")
+            }
+            requireIdentifier(lineKeyColumn, "lineKeyColumn")
+            // A line with no order to belong to cannot be matched, and the query gates on the join
+            // key's column, so there has to be one.
+            if (!joinKeyRowKey) {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} requires joinKeyFieldName: " +
+                        "lines are matched under their order's header key")
+            }
+            // Header columns are emitted as t.<col>, which only means something for a bare column.
+            // Expressions are refused rather than rewritten: a named column list carrying
+            // BUILTIN.DISPLAY(...) came back as an opaque 400 from gorjana where plain columns worked.
+            normalized.each { Map<String, Object> f ->
+                String col = ((String) f.get("sourceColumn")).trim()
+                if (!IDENTIFIER.matcher(col).matches()) {
+                    throw new IllegalArgumentException("${TEMPLATE_SALES_LINES} fields must be bare header " +
+                            "columns; ${f.get('recordFieldName')} maps to the expression: ${col}")
+                }
+            }
+        } else if (lineKeyColumn) {
+            // Refused rather than ignored, like every other template-specific attribute here.
+            throw new IllegalArgumentException("lineKeyColumn is only meaningful on " +
+                    "${TEMPLATE_SALES_LINES}; queryTemplate is ${queryTemplate}")
+        }
+
         String absentChildRecordType = text(query.get("absentChildRecordType"))
         String presentChildRecordType = text(query.get("presentChildRecordType"))
         if (linkTemplate) {
@@ -234,6 +286,12 @@ class NsSuiteQlOrderSupport {
                     "${TEMPLATE_LINKED_CHILD_PRESENT_ABSENT}; queryTemplate is ${queryTemplate}")
         }
         boolean requireFulfillableOpenLine = "Y".equalsIgnoreCase(text(query.get("requireFulfillableOpenLine")) ?: "N")
+        if (requireFulfillableOpenLine && queryTemplate == TEMPLATE_SALES_LINES) {
+            // An order-level "has an open fulfillable line" gate would silently drop the fulfilled lines
+            // this template exists to compare.
+            throw new IllegalArgumentException("requireFulfillableOpenLine is not meaningful on " +
+                    "${TEMPLATE_SALES_LINES}, which emits every keyed line")
+        }
         // Read as a VALUE, never for truth: "N" is a non-empty String and therefore truthy in Groovy.
         // Status codes reach interpolated SQL, so they are format-enforced rather than escaped — the
         // same decision recordType took after `ItemShip' OR '1'='1` widened a type predicate.
@@ -257,6 +315,10 @@ class NsSuiteQlOrderSupport {
 
         List<String> overdueExcludedShipMethods = parseShipMethodList(
                 query.get("overdueExcludedShipMethods"), "overdueExcludedShipMethods")
+        if (overdueExcludedShipMethods && queryTemplate == TEMPLATE_SALES_LINES) {
+            throw new IllegalArgumentException("overdueExcludedShipMethods is not meaningful on " +
+                    "${TEMPLATE_SALES_LINES}; queryTemplate is ${queryTemplate}")
+        }
 
         boolean requireOverdueShipDate = "Y".equalsIgnoreCase(text(query.get("requireOverdueShipDate")) ?: "N")
         if (requireOverdueShipDate && !(queryTemplate in LINK_TEMPLATES)) {
@@ -336,6 +398,7 @@ class NsSuiteQlOrderSupport {
                 amountColumn              : amountColumn,
                 minAmount                 : minAmount,
                 overdueExcludedShipMethods: overdueExcludedShipMethods,
+                lineKeyColumn             : lineKeyColumn,
         ] as Map<String, Object>
     }
 
@@ -414,6 +477,10 @@ class NsSuiteQlOrderSupport {
 
         if (template == TEMPLATE_STATE_CONTRADICTION) {
             return buildStateContradictionQuery(spec, fromDate, toDate, asOfDate, dateColumn)
+        }
+
+        if (template == TEMPLATE_SALES_LINES) {
+            return buildSalesLinesQuery(spec, fromDate, toDate, dateColumn)
         }
 
         StringBuilder sql = new StringBuilder()
@@ -565,6 +632,38 @@ class NsSuiteQlOrderSupport {
     }
 
     /**
+     * One row per keyed line. Header columns are aliased back to their own names so the
+     * rows come back keyed exactly as mapRowToRecord reads them; the line columns take the aliases
+     * TEMPLATE_RECORD_COLUMNS maps.
+     *
+     * ORDER BY t.id, tl.id: t.id alone is no longer a total order once a header fans out into lines,
+     * and offset paging over a partial order can repeat or skip rows across pages.
+     */
+    private static String buildSalesLinesQuery(Map<String, Object> spec, String fromDate, String toDate,
+                                               String dateColumn) {
+        String lineKey = (String) spec.get("lineKeyColumn")
+        List<String> header = ((List<Map<String, Object>>) spec.get("fields")).collect { Map<String, Object> f ->
+            "t.${((String) f.get('sourceColumn')).trim()} AS ${f.get('rowKey')}".toString()
+        }
+        String joinKeyColumn = ((List<Map<String, Object>>) spec.get("fields"))
+                .find { it.get("recordFieldName") == spec.get("joinKeyFieldName") }
+                .get("sourceColumn").toString().trim()
+
+        StringBuilder sql = new StringBuilder()
+        sql << "SELECT ${header.join(', ')}, tl.${lineKey} AS order_line_id, " +
+                "tl.quantityshiprecv AS quantity_shipped, tl.quantitybackordered AS quantity_backordered, " +
+                "tl.isclosed AS line_closed, tl.id AS line_id, tl.itemtype AS item_type "
+        sql << "FROM ${spec.get('fromTable')} t JOIN transactionline tl ON tl.transaction = t.id "
+        sql << "WHERE t.type = '${spec.get('recordType')}' "
+        sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
+        sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
+        sql << "AND tl.mainline = 'F' "
+        sql << "AND tl.${lineKey} IS NOT NULL AND t.${joinKeyColumn} IS NOT NULL "
+        sql << "ORDER BY t.id, tl.id"
+        return sql.toString()
+    }
+
+    /**
      * Renders one of the parallel label columns: the value at {@code slot} in each finding triple,
      * keyed by that finding's condition. Every branch but the last becomes a WHEN and the last
      * becomes the ELSE, so a row in the result always leaves with a reason.
@@ -703,6 +802,13 @@ class NsSuiteQlOrderSupport {
     private static final Map<String, String> TEMPLATE_RECORD_COLUMNS = [
             contradiction      : "contradiction",
             contradiction_brief: "contradictionBrief",
+            // SALES_LINES. Mapped only when present in the row, so no other template gains a field.
+            order_line_id       : "orderLineId",
+            quantity_shipped    : "quantityShipped",
+            quantity_backordered: "quantityBackordered",
+            line_closed         : "lineClosed",
+            line_id             : "lineId",
+            item_type           : "itemType",
     ].asImmutable()
 
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
@@ -769,6 +875,8 @@ class NsSuiteQlOrderSupport {
         int excludedCount = 0
         Map<Integer, Integer> excludedByRuleCounts = [:]
         Map<Integer, Integer> fieldAbsentByRuleCounts = [:]
+        // DAR-UI-044: what the rules drop, whole and before projection, for the conclude pass.
+        Map excludedCollector = ExcludedRecordsSidecar.newCollector()
         int pageCount = 0
         int offset = 0
         boolean hasMore = true
@@ -793,6 +901,7 @@ class NsSuiteQlOrderSupport {
                     // The flat total keeps its existing meaning: every record the configured rules
                     // rejected, for any reason. Callers read it off the returned map.
                     excludedCount++
+                    ExcludedRecordsSidecar.collect(excludedCollector, record, (Map) verdict.get("rule"))
                     continue
                 }
                 // Projection runs AFTER exclusion so a rule can filter on a field the caller did not
@@ -838,6 +947,7 @@ class NsSuiteQlOrderSupport {
                 pageCount    : pageCount,
                 dataAvailable: recordCount > 0,
                 warnings     : warnings,
+                excludedCollector: excludedCollector,
         ] as Map<String, Object>
     }
 

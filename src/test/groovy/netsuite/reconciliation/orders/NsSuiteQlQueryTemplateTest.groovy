@@ -743,4 +743,185 @@ class NsSuiteQlQueryTemplateTest {
                     "2026-8-1", "2026-09-01")
         }
     }
+
+    // ------------------------------------------------------------------ SALES_LINES (DAR-BE tri-system D6)
+
+    /**
+     * The gorjana NetSuite leg of the tri-system order runs, at LINE grain: the header join key is the
+     * OMS orderId (custbody_hc_order_id) and the line key is the OMS orderItemSeqId
+     * (custcol_hc_order_line_id, "01", "02", ...). Configured fields are header columns only; the
+     * template contributes the line columns itself.
+     */
+    private static Map<String, Object> salesLinesSpec(Map<String, Object> overrides = [:],
+                                                      List<Map<String, Object>> fields = null) {
+        Map<String, Object> q = [nsSuiteQlSourceQueryId: "NS_SALES_LINES", recordType: "SalesOrd",
+                                 fromTable: "transaction", dateColumn: "trandate",
+                                 queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id",
+                                 joinKeyFieldName: "orderId", originFieldName: "orderOrigin"] + overrides
+        return NsSuiteQlOrderSupport.normalizeSpec(q, fields ?:
+                [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                 [recordFieldName: "netsuiteOrderId", sourceColumn: "tranid", sequenceNum: 2]])
+    }
+
+    @Test
+    void salesLinesEmitsTheLineGrainQueryExactly() {
+        String q = NsSuiteQlOrderSupport.buildRecordsQuery(salesLinesSpec(), "2026-09-15", "2026-09-18")
+        assertEquals("SELECT t.custbody_hc_order_id AS custbody_hc_order_id, t.tranid AS tranid, " +
+                "tl.custcol_hc_order_line_id AS order_line_id, tl.quantityshiprecv AS quantity_shipped, " +
+                "tl.quantitybackordered AS quantity_backordered, tl.isclosed AS line_closed, tl.id AS line_id, " +
+                "tl.itemtype AS item_type " +
+                "FROM transaction t JOIN transactionline tl ON tl.transaction = t.id " +
+                "WHERE t.type = 'SalesOrd' " +
+                "AND t.trandate >= TO_DATE('2026-09-15', 'YYYY-MM-DD') " +
+                "AND t.trandate < TO_DATE('2026-09-18', 'YYYY-MM-DD') " +
+                "AND tl.mainline = 'F' " +
+                "AND tl.custcol_hc_order_line_id IS NOT NULL AND t.custbody_hc_order_id IS NOT NULL " +
+                "ORDER BY t.id, tl.id", q)
+    }
+
+    @Test
+    void salesLinesMapsTheTemplateLineColumnsAndStampsOrigin() {
+        Map<String, Object> record = NsSuiteQlOrderSupport.mapRowToRecord(salesLinesSpec(),
+                [custbody_hc_order_id: "M100", tranid: "SO1", order_line_id: "01", quantity_shipped: "1",
+                 quantity_backordered: "0", line_closed: "F", line_id: "7", item_type: "InvtPart", links: []])
+        assertEquals([orderId: "M100", netsuiteOrderId: "SO1", orderLineId: "01", quantityShipped: "1",
+                      quantityBackordered: "0", lineClosed: "F", lineId: "7", itemType: "InvtPart",
+                      orderOrigin: "HOTWAX"], record)
+    }
+
+    /**
+     * DAR-UI-044. The rows a rule drops are kept whole for the conclude pass: run C's backorder proof is
+     * exactly the unshipped line this filter removes, and the keepFields projection must not strip the
+     * field that proves it.
+     */
+    @Test
+    void excludedLinesAreCollectedWholeForTheConcludePass() {
+        StringWriter out = new StringWriter()
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 10,
+                 keepFields: ["orderId", "orderLineId"],
+                 filterRules: [[sequenceNum: 1, fieldExpression: "quantityShipped", operator: "EXCLUDE_IN", filterValues: "0"]]],
+                { String q, int limit, int offset ->
+                    [items: [[custbody_hc_order_id: "M1", tranid: "SO1", order_line_id: "01", quantity_shipped: "0",
+                              quantity_backordered: "1", line_closed: "F", line_id: "1", item_type: "InvtPart"]], hasMore: false]
+                })
+        Map c = (Map) result.excludedCollector
+        assertEquals(1, c.total)
+        assertEquals("1", ((Map) ((List) c.records)[0]).quantityBackordered, "the whole record, not the keepFields projection")
+        assertEquals("1:quantityShipped", ((Map) ((List) c.records)[0])._excludedBy)
+    }
+
+    @Test
+    void noRulesCollectNothing() {
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
+                [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 10],
+                { String q, int limit, int offset -> [items: [], hasMore: false] })
+        assertEquals(0, ((Map) result.excludedCollector).total)
+    }
+
+    @Test
+    void salesLinesFilterDropsUnshippedLinesAndKeepFieldsStillProjects() {
+        StringWriter out = new StringWriter()
+        List<Integer> offsets = []
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 2,
+                 keepFields: ["orderId", "orderLineId", "quantityShipped"],
+                 filterRules: [[sequenceNum: 1, fieldExpression: "quantityShipped",
+                                operator: "EXCLUDE_IN", filterValues: "0"]]],
+                { String q, int limit, int offset ->
+                    offsets << offset
+                    offset == 0
+                            ? [items: [[custbody_hc_order_id: "M1", order_line_id: "01", quantity_shipped: "1"],
+                                       [custbody_hc_order_id: "M1", order_line_id: "02", quantity_shipped: "0"]],
+                               hasMore: true]
+                            : [items: [[custbody_hc_order_id: "M2", order_line_id: "01", quantity_shipped: "2"]],
+                               hasMore: false]
+                })
+        assertEquals([0, 2], offsets)
+        assertEquals(2, result.recordCount)
+        assertEquals(1, result.excludedCount)
+        Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        assertEquals([[orderId: "M1", orderLineId: "01", quantityShipped: "1"],
+                      [orderId: "M2", orderLineId: "01", quantityShipped: "2"]], doc.records)
+    }
+
+    @Test
+    void salesLinesRequiresALineKeyAndAHeaderJoinKey() {
+        def noLine = assertThrows(IllegalArgumentException) { salesLinesSpec([lineKeyColumn: null]) }
+        assertTrue(noLine.message.contains("lineKeyColumn"), noLine.message)
+        def noJoin = assertThrows(IllegalArgumentException) {
+            salesLinesSpec([joinKeyFieldName: null, originFieldName: null])
+        }
+        assertTrue(noJoin.message.contains("joinKeyFieldName"), noJoin.message)
+    }
+
+    @Test
+    void salesLinesLineKeyMustBeAPlainIdentifier() {
+        ["custcol_x' OR '1'='1", "custcol_x; DROP", "TO_CHAR(custcol_x)", "custcol x"].each { String hostile ->
+            assertThrows(IllegalArgumentException, { salesLinesSpec([lineKeyColumn: hostile]) },
+                    "must reject: ${hostile}")
+        }
+    }
+
+    @Test
+    void salesLinesRequiresTheTransactionTable() {
+        def e = assertThrows(IllegalArgumentException) { salesLinesSpec([fromTable: "item"]) }
+        assertTrue(e.message.contains("transaction"), e.message)
+    }
+
+    @Test
+    void salesLinesRefusesFunctionCallColumns() {
+        // Measured on gorjana: a named column list carrying BUILTIN.DISPLAY(...) failed with an opaque
+        // 400 where plain columns worked, and a t.-prefixed expression is not what the template emits.
+        def e = assertThrows(IllegalArgumentException) {
+            salesLinesSpec([:], [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                                 [recordFieldName: "orderDate", sourceColumn: "TO_CHAR(trandate, 'YYYY-MM-DD') AS trandate",
+                                  sequenceNum: 2]])
+        }
+        assertTrue(e.message.contains("SALES_LINES"), e.message)
+    }
+
+    @Test
+    void salesLinesRefusesTheOtherTemplatesFlags() {
+        [[absentChildRecordType: "ItemShip"], [presentChildRecordType: "ItemShip"],
+         [requireFulfillableOpenLine: "Y"], [requireOverdueShipDate: "Y"], [pendingStates: "B"],
+         [statesExpectingShipment: "G"], [requireParentRecordType: "SalesOrd"],
+         [amountColumn: "foreignamountunpaid", minAmount: "1"],
+         [overdueExcludedShipMethods: "Store Pickup"]].each { Map<String, Object> flag ->
+            assertThrows(IllegalArgumentException, { salesLinesSpec(flag) }, "must refuse: ${flag}")
+        }
+    }
+
+    @Test
+    void lineKeyColumnIsRefusedOnEveryOtherTemplate() {
+        [[:], [queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"],
+         [queryTemplate: "STATE_CONTRADICTION", disallowedStates: "E"]].each { Map<String, Object> base ->
+            def e = assertThrows(IllegalArgumentException) {
+                spec(base + [lineKeyColumn: "custcol_hc_order_line_id"])
+            }
+            assertTrue(e.message.contains("lineKeyColumn"), e.message)
+        }
+    }
+
+    /**
+     * The row may be a Moqui EntityValue, whose get() THROWS on a field the entity does not declare —
+     * and lineKeyColumn is not declared until the entity change lands. containsKey answers false
+     * there, so a row without the field must normalise exactly as before.
+     */
+    @Test
+    void aRowThatCannotAnswerLineKeyColumnStillNormalises() {
+        Map<String, Object> strict = new LinkedHashMap<String, Object>([nsSuiteQlSourceQueryId: "Q1",
+                recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"]) {
+            @Override Object get(Object key) {
+                if (key == "lineKeyColumn") throw new IllegalStateException("undeclared field lineKeyColumn")
+                return super.get(key)
+            }
+        }
+        Map<String, Object> s = NsSuiteQlOrderSupport.normalizeSpec(strict,
+                [[recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 1]])
+        assertEquals("SELECT tranid FROM transaction WHERE type = 'SalesOrd' " +
+                "AND trandate >= TO_DATE('2026-08-01', 'YYYY-MM-DD') " +
+                "AND trandate < TO_DATE('2026-09-01', 'YYYY-MM-DD') ORDER BY id",
+                NsSuiteQlOrderSupport.buildRecordsQuery(s, "2026-08-01", "2026-09-01"))
+    }
 }
