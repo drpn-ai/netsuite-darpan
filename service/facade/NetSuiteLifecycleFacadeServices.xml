@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DAR-UI-050: the lifecycle builder's dropdown options, read from the NetSuite account itself.
+
+     Lives in netsuite-darpan beside the SuiteQL token path it uses. The `facade.` prefix puts it under the
+     DARPAN_APP artifact group's `facade\..*` pattern, like NetSuiteQueryFacadeServices. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="get" noun="LifecycleOptions" allow-remote="true" authenticate="true">
+        <description>What the lifecycle builder may offer for one NetSuite account: record types with records in the
+            last 30 days, and, given a record type, what follows it in NetSuite's link table over a settled week,
+            with how many reached each follower, how soon, and the share done by each of a few days.</description>
+        <in-parameters>
+            <parameter name="nsAuthConfigId" required="true"/>
+            <parameter name="recordType"><description>Omit for the record-type counts only.</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="messages" type="List"><parameter name="message"/></parameter>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="recordTypes" type="List"><parameter name="recordType" type="Map"/></parameter>
+            <parameter name="stages" type="List"><parameter name="stage" type="Map"/></parameter>
+            <parameter name="sampleSize" type="Long"/>
+            <parameter name="sampleFrom"/>
+            <parameter name="sampleThru"/>
+        </out-parameters>
+        <actions>
+            <set field="result" from="netsuite.facade.NsLifecycleOptionsSupport.forAccount(ec, nsAuthConfigId, recordType)"/>
+            <set field="recordTypes" from="result?.recordTypes ?: []"/>
+            <set field="stages" from="result?.stages ?: []"/>
+            <set field="sampleSize" from="result?.sampleSize"/>
+            <set field="sampleFrom" from="result?.sampleFrom"/>
+            <set field="sampleThru" from="result?.sampleThru"/>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="messages" from="darpan.facade.common.FacadeSupport.getMessages(ec)"/>
+            <set field="errors" from="darpan.facade.common.FacadeSupport.getErrors(ec)"/>
+        </actions>
+    </service>
+</services>
