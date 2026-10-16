@@ -2,6 +2,7 @@ package netsuite.facade
 
 import darpan.facade.common.SharedConfigAccessSupport
 import darpan.reconciliation.flowchart.LifecycleStageCompiler
+import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
 
 import java.math.RoundingMode
 import java.time.LocalDate
@@ -75,14 +76,120 @@ class NsLifecycleOptionsSupport {
         return out + [stages: stages, sampleSize: sampleSize, sampleFrom: from.toString(), sampleThru: thru.minusDays(1).toString()]
     }
 
-    /** The service: the account must be the active tenant's own or shared with it, as for every NetSuite read. */
-    static Map forAccount(def ec, String authId, String recordType) {
+    /** A rule's empty value, as LifecycleRuleSupport projects it (NVL) so a filter can match it. */
+    static final String NO_VALUE = "NO_VALUE"
+
+    /**
+     * The rule dropdowns: the text fields NetSuite shows on this record type, by their own names, and, given one of
+     * them, what it holds over the last 30 days, most common first, empty as "No value". A field with a value per
+     * record (an order id) has more than a page of values; the first page is enough, since "No value" sorts first.
+     *
+     * @param suiteQl (sql, firstPageOnly) -> rows
+     */
+    /**
+     * Standard list fields a stage exception may name, read by display name (BUILTIN.DF): Store Pickup orders never
+     * ship, and Shipping Method is how NetSuite says so. Not offered for leaving records out, whose column cannot wrap
+     * BUILTIN.DF in NVL. Item names items on the record's lines (a gift card never ships): see NsSuiteQlOrderSupport's
+     * waive predicate.
+     */
+    static final Map<String, String> STANDARD_STAGE_FIELDS = [shipmethod: "Shipping Method", (NsSuiteQlOrderSupport.WAIVE_ITEM): "Item"].asImmutable()
+
+    /**
+     * Standard list fields a leave-out rule may name, read by display name (BUILTIN.DF), as each record shows them:
+     * a Closed sales order reached its final state, so it is in no place. Never empty, so no "No value".
+     */
+    static final Map<String, String> STANDARD_RULE_FIELDS = [status: "Status"].asImmutable()
+
+    /** The items an Item exception offers: the kinds NetSuite never ships, as they appear on this record type's lines. */
+    static final List<String> UNSHIPPED_ITEM_TYPES = ["NonInvtPart", "Service", "GiftCert", "OthCharge"].asImmutable()
+
+    static Map ruleOptions(String recordType, String fieldId, LocalDate today, Closure<List<Map>> suiteQl, boolean forStage = false) {
+        LifecycleStageCompiler.words(recordType)
+        // visibleontransactions is a list like "CashSale, SalesOrd, ..." that SuiteQL cannot filter (a LIKE on it
+        // returns no rows, measured on gorjana 2026-10-16), so it is read and matched here.
+        List<Map> fields = (suiteQl.call("SELECT scriptid, name, visibleontransactions FROM customfield WHERE fieldtype = 'BODY' " +
+                "AND fieldvaluetype = 'Free-Form Text'", false) ?: [])
+                .findAll { Map r -> ((r.visibleontransactions ?: "") as String).split(",")*.trim().contains(recordType) }
+                .collect { Map r -> [fieldId: (r.scriptid as String)?.toLowerCase(), label: (r.name as String)?.trim()] }
+                .findAll { it.fieldId && it.label }
+                .sort { it.label.toLowerCase() }
+        fields = (forStage ? STANDARD_STAGE_FIELDS : STANDARD_RULE_FIELDS).collect { k, v -> [fieldId: k, label: v] } + fields
+        Map out = [fields: fields]
+        if (fieldId == null) return out
+        // The field reaches SuiteQL by interpolation: only one NetSuite itself listed for this record type passes.
+        if (!fields.any { it.fieldId == fieldId }) throw new IllegalArgumentException("'${fieldId}' is not a field on ${recordType}.")
+        // The plain GROUP BY is the form NetSuite takes: NVL in the GROUP BY with ORDER BY COUNT(*) answers HTTP 500
+        // UNEXPECTED_ERROR (gorjana 2026-10-16). So values are sorted here, and empties are counted on their own:
+        // a field with a value per record has more than a page, in no order, and "No value" must still be offered.
+        if (fieldId == NsSuiteQlOrderSupport.WAIVE_ITEM) return out + [values: itemValues(recordType, today, suiteQl)]
+        boolean standard = STANDARD_STAGE_FIELDS.containsKey(fieldId) || STANDARD_RULE_FIELDS.containsKey(fieldId)
+        String column = standard ? "BUILTIN.DF(t.${fieldId})" : "t.${fieldId}"
+        String where = "FROM transaction t WHERE t.type = '${recordType}' AND ${window('t.trandate', today.minusDays(COUNT_DAYS), today.plusDays(1))}"
+        List<Map> rows = suiteQl.call("SELECT ${column} AS v, COUNT(*) AS n ${where} GROUP BY ${column}", true) ?: []
+        // An exception names values a record has; "has no value" is a leave-out rule's business.
+        long empty = forStage || standard ? 0L : num((suiteQl.call("SELECT COUNT(*) AS n ${where} AND t.${fieldId} IS NULL", false) ?: [[:]])[0]?.n)
+        List<Map> values = rows.findAll { (it.v as String)?.trim() }
+                .sort { -num(it.n) }
+                .collect { Map r -> [value: (r.v as String).trim(), label: standardValueLabel((r.v as String).trim()), n: num(r.n)] }
+        if (empty > 0) {
+            int at = values.findIndexOf { (it.n as long) < empty }
+            values.add(at < 0 ? values.size() : at, [value: NO_VALUE, label: "No value", n: empty])
+        }
+        return out + [values: values.collect { [value: it.value, label: it.label] }]
+    }
+
+    /**
+     * Items that never ship and are on this record type's lines in the last 30 days, most records first, by SKU and name.
+     * gorjana 2026-10-16: four (GFT-CP on 1,340 sales orders, then POS Tax Variance, Warranties Variance,
+     * PickTicketPaper), ~4s; the catalog holds 226 such items, most never sold.
+     */
+    private static List<Map> itemValues(String recordType, LocalDate today, Closure<List<Map>> suiteQl) {
+        List<Map> rows = suiteQl.call("SELECT i.itemid AS v, i.displayname AS d, COUNT(DISTINCT t.id) AS n FROM transaction t " +
+                "JOIN transactionline tl ON tl.transaction = t.id JOIN item i ON i.id = tl.item WHERE t.type = '${recordType}' " +
+                "AND ${window('t.trandate', today.minusDays(COUNT_DAYS), today.plusDays(1))} AND tl.mainline = 'F' " +
+                "AND i.itemtype IN (${quoted(UNSHIPPED_ITEM_TYPES)}) GROUP BY i.itemid, i.displayname", true) ?: []
+        return rows.findAll { (it.v as String)?.trim() }
+                .sort { -num(it.n) }
+                .collect { Map r ->
+                    String sku = (r.v as String).trim(), name = (r.d as String)?.trim()
+                    [value: sku, label: name && name != sku ? "${sku} · ${name}".toString() : sku]
+                }
+    }
+
+    /** A status reads "Sales Order : Closed"; the record type is already known, so the label is "Closed". */
+    static String standardValueLabel(String value) {
+        int at = value.indexOf(" : ")
+        return at > 0 ? value.substring(at + 3) : value
+    }
+
+    static Map ruleOptionsForAccount(def ec, String authId, String recordType, String fieldId, String scope = null) {
+        def auth = accessibleAccount(ec, authId)
+        if (auth == null) return [:]
+        try {
+            NsSuiteQlClient client = new NsSuiteQlClient(auth)
+            return ruleOptions(recordType, fieldId, ec.user.nowTimestamp.toLocalDateTime().toLocalDate(), { String q, boolean firstPage ->
+                client.query(q, firstPage) }, scope == "STAGE")
+        } catch (IllegalArgumentException e) {
+            ec.message.addError(e.message); return [:]
+        } catch (Exception e) {
+            ec.message.addError("Could not read NetSuite account '${authId}': ${e.message}"); return [:]
+        }
+    }
+
+    private static def accessibleAccount(def ec, String authId) {
         def auth = authId ? SharedConfigAccessSupport.listAccessibleConfigRows(ec, SharedConfigAccessSupport.CONFIG_TYPE_NS_AUTH)
                 .find { it.get("nsAuthConfigId") == authId } : null
-        if (auth == null) { ec.message.addError("NetSuite account '${authId}' was not found."); return [:] }
+        if (auth == null) { ec.message.addError("NetSuite account '${authId}' was not found."); return null }
         if ((auth.get("isActive") ?: "Y").toString().equalsIgnoreCase("N")) {
-            ec.message.addError("NetSuite account '${authId}' is turned off."); return [:]
+            ec.message.addError("NetSuite account '${authId}' is turned off."); return null
         }
+        return auth
+    }
+
+    /** The service: the account must be the active tenant's own or shared with it, as for every NetSuite read. */
+    static Map forAccount(def ec, String authId, String recordType) {
+        def auth = accessibleAccount(ec, authId)
+        if (auth == null) return [:]
         try {
             NsSuiteQlClient client = new NsSuiteQlClient(auth)
             return options(recordType, ec.user.nowTimestamp.toLocalDateTime().toLocalDate()) { String q -> client.query(q) }

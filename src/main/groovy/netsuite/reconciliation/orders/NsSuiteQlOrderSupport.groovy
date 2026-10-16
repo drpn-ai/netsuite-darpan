@@ -4,6 +4,7 @@ import darpan.facade.common.OutboundHttpPolicy
 import darpan.reconciliation.source.SourceFilterSupport
 import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
 
 import java.time.Instant
@@ -70,6 +71,12 @@ class NsSuiteQlOrderSupport {
     /** Parent rows WITH one linked child type and WITHOUT another — "shipped but never billed". */
     static final String TEMPLATE_LINKED_CHILD_PRESENT_ABSENT = "LINKED_CHILD_PRESENT_ABSENT"
     /**
+     * Parent rows WITH a linked child of a given type (DAR-UI-050). The lifecycle builder gives every place its
+     * own question so each opens its records; "shipped, never billed" is the no-invoice orders that DO have a
+     * fulfillment, and only an EXISTS-only shape can return exactly those rows.
+     */
+    static final String TEMPLATE_LINKED_CHILD_PRESENT = "LINKED_CHILD_PRESENT"
+    /**
      * STATE_CONTRADICTION asks the question the other templates only approximate: does the order's own
      * STATUS agree with its transaction chain? The status is NetSuite's claim about state and the chain
      * is the evidence; a finding is a disagreement, not merely a missing child.
@@ -98,7 +105,7 @@ class NsSuiteQlOrderSupport {
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
-             TEMPLATE_STATE_CONTRADICTION, TEMPLATE_SALES_LINES].asImmutable()
+             TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_STATE_CONTRADICTION, TEMPLATE_SALES_LINES].asImmutable()
     private static final List<String> LINK_TEMPLATES =
             [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
 
@@ -126,7 +133,7 @@ class NsSuiteQlOrderSupport {
      * are not matched, so a subquery cannot be expressed even before the keyword check below.
      */
     private static final Pattern COLUMN_EXPRESSION =
-            ~/[A-Za-z_][A-Za-z0-9_]*(\s*\(\s*[A-Za-z0-9_,'\- \/:.]*\s*\))?(\s+[Aa][Ss]\s+[A-Za-z_][A-Za-z0-9_]*)?/
+            ~/[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?(\s*\(\s*[A-Za-z0-9_,'\- \/:.]*\s*\))?(\s+[Aa][Ss]\s+[A-Za-z_][A-Za-z0-9_]*)?/
 
     /** Belt and braces beside the shape check: no statement breaks, no comment starts. */
     private static final List<String> FORBIDDEN_SEQUENCES = [";", "--", "/*", "*/"]
@@ -274,7 +281,11 @@ class NsSuiteQlOrderSupport {
             throw new IllegalArgumentException("absentChildRecordType is only meaningful on " +
                     "${LINK_TEMPLATES.join(' or ')}; queryTemplate is ${queryTemplate}")
         }
-        if (queryTemplate == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT) {
+        if (queryTemplate == TEMPLATE_LINKED_CHILD_PRESENT && fromTable != DEFAULT_FROM_TABLE) {
+            throw new IllegalArgumentException("queryTemplate ${queryTemplate} reads the ${LINK_TABLE} " +
+                    "link table, which relates transactions, so fromTable must be ${DEFAULT_FROM_TABLE}, got: ${fromTable}")
+        }
+        if (queryTemplate == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT || queryTemplate == TEMPLATE_LINKED_CHILD_PRESENT) {
             if (!presentChildRecordType) {
                 throw new IllegalArgumentException("queryTemplate ${queryTemplate} requires presentChildRecordType")
             }
@@ -283,7 +294,7 @@ class NsSuiteQlOrderSupport {
             // Rejected rather than ignored: silently dropping it is how an operator comes to believe a
             // filter is applied that is not.
             throw new IllegalArgumentException("presentChildRecordType is only meaningful on " +
-                    "${TEMPLATE_LINKED_CHILD_PRESENT_ABSENT}; queryTemplate is ${queryTemplate}")
+                    "${TEMPLATE_LINKED_CHILD_PRESENT_ABSENT} or ${TEMPLATE_LINKED_CHILD_PRESENT}; queryTemplate is ${queryTemplate}")
         }
         boolean requireFulfillableOpenLine = "Y".equalsIgnoreCase(text(query.get("requireFulfillableOpenLine")) ?: "N")
         if (requireFulfillableOpenLine && queryTemplate == TEMPLATE_SALES_LINES) {
@@ -376,7 +387,16 @@ class NsSuiteQlOrderSupport {
             }
         }
 
+        // DAR-UI-050. Stage exceptions: a record that one of them names counts as having the stage. Each is a field and
+        // the values that waive it; a stage may hold several (Shipping Method Store Pickup, Item GFT-CP).
+        List<Map<String, Object>> waiveRules = parseWaiveRules(query.get("waiveRules"))
+        if (waiveRules && queryTemplate != TEMPLATE_LINKED_CHILD_ABSENT && queryTemplate != TEMPLATE_LINKED_CHILD_PRESENT) {
+            throw new IllegalArgumentException("waiveRules are only meaningful on ${TEMPLATE_LINKED_CHILD_ABSENT} or " +
+                    "${TEMPLATE_LINKED_CHILD_PRESENT}; queryTemplate is ${queryTemplate}")
+        }
+
         return [
+                waiveRules            : waiveRules,
                 nsSuiteQlSourceQueryId: text(query.get("nsSuiteQlSourceQueryId")),
                 recordType            : recordType,
                 fromTable             : fromTable,
@@ -488,10 +508,15 @@ class NsSuiteQlOrderSupport {
         sql << "WHERE t.type = '${spec.get('recordType')}' "
         sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
         sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
-        if (template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT) {
-            sql << "AND ${linkedChildPredicate(true, (String) spec.get('presentChildRecordType'), '')} "
+        String waived = waivePredicate(spec)
+        if (template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT || template == TEMPLATE_LINKED_CHILD_PRESENT) {
+            String has = linkedChildPredicate(true, (String) spec.get('presentChildRecordType'), '')
+            sql << (waived && template == TEMPLATE_LINKED_CHILD_PRESENT ? "AND (${has} OR ${waived}) " : "AND ${has} ")
         }
-        sql << "AND NOT ${linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '')} "
+        if (template != TEMPLATE_LINKED_CHILD_PRESENT) {
+            String has = linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '')
+            sql << (waived && template == TEMPLATE_LINKED_CHILD_ABSENT ? "AND NOT (${has} OR ${waived}) " : "AND NOT ${has} ")
+        }
         if (spec.get("requireFulfillableOpenLine")) sql << "AND ${FULFILLABLE_OPEN_LINE_PREDICATE} "
         if (spec.get("requireOverdueShipDate")) {
             if (!asOfDate) {
@@ -718,6 +743,38 @@ class NsSuiteQlOrderSupport {
                 "WHERE l0.nextdoc = t.id AND p.type = '${parentRecordType}')"
     }
 
+    /** DAR-UI-050. The stage exception that names items (by SKU) rather than a field of the record. */
+    static final String WAIVE_ITEM = "item"
+    /** Item types NetSuite fulfills: an order holding one of these, other than the named items, still has something to ship. */
+    static final List<String> SHIPPED_ITEM_TYPES = ["InvtPart", "Kit", "Assembly"].asImmutable()
+
+    /**
+     * DAR-UI-050. "The stage is waived for this record": a custbody field is compared as the text it holds, a standard
+     * list field (shipmethod) by its display name, which is what a person picked from the dropdown.
+     *
+     * Items are line-level, so the record is waived when it holds a named item and nothing else that ships: a gift
+     * card ordered with a necklace that never shipped is still owed its fulfillment. (gorjana Oct 12-14: 110 of 132
+     * billed-never-shipped orders held GFT-CP, and every one of them held nothing that ships.)
+     */
+    private static String waivePredicate(Map<String, Object> spec) {
+        List<Map<String, Object>> rules = (List<Map<String, Object>>) spec.get("waiveRules")
+        if (!rules) return null
+        return rules.collect { Map<String, Object> r -> waiveRulePredicate((String) r.get("fieldId"), (List<String>) r.get("values")) }.join(" OR ")
+    }
+
+    private static String waiveRulePredicate(String field, List<String> values) {
+        String named = values.collect { "'${it}'" }.join(', ')
+        if (field == WAIVE_ITEM) {
+            return "(EXISTS (SELECT 1 FROM transactionline wl JOIN item wi ON wi.id = wl.item " +
+                    "WHERE wl.transaction = t.id AND wi.itemid IN (${named})) " +
+                    "AND NOT EXISTS (SELECT 1 FROM transactionline wo JOIN item woi ON woi.id = wo.item " +
+                    "WHERE wo.transaction = t.id AND wo.mainline = 'F' " +
+                    "AND woi.itemtype IN (${SHIPPED_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) AND woi.itemid NOT IN (${named})))"
+        }
+        String column = field.startsWith("custbody") ? "t.${field}" : "BUILTIN.DF(t.${field})"
+        return "${column} IN (${named})"
+    }
+
     private static String linkedChildPredicate(boolean present, String childRecordType, String suffix) {
         String link = "l${suffix}", child = "c${suffix}"
         return "EXISTS (SELECT 1 FROM ${LINK_TABLE} ${link} " +
@@ -840,6 +897,30 @@ class NsSuiteQlOrderSupport {
     }
 
     /** SuiteQL decorates every row with a "links" array; it is transport metadata, not record data. */
+    /**
+     * DAR-UI-050. The stage's exceptions, stored as JSON [{fieldId, values}]. Every field id and value reaches SuiteQL
+     * by interpolation, so a field id must be an identifier and a value may not hold a quote.
+     */
+    static List<Map<String, Object>> parseWaiveRules(Object raw) {
+        Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
+        if (parsed == null) return []
+        if (!(parsed instanceof List)) throw new IllegalArgumentException("waiveRules must be a list, got: ${raw}")
+        return ((List) parsed).collect { Object o ->
+            if (!(o instanceof Map)) throw new IllegalArgumentException("waiveRules holds a non-rule: ${o}")
+            Map m = (Map) o
+            String fieldId = text(m.get("fieldId"))
+            if (!fieldId || !(fieldId ==~ /[a-z][a-z0-9_]*/)) throw new IllegalArgumentException("waiveRules field must be a field id, got: ${fieldId}")
+            List<String> values = ((m.get("values") ?: []) as List).collect { text(it) }.findAll { it } as List<String>
+            if (!values) throw new IllegalArgumentException("waiveRules field ${fieldId} needs values")
+            values.each { String v ->
+                // Values reach SuiteQL as quoted literals, so a quote is refused rather than escaped.
+                if (v.contains("'") || v.length() > 100) throw new IllegalArgumentException("waiveRules values may not contain a quote: ${v}")
+                requireSafeFragment(v, "waiveRules")
+            }
+            [fieldId: (Object) fieldId, values: (Object) values] as Map<String, Object>
+        }
+    }
+
     private static String text(Object value) {
         String s = value?.toString()?.trim()
         return s ? s : null

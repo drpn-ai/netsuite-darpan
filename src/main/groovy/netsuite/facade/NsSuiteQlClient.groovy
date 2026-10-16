@@ -35,8 +35,11 @@ class NsSuiteQlClient {
         this.suiteQlUrl = NsSuiteQlOrderSupport.suiteQlUrlFromTokenUrl(tokenUrl)
     }
 
-    /** The rows of one page. An aggregate that would need a second page is a caller bug, so it is refused. */
-    List<Map> query(String sql) {
+    /**
+     * The rows of one page. An aggregate that would need a second page is a caller bug, so it is refused unless the
+     * caller asked for the first page only (a value list sorted most common first).
+     */
+    List<Map> query(String sql, boolean firstPageOnly = false) {
         String token = NsTokenCache.getValidAccessToken(authId, tokenUrl) ?: mintToken()
         HttpResponse<String> resp = send(token, sql)
         if (resp.statusCode() == 401) {
@@ -47,7 +50,7 @@ class NsSuiteQlClient {
             throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: ${resp.body()?.take(300)}")
         }
         Map parsed = new JsonSlurper().parseText(resp.body()) as Map
-        if (parsed.hasMore == true) throw new IllegalStateException("NetSuite returned more than ${PAGE_LIMIT} rows for a summary query.")
+        if (parsed.hasMore == true && !firstPageOnly) throw new IllegalStateException("NetSuite returned more than ${PAGE_LIMIT} rows for a summary query.")
         return (parsed.items ?: []) as List<Map>
     }
 

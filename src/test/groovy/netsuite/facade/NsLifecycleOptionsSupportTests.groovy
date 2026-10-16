@@ -80,4 +80,91 @@ class NsLifecycleOptionsSupportTests {
         assertEquals([], out.stages)
         assertEquals(0L, out.sampleSize)
     }
+
+    // --- rule options: "leave out sales orders where [field] is [value]" ------------------------------------
+
+    @Test
+    void ruleFieldsAreTheTextFieldsOnTheRecordTypeByTheirNetSuiteNames() {
+        List<String> asked = []
+        Map out = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", null, TODAY) { String q, boolean firstPage -> asked << q
+            [[scriptid: "CUSTBODY_HC_SALES_CHANNEL", name: "HC Sales Channel", visibleontransactions: "CashSale, SalesOrd, TrnfrOrd"],
+             [scriptid: "CUSTBODY_HC_ORDER_ID", name: "HC Order Id", visibleontransactions: "SalesOrd"],
+             [scriptid: "CUSTBODY_NM_LOOP_CANCELLED", name: " Loop Cancelled", visibleontransactions: "RtnAuth, SalesOrd"],
+             [scriptid: "CUSTBODY_DEPOSIT_ONLY", name: "Deposit Only", visibleontransactions: "Deposit, SalesOrdX"],
+             [scriptid: "CUSTBODY_NOWHERE", name: "Nowhere"]] }
+        assertEquals(1, asked.size())
+        assertTrue(asked[0].contains("FROM customfield WHERE fieldtype = 'BODY' AND fieldvaluetype = 'Free-Form Text'"), asked[0])
+        assertFalse(asked[0].contains("LIKE"), "SuiteQL returns nothing for a LIKE on visibleontransactions: ${asked[0]}")
+        assertEquals([["status", "Status"], ["custbody_hc_order_id", "HC Order Id"], ["custbody_hc_sales_channel", "HC Sales Channel"],
+                      ["custbody_nm_loop_cancelled", "Loop Cancelled"]], out.fields.collect { [it.fieldId, it.label] })
+    }
+
+    // A Closed sales order reached its final state: Status leaves it out, offered by name, never as "No value".
+    @Test
+    void statusIsALeaveOutFieldReadByName() {
+        List<String> asked = []
+        Map out = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", "status", TODAY) { String q, boolean firstPage -> asked << q
+            q.contains("customfield") ? [] : [[v: "Sales Order : Billed", n: "9000"], [v: "Sales Order : Closed", n: "120"]] }
+        assertTrue(asked.any { it.contains("SELECT BUILTIN.DF(t.status) AS v") }, asked.toString())
+        assertFalse(asked.any { it.contains("IS NULL") }, asked.toString())
+        assertEquals([["Sales Order : Billed", "Billed"], ["Sales Order : Closed", "Closed"]], out.values.collect { [it.value, it.label] })
+    }
+
+    @Test
+    void ruleValuesAreWhatTheFieldHoldsMostCommonFirstWithEmptyAsNoValue() {
+        List<String> asked = []
+        Map out = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", "custbody_hc_sales_channel", TODAY) { String q, boolean firstPage ->
+            asked << q
+            if (q.contains("customfield")) return [[scriptid: "CUSTBODY_HC_SALES_CHANNEL", name: "HC Sales Channel", visibleontransactions: "SalesOrd"]]
+            if (q.contains("IS NULL")) return [[n: "975"]]
+            assertTrue(firstPage, "a field with a value per record has more than a page; the first is enough")
+            return [[v: "Shopify Draft Order", n: "750"], [v: null, n: "975"], [v: "POS Channel", n: "89394"]]
+        }
+        String values = asked[1]
+        // The form NetSuite takes: a plain GROUP BY (NVL in it with ORDER BY COUNT(*) answers 500), sorted here.
+        assertTrue(values.contains("SELECT t.custbody_hc_sales_channel AS v, COUNT(*) AS n FROM transaction t WHERE t.type = 'SalesOrd'"), values)
+        assertTrue(values.endsWith("GROUP BY t.custbody_hc_sales_channel"), values)
+        assertFalse(values.contains("NVL") || values.contains("ORDER BY"), values)
+        assertTrue(asked[2].endsWith("AND t.custbody_hc_sales_channel IS NULL"), asked[2])
+        assertEquals([["POS Channel", "POS Channel"], ["NO_VALUE", "No value"], ["Shopify Draft Order", "Shopify Draft Order"]],
+                out.values.collect { [it.value, it.label] })
+    }
+
+    @Test
+    void aRuleFieldNotOnTheRecordTypeIsRefusedBeforeItReachesTheQuery() {
+        List<String> asked = []
+        assertThrows(IllegalArgumentException) {
+            NsLifecycleOptionsSupport.ruleOptions("SalesOrd", "custbody_x) OR (1=1", TODAY) { String q, boolean firstPage ->
+                asked << q; [[scriptid: "CUSTBODY_HC_SALES_CHANNEL", name: "HC Sales Channel", visibleontransactions: "SalesOrd"]] }
+        }
+        assertTrue(asked.every { it.contains("customfield") }, "only the field list was asked: ${asked}")
+    }
+
+    @Test
+    void aStageExceptionAlsoOffersShippingMethodByNameAndNeverNoValue() {
+        List<String> asked = []
+        Map fields = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", null, TODAY, { String q, boolean firstPage -> asked << q
+            [[scriptid: "CUSTBODY_HC_SALES_CHANNEL", name: "HC Sales Channel", visibleontransactions: "SalesOrd"]] }, true)
+        assertEquals(["Shipping Method", "Item", "HC Sales Channel"], fields.fields*.label)
+
+        asked.clear()
+        Map values = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", "shipmethod", TODAY, { String q, boolean firstPage -> asked << q
+            q.contains("customfield") ? [] : [[v: "Standard", n: "24657"], [v: "Store Pickup", n: "6823"], [v: null, n: "1"]] }, true)
+        assertTrue(asked.any { it.contains("SELECT BUILTIN.DF(t.shipmethod) AS v") && it.endsWith("GROUP BY BUILTIN.DF(t.shipmethod)") }, asked.toString())
+        assertFalse(asked.any { it.contains("IS NULL") }, "an exception names values, so empties are not counted")
+        assertEquals(["Standard", "Store Pickup"], values.values*.label)
+    }
+
+    // An Item exception offers the items that never ship, as they appear on the record type's lines, most first.
+    @Test
+    void anItemExceptionOffersItemsThatNeverShipBySku() {
+        List<String> asked = []
+        Map values = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", "item", TODAY, { String q, boolean firstPage -> asked << q
+            q.contains("customfield") ? [] : [[v: "POS Tax Variance", d: null, n: "12974"], [v: "GFT-CP", d: "Shopify Gift Card - Purchase", n: "1340"]] }, true)
+        String itemQuery = asked.find { it.contains("transactionline") }
+        assertTrue(itemQuery.contains("i.itemtype IN ('NonInvtPart', 'Service', 'GiftCert', 'OthCharge')"), itemQuery)
+        assertTrue(itemQuery.contains("t.type = 'SalesOrd'"), itemQuery)
+        assertEquals(["POS Tax Variance", "GFT-CP"], values.values*.value)
+        assertEquals(["POS Tax Variance", "GFT-CP · Shopify Gift Card - Purchase"], values.values*.label)
+    }
 }

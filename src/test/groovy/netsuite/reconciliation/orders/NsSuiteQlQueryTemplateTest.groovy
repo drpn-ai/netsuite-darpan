@@ -655,6 +655,100 @@ class NsSuiteQlQueryTemplateTest {
         }.message.contains("absentChildRecordType"))
     }
 
+    // DAR-UI-050: the lifecycle builder gives every place its own question, so "has it reached X?" must be
+    // askable on its own: its rows are the records that DID reach X ("shipped, never billed" under no-invoice).
+    @Test
+    void presentEmitsOnlyTheExistsHalf() {
+        String q = query([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip"])
+        assertTrue(q.contains("AND EXISTS (SELECT 1 FROM nexttransactionlink l " +
+                "JOIN transaction c ON c.id = l.nextdoc WHERE l.previousdoc = t.id AND c.type = 'ItemShip')"), q)
+        assertFalse(q.contains("NOT EXISTS"), q)
+        assertTrue(q.endsWith("ORDER BY t.id"), q)
+    }
+
+    @Test
+    void presentRequiresItsChildTypeAndRefusesAnAbsentOne() {
+        assertTrue(assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_PRESENT"])
+        }.message.contains("presentChildRecordType"))
+        assertTrue(assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip", absentChildRecordType: "CustInvc"])
+        }.message.contains("absentChildRecordType"))
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip' OR '1'='1"])
+        }
+    }
+
+    // DAR-UI-050: a stage exception. Store Pickup orders never ship, so for them Fulfillment is not expected: an absent
+    // check does not find them, and a present check counts them as having the stage.
+    @Test
+    void anExceptionWaivesTheStageOnBothSidesOfTheCheck() {
+        String absent = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
+                               waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": [\"Store Pickup\"]}]"])
+        assertTrue(absent.contains("AND NOT (EXISTS (SELECT 1 FROM nexttransactionlink l JOIN transaction c ON c.id = l.nextdoc " +
+                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip') OR BUILTIN.DF(t.shipmethod) IN ('Store Pickup'))"), absent)
+        String present = query([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip",
+                                waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": [\"Store Pickup\", \"In Studio\"]}]"])
+        assertTrue(present.contains("AND (EXISTS (SELECT 1 FROM nexttransactionlink l JOIN transaction c ON c.id = l.nextdoc " +
+                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip') OR BUILTIN.DF(t.shipmethod) IN ('Store Pickup', 'In Studio'))"), present)
+        // A custom text field is compared as the text it holds.
+        String custom = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
+                               waiveRules: "[{\"fieldId\": \"custbody_hc_sales_channel\", \"values\": [\"POS Channel\"]}]"])
+        assertTrue(custom.contains("OR t.custbody_hc_sales_channel IN ('POS Channel'))"), custom)
+    }
+
+    // DAR-UI-050: an exception by item. A gift card (GFT-CP) never ships, so an order holding one and nothing else
+    // that ships is not owed a fulfillment; one that also holds a necklace still is.
+    @Test
+    void anItemExceptionWaivesOnlyRecordsWithNothingElseToShip() {
+        String absent = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
+                               waiveRules: "[{\"fieldId\": \"item\", \"values\": [\"GFT-CP\"]}]"])
+        assertTrue(absent.contains("WHERE l.previousdoc = t.id AND c.type = 'ItemShip') OR (EXISTS (SELECT 1 FROM transactionline wl " +
+                "JOIN item wi ON wi.id = wl.item WHERE wl.transaction = t.id AND wi.itemid IN ('GFT-CP')) " +
+                "AND NOT EXISTS (SELECT 1 FROM transactionline wo JOIN item woi ON woi.id = wo.item WHERE wo.transaction = t.id " +
+                "AND wo.mainline = 'F' AND woi.itemtype IN ('InvtPart', 'Kit', 'Assembly') AND woi.itemid NOT IN ('GFT-CP'))))"), absent)
+        assertTrue(absent.contains("AND NOT (EXISTS"), absent)
+    }
+
+    // A stage may hold exceptions on several fields: a record any of them names is waived.
+    @Test
+    void aStageHoldsExceptionsOnSeveralFields() {
+        String absent = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
+                               waiveRules: [[fieldId: "shipmethod", values: ["Store Pickup"]], [fieldId: "item", values: ["GFT-CP"]]]])
+        assertTrue(absent.contains("c.type = 'ItemShip') OR BUILTIN.DF(t.shipmethod) IN ('Store Pickup') OR (EXISTS (SELECT 1 FROM transactionline wl"), absent)
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", waiveRules: "{\"fieldId\":\"item\"}"]) }
+    }
+
+    // DAR-UI-050: a record shows a list field by the name people use, so BUILTIN.DF (a dotted function) is a column.
+    @Test
+    void aListFieldIsShownByItsDisplayName() {
+        Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"],
+                [[recordFieldName: "status", sourceColumn: "BUILTIN.DF(status) AS status", sequenceNum: 1],
+                 [recordFieldName: "hcOrderId", sourceColumn: "custbody_hc_order_id AS detail1", sequenceNum: 2]])
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(spec, "2026-08-01", "2026-09-01")
+        assertTrue(sql.startsWith("SELECT BUILTIN.DF(status) AS status, custbody_hc_order_id AS detail1 FROM transaction t "), sql)
+        assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"],
+                    [[recordFieldName: "x", sourceColumn: "A.B.C(status) AS s", sequenceNum: 1]])
+        }
+    }
+
+    @Test
+    void anExceptionThatCouldBreakTheQueryIsRefused() {
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": [\"Store' OR '1'='1\"]}]"])
+        }
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", waiveRules: "[{\"fieldId\": \"ship method\", \"values\": [\"Store Pickup\"]}]"])
+        }
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": []}]"])
+        }
+        // Only a stage check has a stage to waive.
+        assertThrows(IllegalArgumentException) { spec([waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": [\"Store Pickup\"]}]"]) }
+    }
+
     @Test
     void childTypesAreRejectedOnTemplatesThatCannotUseThem() {
         // Silently ignoring them is how an operator ends up believing a filter is applied that is not.

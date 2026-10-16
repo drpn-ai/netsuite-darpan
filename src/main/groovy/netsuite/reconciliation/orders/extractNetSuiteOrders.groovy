@@ -142,7 +142,9 @@ try {
              overdueExcludedShipMethods: queryRow.overdueExcludedShipMethods,
              // Guarded: EntityValue.get THROWS on a field the entity does not declare, and a
              // deployment whose entity predates lineKeyColumn must keep running every other check.
-             lineKeyColumn         : queryRow.isField("lineKeyColumn") ? queryRow.get("lineKeyColumn") : null],
+             lineKeyColumn         : queryRow.isField("lineKeyColumn") ? queryRow.get("lineKeyColumn") : null,
+             // DAR-UI-050. A lifecycle stage's exceptions; guarded the same way for an entity that predates them.
+             waiveRules            : queryRow.isField("waiveRules") ? queryRow.get("waiveRules") : null],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
