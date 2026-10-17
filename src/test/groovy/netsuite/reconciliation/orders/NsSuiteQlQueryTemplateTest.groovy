@@ -904,7 +904,9 @@ class NsSuiteQlQueryTemplateTest {
         assertEquals("SELECT t.custbody_hc_order_id AS custbody_hc_order_id, t.tranid AS tranid, " +
                 "tl.custcol_hc_order_line_id AS order_line_id, tl.quantityshiprecv AS quantity_shipped, " +
                 "tl.quantitybackordered AS quantity_backordered, tl.isclosed AS line_closed, tl.id AS line_id, " +
-                "tl.itemtype AS item_type " +
+                "tl.itemtype AS item_type, tl.quantitybilled AS quantity_billed, " +
+                "CASE WHEN tl.quantitybilled <> 0 THEN 'BILLED' WHEN tl.isclosed = 'T' THEN 'CLOSED' " +
+                "WHEN tl.quantityshiprecv <> 0 THEN 'SHIPPED' ELSE 'OPEN' END AS line_state " +
                 "FROM transaction t JOIN transactionline tl ON tl.transaction = t.id " +
                 "WHERE t.type = 'SalesOrd' " +
                 "AND t.trandate >= TO_DATE('2026-09-15', 'YYYY-MM-DD') " +
@@ -918,10 +920,11 @@ class NsSuiteQlQueryTemplateTest {
     void salesLinesMapsTheTemplateLineColumnsAndStampsOrigin() {
         Map<String, Object> record = NsSuiteQlOrderSupport.mapRowToRecord(salesLinesSpec(),
                 [custbody_hc_order_id: "M100", tranid: "SO1", order_line_id: "01", quantity_shipped: "1",
-                 quantity_backordered: "0", line_closed: "F", line_id: "7", item_type: "InvtPart", links: []])
+                 quantity_backordered: "0", line_closed: "F", line_id: "7", item_type: "InvtPart",
+                 quantity_billed: "1", line_state: "BILLED", links: []])
         assertEquals([orderId: "M100", netsuiteOrderId: "SO1", orderLineId: "01", quantityShipped: "1",
                       quantityBackordered: "0", lineClosed: "F", lineId: "7", itemType: "InvtPart",
-                      orderOrigin: "HOTWAX"], record)
+                      quantityBilled: "1", lineState: "BILLED", orderOrigin: "HOTWAX"], record)
     }
 
     /**

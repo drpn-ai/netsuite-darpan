@@ -700,6 +700,16 @@ class NsSuiteQlOrderSupport {
     }
 
     /**
+     * One state per line, so a run can include exactly one with a single INCLUDE_IN rule. The order is the
+     * meaning: billed wins over closed (a line billed and then closed was done), and closed wins over
+     * shipped. On gorjana every closed unbilled line was unshipped and 424 of 427 sat on Closed (H)
+     * orders (SalesOrd 2026-10-01..08), so CLOSED is NetSuite's cancel, not a second kind of done.
+     * Quantities are signed on sales order lines, hence <> 0 rather than > 0.
+     */
+    private static final String LINE_STATE_CASE = "CASE WHEN tl.quantitybilled <> 0 THEN 'BILLED' " +
+            "WHEN tl.isclosed = 'T' THEN 'CLOSED' WHEN tl.quantityshiprecv <> 0 THEN 'SHIPPED' ELSE 'OPEN' END"
+
+    /**
      * One row per keyed line. Header columns are aliased back to their own names so the
      * rows come back keyed exactly as mapRowToRecord reads them; the line columns take the aliases
      * TEMPLATE_RECORD_COLUMNS maps.
@@ -720,7 +730,8 @@ class NsSuiteQlOrderSupport {
         StringBuilder sql = new StringBuilder()
         sql << "SELECT ${header.join(', ')}, tl.${lineKey} AS order_line_id, " +
                 "tl.quantityshiprecv AS quantity_shipped, tl.quantitybackordered AS quantity_backordered, " +
-                "tl.isclosed AS line_closed, tl.id AS line_id, tl.itemtype AS item_type "
+                "tl.isclosed AS line_closed, tl.id AS line_id, tl.itemtype AS item_type, " +
+                "tl.quantitybilled AS quantity_billed, ${LINE_STATE_CASE} AS line_state "
         sql << "FROM ${spec.get('fromTable')} t JOIN transactionline tl ON tl.transaction = t.id "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
         sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
@@ -909,6 +920,8 @@ class NsSuiteQlOrderSupport {
             line_closed         : "lineClosed",
             line_id             : "lineId",
             item_type           : "itemType",
+            quantity_billed     : "quantityBilled",
+            line_state          : "lineState",
     ].asImmutable()
 
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
