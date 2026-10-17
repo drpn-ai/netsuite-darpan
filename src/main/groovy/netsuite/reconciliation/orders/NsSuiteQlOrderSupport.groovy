@@ -77,6 +77,11 @@ class NsSuiteQlOrderSupport {
      */
     static final String TEMPLATE_LINKED_CHILD_EXCUSED = "LINKED_CHILD_EXCUSED"
     /**
+     * Records whose fields match conditions (DAR-UI-050): a finding a person writes for a lifecycle stage, e.g. "Items
+     * Backordered more than 0". Asked of the records that reached the stage; every condition must hold.
+     */
+    static final String TEMPLATE_RECORDS_MATCHING = "RECORDS_MATCHING"
+    /**
      * Parent rows WITH a linked child of a given type (DAR-UI-050). The lifecycle builder gives every place its
      * own question so each opens its records; "shipped, never billed" is the no-invoice orders that DO have a
      * fulfillment, and only an EXISTS-only shape can return exactly those rows.
@@ -111,7 +116,8 @@ class NsSuiteQlOrderSupport {
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
-             TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED, TEMPLATE_STATE_CONTRADICTION, TEMPLATE_SALES_LINES].asImmutable()
+             TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED, TEMPLATE_RECORDS_MATCHING, TEMPLATE_STATE_CONTRADICTION,
+             TEMPLATE_SALES_LINES].asImmutable()
     private static final List<String> LINK_TEMPLATES =
             [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT, TEMPLATE_LINKED_CHILD_EXCUSED].asImmutable()
 
@@ -396,6 +402,17 @@ class NsSuiteQlOrderSupport {
         // DAR-UI-050. Stage exceptions: a record that one of them names counts as having the stage. Each is a field and
         // the values that waive it; a stage may hold several (Shipping Method Store Pickup, Item GFT-CP).
         List<Map<String, Object>> waiveRules = parseWaiveRules(query.get("waiveRules"))
+        // DAR-UI-050. A written finding's conditions; only RECORDS_MATCHING takes them, and it needs at least one.
+        List<Map<String, Object>> matchRules = parseMatchRules(query.containsKey("matchRules") ? query.get("matchRules") : null)
+        if (queryTemplate == TEMPLATE_RECORDS_MATCHING && !matchRules) {
+            throw new IllegalArgumentException("queryTemplate ${TEMPLATE_RECORDS_MATCHING} needs matchRules")
+        }
+        if (matchRules && queryTemplate != TEMPLATE_RECORDS_MATCHING) {
+            throw new IllegalArgumentException("matchRules are only meaningful on ${TEMPLATE_RECORDS_MATCHING}; queryTemplate is ${queryTemplate}")
+        }
+        if (queryTemplate == TEMPLATE_RECORDS_MATCHING && fromTable != DEFAULT_FROM_TABLE) {
+            throw new IllegalArgumentException("queryTemplate ${queryTemplate} reads transactions, so fromTable must be ${DEFAULT_FROM_TABLE}")
+        }
         if (waiveRules && !(queryTemplate in [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED])) {
             throw new IllegalArgumentException("waiveRules are only meaningful on ${TEMPLATE_LINKED_CHILD_ABSENT}, " +
                     "${TEMPLATE_LINKED_CHILD_PRESENT} or ${TEMPLATE_LINKED_CHILD_EXCUSED}; queryTemplate is ${queryTemplate}")
@@ -403,6 +420,7 @@ class NsSuiteQlOrderSupport {
 
         return [
                 waiveRules            : waiveRules,
+                matchRules            : matchRules,
                 nsSuiteQlSourceQueryId: text(query.get("nsSuiteQlSourceQueryId")),
                 recordType            : recordType,
                 fromTable             : fromTable,
@@ -526,6 +544,10 @@ class NsSuiteQlOrderSupport {
         sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
         sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
         String waived = waivePredicate(spec)
+        if (template == TEMPLATE_RECORDS_MATCHING) {
+            sql << "AND ${matchPredicate(spec)} ORDER BY t.id"
+            return sql.toString()
+        }
         if (template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT || template == TEMPLATE_LINKED_CHILD_PRESENT) {
             String has = linkedChildPredicate(true, (String) spec.get('presentChildRecordType'), '')
             sql << (waived && template == TEMPLATE_LINKED_CHILD_PRESENT ? "AND (${has} OR ${waived}) " : "AND ${has} ")
@@ -918,6 +940,65 @@ class NsSuiteQlOrderSupport {
     }
 
     /** SuiteQL decorates every row with a "links" array; it is transport metadata, not record data. */
+    /**
+     * DAR-UI-050. What a written finding may ask about: list fields by display name, a record's items on backorder
+     * (its lines added up), its total; any custom body field (custbody_...) as the text it holds.
+     */
+    static final Map<String, String> MATCH_COLUMNS = [
+            status          : "BUILTIN.DF(t.status)",
+            shipmethod      : "BUILTIN.DF(t.shipmethod)",
+            itemsbackordered: "(SELECT SUM(mb.quantitybackordered) FROM transactionline mb WHERE mb.transaction = t.id AND mb.mainline = 'F')",
+            total           : "t.foreigntotal",
+    ].asImmutable()
+    static final List<String> MATCH_OPS = ["IN", "GT"].asImmutable()
+
+    static String matchColumn(String fieldId) {
+        if (MATCH_COLUMNS.containsKey(fieldId)) return MATCH_COLUMNS[fieldId]
+        if (fieldId ==~ /custbody_[a-z0-9_]+/) return "t.${fieldId}".toString()
+        throw new IllegalArgumentException("'${fieldId}' is not a field a finding can ask about")
+    }
+
+    /** Every condition holds: IN names values (NO_VALUE = empty), GT a number the field is more than. */
+    private static String matchPredicate(Map<String, Object> spec) {
+        List<Map<String, Object>> rules = (List<Map<String, Object>>) spec.get("matchRules")
+        return "(" + rules.collect { Map<String, Object> r ->
+            String column = matchColumn((String) r.get("fieldId"))
+            List<String> values = (List<String>) r.get("values")
+            if (r.get("op") == "GT") return "${column} > ${values[0]}".toString()
+            List<String> named = values.findAll { it != "NO_VALUE" }
+            List<String> parts = []
+            if (named) parts << "${column} IN (${named.collect { "'${it}'" }.join(', ')})".toString()
+            if (values.contains("NO_VALUE")) parts << "${column} IS NULL".toString()
+            return parts.size() == 1 ? parts[0] : "(${parts.join(' OR ')})".toString()
+        }.join(" AND ") + ")"
+    }
+
+    /** A written finding's conditions, stored as JSON [{fieldId, op, values}]; fields and values reach SuiteQL. */
+    static List<Map<String, Object>> parseMatchRules(Object raw) {
+        Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
+        if (parsed == null) return []
+        if (!(parsed instanceof List)) throw new IllegalArgumentException("matchRules must be a list, got: ${raw}")
+        return ((List) parsed).collect { Object o ->
+            if (!(o instanceof Map)) throw new IllegalArgumentException("matchRules holds a non-rule: ${o}")
+            Map m = (Map) o
+            String fieldId = text(m.get("fieldId"))
+            if (!fieldId) throw new IllegalArgumentException("matchRules needs a field")
+            matchColumn(fieldId)
+            String op = (text(m.get("op")) ?: "IN").toUpperCase()
+            if (!MATCH_OPS.contains(op)) throw new IllegalArgumentException("matchRules op must be one of ${MATCH_OPS}, got: ${op}")
+            List<String> values = ((m.get("values") ?: []) as List).collect { text(it) }.findAll { it } as List<String>
+            if (!values) throw new IllegalArgumentException("matchRules field ${fieldId} needs a value")
+            if (op == "GT" && !(values.size() == 1 && values[0] ==~ /-?\d+(\.\d+)?/)) {
+                throw new IllegalArgumentException("matchRules 'more than' needs one number, got: ${values}")
+            }
+            values.each { String v ->
+                if (v.contains("'") || v.length() > 100) throw new IllegalArgumentException("matchRules values may not contain a quote: ${v}")
+                requireSafeFragment(v, "matchRules")
+            }
+            [fieldId: (Object) fieldId, op: (Object) op, values: (Object) values] as Map<String, Object>
+        }
+    }
+
     /**
      * DAR-UI-050. The stage's exceptions, stored as JSON [{fieldId, values}]. Every field id and value reaches SuiteQL
      * by interpolation, so a field id must be an identifier and a value may not hold a quote.

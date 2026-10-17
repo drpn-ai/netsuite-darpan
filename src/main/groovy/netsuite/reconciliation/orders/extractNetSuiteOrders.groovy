@@ -144,7 +144,9 @@ try {
              // deployment whose entity predates lineKeyColumn must keep running every other check.
              lineKeyColumn         : queryRow.isField("lineKeyColumn") ? queryRow.get("lineKeyColumn") : null,
              // DAR-UI-050. A lifecycle stage's exceptions; guarded the same way for an entity that predates them.
-             waiveRules            : queryRow.isField("waiveRules") ? queryRow.get("waiveRules") : null],
+             waiveRules            : queryRow.isField("waiveRules") ? queryRow.get("waiveRules") : null,
+             // DAR-UI-050. A written finding's conditions.
+             matchRules            : queryRow.isField("matchRules") ? queryRow.get("matchRules") : null],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]

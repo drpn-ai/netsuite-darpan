@@ -155,6 +155,20 @@ class NsLifecycleOptionsSupportTests {
         assertEquals(["Standard", "Store Pickup"], values.values*.label)
     }
 
+    // A written finding asks about list fields by name, numbers "more than" a threshold, and the custom text fields.
+    @Test
+    void aFindingOffersListFieldsNumbersAndTextFields() {
+        Map fields = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", null, TODAY, { String q, boolean firstPage ->
+            [[scriptid: "CUSTBODY_HC_SALES_CHANNEL", name: "HC Sales Channel", visibleontransactions: "SalesOrd"]] }, false, true)
+        assertEquals(["Status", "Shipping Method", "Items Backordered", "Total", "HC Sales Channel"], fields.fields*.label)
+        assertEquals("number", fields.fields.find { it.fieldId == "itemsbackordered" }.kind)
+        List<String> asked = []
+        Map values = NsLifecycleOptionsSupport.ruleOptions("SalesOrd", "itemsbackordered", TODAY, { String q, boolean firstPage -> asked << q
+            q.contains("customfield") ? [] : [] }, false, true)
+        assertEquals(["more than 0", "more than 1", "more than 2", "more than 5", "more than 10"], values.values*.label)
+        assertTrue(asked.every { it.contains("customfield") }, "a threshold reads nothing from the account")
+    }
+
     // An Item exception offers the items that never ship, as they appear on the record type's lines, most first.
     @Test
     void anItemExceptionOffersItemsThatNeverShipBySku() {

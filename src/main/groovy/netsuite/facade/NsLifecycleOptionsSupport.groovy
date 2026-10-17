@@ -103,7 +103,17 @@ class NsLifecycleOptionsSupport {
     /** The items an Item exception offers: the kinds NetSuite never ships, as they appear on this record type's lines. */
     static final List<String> UNSHIPPED_ITEM_TYPES = ["NonInvtPart", "Service", "GiftCert", "OthCharge"].asImmutable()
 
-    static Map ruleOptions(String recordType, String fieldId, LocalDate today, Closure<List<Map>> suiteQl, boolean forStage = false) {
+    /**
+     * What a written finding may ask about beyond the custom text fields (NsSuiteQlOrderSupport.MATCH_COLUMNS): list
+     * fields by name, and numbers, which offer "more than" a threshold rather than values read from the account.
+     */
+    static final Map<String, String> FINDING_FIELDS = [status: "Status", shipmethod: "Shipping Method",
+                                                       itemsbackordered: "Items Backordered", total: "Total"].asImmutable()
+    static final Map<String, List<String>> FINDING_THRESHOLDS = [itemsbackordered: ["0", "1", "2", "5", "10"],
+                                                                 total: ["0", "50", "100", "500", "1000"]].asImmutable()
+
+    static Map ruleOptions(String recordType, String fieldId, LocalDate today, Closure<List<Map>> suiteQl, boolean forStage = false,
+                           boolean forFinding = false) {
         LifecycleStageCompiler.words(recordType)
         // visibleontransactions is a list like "CashSale, SalesOrd, ..." that SuiteQL cannot filter (a LIKE on it
         // returns no rows, measured on gorjana 2026-10-16), so it is read and matched here.
@@ -113,7 +123,8 @@ class NsLifecycleOptionsSupport {
                 .collect { Map r -> [fieldId: (r.scriptid as String)?.toLowerCase(), label: (r.name as String)?.trim()] }
                 .findAll { it.fieldId && it.label }
                 .sort { it.label.toLowerCase() }
-        fields = (forStage ? STANDARD_STAGE_FIELDS : STANDARD_RULE_FIELDS).collect { k, v -> [fieldId: k, label: v] } + fields
+        Map<String, String> standardFields = forFinding ? FINDING_FIELDS : forStage ? STANDARD_STAGE_FIELDS : STANDARD_RULE_FIELDS
+        fields = standardFields.collect { k, v -> [fieldId: k, label: v] + (FINDING_THRESHOLDS.containsKey(k) ? [kind: "number"] : [:]) } + fields
         Map out = [fields: fields]
         if (fieldId == null) return out
         // The field reaches SuiteQL by interpolation: only one NetSuite itself listed for this record type passes.
@@ -122,7 +133,11 @@ class NsLifecycleOptionsSupport {
         // UNEXPECTED_ERROR (gorjana 2026-10-16). So values are sorted here, and empties are counted on their own:
         // a field with a value per record has more than a page, in no order, and "No value" must still be offered.
         if (fieldId == NsSuiteQlOrderSupport.WAIVE_ITEM) return out + [values: itemValues(recordType, today, suiteQl)]
-        boolean standard = STANDARD_STAGE_FIELDS.containsKey(fieldId) || STANDARD_RULE_FIELDS.containsKey(fieldId)
+        // A number is asked "more than" one of a few thresholds; nothing is read from the account for it.
+        if (forFinding && FINDING_THRESHOLDS.containsKey(fieldId)) {
+            return out + [values: FINDING_THRESHOLDS[fieldId].collect { [value: it, label: "more than ${it}".toString()] }]
+        }
+        boolean standard = STANDARD_STAGE_FIELDS.containsKey(fieldId) || STANDARD_RULE_FIELDS.containsKey(fieldId) || FINDING_FIELDS.containsKey(fieldId)
         String column = standard ? "BUILTIN.DF(t.${fieldId})" : "t.${fieldId}"
         String where = "FROM transaction t WHERE t.type = '${recordType}' AND ${window('t.trandate', today.minusDays(COUNT_DAYS), today.plusDays(1))}"
         List<Map> rows = suiteQl.call("SELECT ${column} AS v, COUNT(*) AS n ${where} GROUP BY ${column}", true) ?: []
@@ -168,7 +183,7 @@ class NsLifecycleOptionsSupport {
         try {
             NsSuiteQlClient client = new NsSuiteQlClient(auth)
             return ruleOptions(recordType, fieldId, ec.user.nowTimestamp.toLocalDateTime().toLocalDate(), { String q, boolean firstPage ->
-                client.query(q, firstPage) }, scope == "STAGE")
+                client.query(q, firstPage) }, scope == "STAGE", scope == "FINDING")
         } catch (IllegalArgumentException e) {
             ec.message.addError(e.message); return [:]
         } catch (Exception e) {

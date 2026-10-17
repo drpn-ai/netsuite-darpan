@@ -759,6 +759,22 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(records.contains("WHERE bl.transaction = transaction.id AND bl.mainline = 'F') AS backordered FROM transaction WHERE"), records)
     }
 
+    // DAR-UI-050: a finding a person writes: records whose fields match, every condition holding.
+    @Test
+    void aWrittenFindingIsTheRecordsWhoseFieldsMatch() {
+        String sql = query([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "itemsbackordered", op: "GT", values: ["0"]],
+                [fieldId: "status", op: "IN", values: ["Sales Order : Partially Fulfilled"]], [fieldId: "custbody_hc_order_id", values: ["NO_VALUE"]]]])
+        assertTrue(sql.contains("FROM transaction t WHERE t.type = 'SalesOrd' "), sql)
+        assertTrue(sql.contains("AND ((SELECT SUM(mb.quantitybackordered) FROM transactionline mb WHERE mb.transaction = t.id AND mb.mainline = 'F') > 0 " +
+                "AND BUILTIN.DF(t.status) IN ('Sales Order : Partially Fulfilled') AND t.custbody_hc_order_id IS NULL) ORDER BY t.id"), sql)
+        assertFalse(sql.contains("nexttransactionlink"), sql)
+        // Nothing that could break the query, and no finding without a condition.
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "RECORDS_MATCHING"]) }
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "id; DROP", values: ["1"]]]]) }
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "total", op: "GT", values: ["1 OR 1=1"]]]]) }
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", matchRules: [[fieldId: "total", op: "GT", values: ["1"]]]]) }
+    }
+
     @Test
     void anExceptionThatCouldBreakTheQueryIsRefused() {
         assertThrows(IllegalArgumentException) {
