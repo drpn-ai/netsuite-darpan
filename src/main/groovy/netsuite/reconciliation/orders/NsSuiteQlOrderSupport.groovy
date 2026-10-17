@@ -417,8 +417,18 @@ class NsSuiteQlOrderSupport {
             throw new IllegalArgumentException("waiveRules are only meaningful on ${TEMPLATE_LINKED_CHILD_ABSENT}, " +
                     "${TEMPLATE_LINKED_CHILD_PRESENT} or ${TEMPLATE_LINKED_CHILD_EXCUSED}; queryTemplate is ${queryTemplate}")
         }
+        // DAR-BE-073. How a stage is reached: the link table unless named here, by the child record type it applies to.
+        Map<String, Map<String, String>> stageReach = parseStageReach(query.containsKey("stageReach") ? query.get("stageReach") : null)
+        List<String> asked = [absentChildRecordType, presentChildRecordType].findAll { it }
+        stageReach.keySet().each { String childType ->
+            if (!asked.contains(childType)) {
+                throw new IllegalArgumentException("stageReach names ${childType}, which this query does not ask about " +
+                        "(it asks about ${asked ?: 'no stage'})")
+            }
+        }
 
         return [
+                stageReach            : stageReach,
                 waiveRules            : waiveRules,
                 matchRules            : matchRules,
                 nsSuiteQlSourceQueryId: text(query.get("nsSuiteQlSourceQueryId")),
@@ -549,11 +559,11 @@ class NsSuiteQlOrderSupport {
             return sql.toString()
         }
         if (template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT || template == TEMPLATE_LINKED_CHILD_PRESENT) {
-            String has = linkedChildPredicate(true, (String) spec.get('presentChildRecordType'), '')
+            String has = linkedChildPredicate(true, (String) spec.get('presentChildRecordType'), '', spec)
             sql << (waived && template == TEMPLATE_LINKED_CHILD_PRESENT ? "AND (${has} OR ${waived}) " : "AND ${has} ")
         }
         if (template != TEMPLATE_LINKED_CHILD_PRESENT) {
-            String has = linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '')
+            String has = linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '', spec)
             if (template == TEMPLATE_LINKED_CHILD_EXCUSED) {
                 sql << "AND NOT ${has} AND ${waived ? "(${waived})" : '1 = 0'} "
             } else {
@@ -829,8 +839,14 @@ class NsSuiteQlOrderSupport {
         return "${column} IN (${named})"
     }
 
-    private static String linkedChildPredicate(boolean present, String childRecordType, String suffix) {
+    private static String linkedChildPredicate(boolean present, String childRecordType, String suffix, Map<String, Object> spec = null) {
         String link = "l${suffix}", child = "c${suffix}"
+        // DAR-BE-073. A stage reached by a shared field: a record of the child type carrying the start record's value.
+        Map<String, String> reach = (Map<String, String>) ((Map) spec?.get("stageReach"))?.get(childRecordType)
+        if (reach) {
+            return "EXISTS (SELECT 1 FROM transaction ${child} WHERE ${child}.type = '${childRecordType}' " +
+                    "AND ${child}.${reach.stageField} = t.${reach.startField})"
+        }
         return "EXISTS (SELECT 1 FROM ${LINK_TABLE} ${link} " +
                 "JOIN transaction ${child} ON ${child}.id = ${link}.nextdoc " +
                 "WHERE ${link}.previousdoc = t.id AND ${child}.type = '${childRecordType}')"
@@ -1034,6 +1050,73 @@ class NsSuiteQlOrderSupport {
             }
             [fieldId: (Object) fieldId, values: (Object) values] as Map<String, Object>
         }
+    }
+
+    /**
+     * DAR-BE-073. Stages reached by a shared field rather than the link table, stored as JSON
+     * [{recordType, startField, stageField}]: a record of recordType whose stageField equals the start record's startField
+     * (a credit memo carrying the return's custbody_hc_return_id). Both field ids reach SuiteQL by interpolation, so they
+     * must be plain identifiers. Answers recordType -> [startField, stageField].
+     */
+    static Map<String, Map<String, String>> parseStageReach(Object raw) {
+        Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
+        if (parsed == null) return [:]
+        if (!(parsed instanceof List)) throw new IllegalArgumentException("stageReach must be a list, got: ${raw}")
+        Map<String, Map<String, String>> out = [:]
+        ((List) parsed).each { Object o ->
+            if (!(o instanceof Map)) throw new IllegalArgumentException("stageReach holds a non-entry: ${o}")
+            Map m = (Map) o
+            String recordType = text(m.get("recordType"))
+            String startField = text(m.get("startField"))
+            String stageField = text(m.get("stageField"))
+            if (!recordType || !startField || !stageField) {
+                throw new IllegalArgumentException("stageReach needs recordType, startField and stageField, got: ${o}")
+            }
+            requireIdentifier(recordType, "stageReach recordType")
+            [startField, stageField].each { String f ->
+                if (!(f ==~ /[a-z][a-z0-9_]*/)) throw new IllegalArgumentException("stageReach field must be a field id, got: ${f}")
+            }
+            if (out.containsKey(recordType)) throw new IllegalArgumentException("stageReach names ${recordType} twice")
+            out.put(recordType, [startField: startField, stageField: stageField])
+        }
+        return out
+    }
+
+    /** DAR-BE-073. The conditions a run snapshot reads once each, as the ids of the window's records that meet them. */
+    static final String CONDITION_MISSING = "MISSING"
+    static final String CONDITION_WAIVED = "WAIVED"
+    static final String CONDITION_MATCHING = "MATCHING"
+
+    /**
+     * DAR-BE-073. The window's records meeting ONE condition, ids only: missing a stage (by its reach), named by the
+     * spec's stage exceptions, or matching its written finding. One predicate per query on purpose: SuiteQL has silently
+     * truncated results whose shape stacked several EXISTS-derived columns (57 of 4,327 rows, hasMore=false), and a
+     * single NOT EXISTS is the shape every ABSENT check has already run in production.
+     */
+    static String buildConditionIdQuery(Map<String, Object> spec, String condition, String childRecordType,
+                                        String fromDate, String toDate) {
+        requireIsoDate(fromDate, "fromDate")
+        requireIsoDate(toDate, "toDate")
+        String predicate
+        if (condition == CONDITION_MISSING) {
+            if (!childRecordType) throw new IllegalArgumentException("a missing condition needs the stage's record type")
+            requireIdentifier(childRecordType, "childRecordType")
+            predicate = "NOT " + linkedChildPredicate(false, childRecordType, '', spec)
+        } else if (condition == CONDITION_WAIVED) {
+            String waived = waivePredicate(spec)
+            if (!waived) throw new IllegalArgumentException("a waived condition needs the spec's waiveRules")
+            predicate = "(${waived})"
+        } else if (condition == CONDITION_MATCHING) {
+            if (!spec.get("matchRules")) throw new IllegalArgumentException("a matching condition needs the spec's matchRules")
+            predicate = matchPredicate(spec)
+        } else {
+            throw new IllegalArgumentException("unknown condition ${condition}")
+        }
+        String dateColumn = (String) spec.get("dateColumn")
+        return "SELECT t.id AS id FROM ${spec.get('fromTable')} t WHERE t.type = '${spec.get('recordType')}' " +
+                "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
+                "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') " +
+                "AND ${predicate} ORDER BY t.id"
     }
 
     private static String text(Object value) {

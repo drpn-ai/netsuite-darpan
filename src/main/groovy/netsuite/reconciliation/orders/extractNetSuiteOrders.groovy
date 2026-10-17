@@ -3,9 +3,11 @@ import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.facade.reconciliation.RunObservability
 import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
+import darpan.reconciliation.core.RunSnapshotScope
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import netsuite.reconciliation.inventory.NsTokenCache
+import netsuite.reconciliation.orders.NsLifecycleSnapshot
 import netsuite.reconciliation.orders.NsOAuthTokenMinter
 import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
 
@@ -146,7 +148,9 @@ try {
              // DAR-UI-050. A lifecycle stage's exceptions; guarded the same way for an entity that predates them.
              waiveRules            : queryRow.isField("waiveRules") ? queryRow.get("waiveRules") : null,
              // DAR-UI-050. A written finding's conditions.
-             matchRules            : queryRow.isField("matchRules") ? queryRow.get("matchRules") : null],
+             matchRules            : queryRow.isField("matchRules") ? queryRow.get("matchRules") : null,
+             // DAR-BE-073. How the stages this query asks about are reached, when not by link.
+             stageReach            : queryRow.isField("stageReach") ? queryRow.get("stageReach") : null],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
@@ -211,47 +215,81 @@ try {
 } catch (Exception ignored) { }
 long lastReportedAtMs = 0L
 
-try {
-    Map extraction = null
-    workFile.withWriter("UTF-8") { Writer writer ->
-        long cumulative = 0L
-        extraction = NsSuiteQlOrderSupport.streamOrdersToWriter(writer,
-                [spec       : querySpec,
-                 fromDate   : fromDate,
-                 toDate     : thruDate,
-                 pageSize   : (pageSize != null ? pageSize as Integer : null),
-                 // The run's own day, resolved in the window's zone rather than the JVM's. The
-                 // time-sensitive branches compare a promised ship date against it, and reading a
-                 // clock deeper in the stack would make the query depend on where it executed.
-                 asOfDate   : asOfDateValue,
-                 keepFields : (keepRecordFields instanceof List ? keepRecordFields : null),
-                 filterRules: (sourceFilters instanceof List ? sourceFilters : null)],
-                { String query, int limit, int offset ->
-                    String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
-                    HttpResponse<String> resp = sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset)
-                    if (resp.statusCode() == 401) {
-                        // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
-                        // then retry ONCE — a second 401 is a real credential problem, not a race.
-                        NsTokenCache.evict(authCacheKey)
-                        resp = sendSuiteQl(httpClient, suiteQlUrl, mintToken(), query, limit, offset)
-                    }
-                    if (resp.statusCode() != 200) {
-                        throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: " +
-                                "${resp.body()?.take(500)}")
-                    }
-                    Map parsed = new JsonSlurper().parseText(resp.body()) as Map
+// One page of SuiteQL, live.
+long cumulative = 0L
+Closure livePage = { String query, int limit, int offset ->
+    String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
+    HttpResponse<String> resp = sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset)
+    if (resp.statusCode() == 401) {
+        // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
+        // then retry ONCE — a second 401 is a real credential problem, not a race.
+        NsTokenCache.evict(authCacheKey)
+        resp = sendSuiteQl(httpClient, suiteQlUrl, mintToken(), query, limit, offset)
+    }
+    if (resp.statusCode() != 200) {
+        throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: " +
+                "${resp.body()?.take(500)}")
+    }
+    Map parsed = new JsonSlurper().parseText(resp.body()) as Map
 
-                    if (progressRunId) {
-                        cumulative += ((List) (parsed.items ?: [])).size()
-                        long nowMs = System.currentTimeMillis()
-                        if (nowMs - lastReportedAtMs >= PROGRESS_MIN_INTERVAL_MS) {
-                            lastReportedAtMs = nowMs
-                            RunObservability.heartbeatStageProgress(ec, progressRunId, progressStage,
-                                    cumulative, (progressExpectedTotal ?: null))
-                        }
-                    }
-                    return [items: (parsed.items ?: []), hasMore: parsed.hasMore == true]
-                })
+    if (progressRunId) {
+        cumulative += ((List) (parsed.items ?: [])).size()
+        long nowMs = System.currentTimeMillis()
+        if (nowMs - lastReportedAtMs >= PROGRESS_MIN_INTERVAL_MS) {
+            lastReportedAtMs = nowMs
+            RunObservability.heartbeatStageProgress(ec, progressRunId, progressStage,
+                    cumulative, (progressExpectedTotal ?: null))
+        }
+    }
+    return [items: (parsed.items ?: []), hasMore: parsed.hasMore == true]
+}
+
+try {
+    // DAR-BE-073. Inside a run's walk, a lifecycle question is answered from one read of its window (NsLifecycleSnapshot)
+    // when it can be answered exactly; the first such question reads it, the rest only read the ids of the conditions
+    // they add. Anything else, and every run outside a walk, reads live.
+    Map<String, Closure> served = null
+    RunSnapshotScope runScope = RunSnapshotScope.current()
+    if (runScope != null && NsLifecycleSnapshot.canAnswer(querySpec)) {
+        String snapshotKey = NsLifecycleSnapshot.keyFor(querySpec, fromDate, thruDate,
+                "${authConfigIdValue}|${queryRow.companyUserGroupId}".toString())
+        NsLifecycleSnapshot snapshot = (NsLifecycleSnapshot) runScope.get(snapshotKey)
+        if (snapshot == null) {
+            snapshot = NsLifecycleSnapshot.read(querySpec, fromDate, thruDate, runScope.dir, livePage)
+            NsLifecycleSnapshot read = snapshot
+            runScope.put(snapshotKey, snapshot) { -> read.discard() }
+            ec.logger.info("lifecycle snapshot read ${snapshot.baseCount} ${querySpec.recordType} records ${fromDate}..${thruDate} " +
+                    "in ${snapshot.readMillis}ms for query ${queryIdValue}")
+        }
+        if (snapshot.covers(querySpec)) {
+            long before = System.currentTimeMillis()
+            Closure<Boolean> admits = snapshot.admits(querySpec, livePage)
+            served = snapshot.serve(admits)
+            ec.logger.info("lifecycle snapshot answers query ${queryIdValue} (${querySpec.queryTemplate}); conditions " +
+                    "${snapshot.conditionCounts} ready in ${System.currentTimeMillis() - before}ms")
+        } else {
+            ec.logger.info("lifecycle snapshot does not hold every column query ${queryIdValue} selects; reading it live")
+        }
+    }
+
+    Map extraction = null
+    try {
+        workFile.withWriter("UTF-8") { Writer writer ->
+            extraction = NsSuiteQlOrderSupport.streamOrdersToWriter(writer,
+                    [spec       : querySpec,
+                     fromDate   : fromDate,
+                     toDate     : thruDate,
+                     pageSize   : (pageSize != null ? pageSize as Integer : null),
+                     // The run's own day, resolved in the window's zone rather than the JVM's. The
+                     // time-sensitive branches compare a promised ship date against it, and reading a
+                     // clock deeper in the stack would make the query depend on where it executed.
+                     asOfDate   : asOfDateValue,
+                     keepFields : (keepRecordFields instanceof List ? keepRecordFields : null),
+                     filterRules: (sourceFilters instanceof List ? sourceFilters : null)],
+                    served != null ? served.fetch : livePage)
+        }
+    } finally {
+        served?.close?.call()
     }
 
     recordCount = extraction.recordCount ?: 0
@@ -263,6 +301,7 @@ try {
             windowThru   : thruDate,
             pageCount    : extraction.pageCount,
             excludedCount: extraction.excludedCount,
+            answeredFrom : served != null ? "run snapshot" : "NetSuite",
     ]
 
     String outputFileName = (fileName ?: "netsuite-orders-${fromDate}-${thruDate}.json").toString()
