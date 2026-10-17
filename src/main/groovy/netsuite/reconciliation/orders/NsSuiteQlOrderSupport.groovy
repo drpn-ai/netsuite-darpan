@@ -71,6 +71,12 @@ class NsSuiteQlOrderSupport {
     /** Parent rows WITH one linked child type and WITHOUT another — "shipped but never billed". */
     static final String TEMPLATE_LINKED_CHILD_PRESENT_ABSENT = "LINKED_CHILD_PRESENT_ABSENT"
     /**
+     * Parent rows with NO linked child of a given type that a stage exception excuses (DAR-UI-050): the Store Pickup
+     * orders with no fulfillment. A lifecycle gives them their own place rather than counting them as past the stage.
+     * With no exception it finds nothing.
+     */
+    static final String TEMPLATE_LINKED_CHILD_EXCUSED = "LINKED_CHILD_EXCUSED"
+    /**
      * Parent rows WITH a linked child of a given type (DAR-UI-050). The lifecycle builder gives every place its
      * own question so each opens its records; "shipped, never billed" is the no-invoice orders that DO have a
      * fulfillment, and only an EXISTS-only shape can return exactly those rows.
@@ -105,9 +111,9 @@ class NsSuiteQlOrderSupport {
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
-             TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_STATE_CONTRADICTION, TEMPLATE_SALES_LINES].asImmutable()
+             TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED, TEMPLATE_STATE_CONTRADICTION, TEMPLATE_SALES_LINES].asImmutable()
     private static final List<String> LINK_TEMPLATES =
-            [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT].asImmutable()
+            [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT, TEMPLATE_LINKED_CHILD_EXCUSED].asImmutable()
 
     /**
      * Transaction-to-transaction linkage lives in a link table, NOT in a `createdfrom` column on
@@ -390,9 +396,9 @@ class NsSuiteQlOrderSupport {
         // DAR-UI-050. Stage exceptions: a record that one of them names counts as having the stage. Each is a field and
         // the values that waive it; a stage may hold several (Shipping Method Store Pickup, Item GFT-CP).
         List<Map<String, Object>> waiveRules = parseWaiveRules(query.get("waiveRules"))
-        if (waiveRules && queryTemplate != TEMPLATE_LINKED_CHILD_ABSENT && queryTemplate != TEMPLATE_LINKED_CHILD_PRESENT) {
-            throw new IllegalArgumentException("waiveRules are only meaningful on ${TEMPLATE_LINKED_CHILD_ABSENT} or " +
-                    "${TEMPLATE_LINKED_CHILD_PRESENT}; queryTemplate is ${queryTemplate}")
+        if (waiveRules && !(queryTemplate in [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED])) {
+            throw new IllegalArgumentException("waiveRules are only meaningful on ${TEMPLATE_LINKED_CHILD_ABSENT}, " +
+                    "${TEMPLATE_LINKED_CHILD_PRESENT} or ${TEMPLATE_LINKED_CHILD_EXCUSED}; queryTemplate is ${queryTemplate}")
         }
 
         return [
@@ -461,8 +467,19 @@ class NsSuiteQlOrderSupport {
     }
 
     /** The SELECT list is exactly the mapped columns — see NsSuiteQlSourceQueryField's description. */
-    static List<String> selectColumns(Map<String, Object> spec) {
-        return ((List<Map<String, Object>>) spec.get("fields")).collect { (String) it.get("sourceColumn") }
+    /** DAR-UI-050. "LINE_SUM(quantitybackordered) AS backordered": a record's lines added up, e.g. its items on backorder. */
+    private static final Pattern LINE_SUM = ~/(?i)^LINE_SUM\(\s*([a-z][a-z0-9_]*)\s*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$/
+
+    /**
+     * The SELECT list. A LINE_SUM column becomes a sub-select over the record's item lines; outer names the record as
+     * the query does: "t" where it is aliased, "transaction" in the RECORDS query, which carries no alias.
+     */
+    static List<String> selectColumns(Map<String, Object> spec, String outer = "t") {
+        return ((List<Map<String, Object>>) spec.get("fields")).collect { Map<String, Object> f ->
+            String col = ((String) f.get("sourceColumn")).trim()
+            def m = LINE_SUM.matcher(col)
+            m.matches() ? "(SELECT SUM(bl.${m.group(1)}) FROM transactionline bl WHERE bl.transaction = ${outer}.id AND bl.mainline = 'F') AS ${m.group(2)}".toString() : col
+        }
     }
 
     /**
@@ -488,7 +505,7 @@ class NsSuiteQlOrderSupport {
         // none). Every stored row predates the template field, so a default that even reformatted this
         // query would change an extract already proven against gorjana production.
         if (template == TEMPLATE_RECORDS) {
-            return "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} " +
+            return "SELECT ${selectColumns(spec, (String) spec.get('fromTable')).join(', ')} FROM ${spec.get('fromTable')} " +
                     "WHERE type = '${spec.get('recordType')}' " +
                     "AND ${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
                     "AND ${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') " +
@@ -515,7 +532,11 @@ class NsSuiteQlOrderSupport {
         }
         if (template != TEMPLATE_LINKED_CHILD_PRESENT) {
             String has = linkedChildPredicate(false, (String) spec.get('absentChildRecordType'), template == TEMPLATE_LINKED_CHILD_PRESENT_ABSENT ? '2' : '')
-            sql << (waived && template == TEMPLATE_LINKED_CHILD_ABSENT ? "AND NOT (${has} OR ${waived}) " : "AND NOT ${has} ")
+            if (template == TEMPLATE_LINKED_CHILD_EXCUSED) {
+                sql << "AND NOT ${has} AND ${waived ? "(${waived})" : '1 = 0'} "
+            } else {
+                sql << (waived && template == TEMPLATE_LINKED_CHILD_ABSENT ? "AND NOT (${has} OR ${waived}) " : "AND NOT ${has} ")
+            }
         }
         if (spec.get("requireFulfillableOpenLine")) sql << "AND ${FULFILLABLE_OPEN_LINE_PREDICATE} "
         if (spec.get("requireOverdueShipDate")) {

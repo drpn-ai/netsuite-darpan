@@ -710,6 +710,17 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(absent.contains("AND NOT (EXISTS"), absent)
     }
 
+    // DAR-UI-050: the records a stage's exceptions excuse, missing the stage, are found on their own; with no exception, none.
+    @Test
+    void excusedRecordsAreTheOnesMissingTheStageThatAnExceptionNames() {
+        String excused = query([queryTemplate: "LINKED_CHILD_EXCUSED", absentChildRecordType: "ItemShip",
+                                waiveRules: [[fieldId: "shipmethod", values: ["Store Pickup"]], [fieldId: "item", values: ["GFT-CP"]]]])
+        assertTrue(excused.contains("AND NOT EXISTS (SELECT 1 FROM nexttransactionlink l JOIN transaction c ON c.id = l.nextdoc " +
+                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip') AND (BUILTIN.DF(t.shipmethod) IN ('Store Pickup') OR (EXISTS"), excused)
+        String none = query([queryTemplate: "LINKED_CHILD_EXCUSED", absentChildRecordType: "ItemShip"])
+        assertTrue(none.contains("c.type = 'ItemShip') AND 1 = 0"), none)
+    }
+
     // A stage may hold exceptions on several fields: a record any of them names is waived.
     @Test
     void aStageHoldsExceptionsOnSeveralFields() {
@@ -732,6 +743,20 @@ class NsSuiteQlQueryTemplateTest {
             NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"],
                     [[recordFieldName: "x", sourceColumn: "A.B.C(status) AS s", sequenceNum: 1]])
         }
+    }
+
+    // DAR-UI-050: a record shows its items on backorder, its lines added up, whichever way the query names the record.
+    @Test
+    void aLineSumIsTheRecordsLinesAddedUp() {
+        List<Map<String, Object>> fields = [[recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1],
+                                            [recordFieldName: "itemsBackordered", sourceColumn: "LINE_SUM(quantitybackordered) AS backordered", sequenceNum: 2]]
+        String linked = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"], fields), "2026-08-01", "2026-09-01")
+        assertTrue(linked.startsWith("SELECT id, (SELECT SUM(bl.quantitybackordered) FROM transactionline bl WHERE bl.transaction = t.id " +
+                "AND bl.mainline = 'F') AS backordered FROM transaction t "), linked)
+        String records = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate"], fields), "2026-08-01", "2026-09-01")
+        assertTrue(records.contains("WHERE bl.transaction = transaction.id AND bl.mainline = 'F') AS backordered FROM transaction WHERE"), records)
     }
 
     @Test
