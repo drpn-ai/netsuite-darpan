@@ -1,5 +1,7 @@
 # NetSuite Reconciliation Restlets
 
+> Status: not live. Inventory reconciliation is not in production. The RESTlet services (`reconciliation.NetSuiteInventoryServices.*`) and `NsRestletConfig` are still in the code, so this page describes them as written, but no live run uses them. The live NetSuite path is SuiteQL: see [suiteql-orders-and-lifecycle.md](../../suiteql-orders-and-lifecycle.md).
+
 ## Files
 - `inventory_bulk_restlet.js`
 - `inventory_detail_restlet.js`

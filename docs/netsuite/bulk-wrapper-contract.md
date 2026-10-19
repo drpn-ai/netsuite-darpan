@@ -1,5 +1,7 @@
 # Bulk Contract: NetSuite Inventory Retrieval
 
+> Status: not live. Inventory reconciliation is not in production. The RESTlet services (`reconciliation.NetSuiteInventoryServices.*`) and `NsRestletConfig` are still in the code, so this page describes them as written, but no live run uses them. The live NetSuite path is SuiteQL: see [suiteql-orders-and-lifecycle.md](suiteql-orders-and-lifecycle.md).
+
 ## Overview
 - The public NetSuite inventory retrieval surface is `reconciliation.NetSuiteInventoryServices.*` inside the `netsuite-darpan` component.
 - The bulk implementation enforces deterministic chunking, backoff-aware retries, and telemetry so that downstream reconciliation flows can reason about NetSuite ingestion health.
@@ -36,4 +38,4 @@
 | Chunk boundary (≤100 pairs) | Ensure single-chunk execution and success without exceeding NetSuite limits. | `nsChunkCount == 1`, `failedCount == 0`, `pairResults.size() == input pairs`, `summary` has no chunk failure entries. |
 | Multi-chunk determinism (>100 pairs) | Verify that chunk ordering matches sorted `<itemId, locationId>` order and that chunk indexes are sequential. | `itemResults` order matches the sorted source, `nsChunkResults[*].chunkIndex` is contiguous, and `nsChunkResults[*].pairCount == chunk size except final chunk`. |
 | Retry/backoff exercise | Force a retryable HTTP failure (e.g., transient 5xx) on a chunk and confirm `nsTotalRetryCount` increments and `nsChunkResults` captures multiple attempts with `status` eventually `SUCCESS` or `FAILED`. | `nsTotalRetryCount >= 1`, last `nsChunkResults` entry `attempts > 1`, backoff interval honored (observed via log timestamps). |
-| Telemetry parity | Confirm the retrieve service surfaces chunk metadata for downstream DIFF / truth-set comparisons. | Summary JSON contains `nsChunkResults`, `nsChunkSuccessCount`, `nsChunkFailureCount`, and each `itemResults` row includes `_matchedRuleIds` plus the reason fields described in the [rule explainability contract](../../../darpan/docs/reconciliation/rule-explainability.md). |
+| Telemetry parity | Confirm the retrieve service surfaces chunk metadata for downstream DIFF / truth-set comparisons. | Summary JSON contains `nsChunkResults`, `nsChunkSuccessCount`, `nsChunkFailureCount`, and each `itemResults` row includes `_matchedRuleIds` plus the reason fields described in the [rule engine services](../../../darpan/docs/reconciliation/rule-engine-services.md) notes. |

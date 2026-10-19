@@ -2,7 +2,7 @@
 
 ## Context
 - The `netsuite-darpan` component owns NetSuite fetching and two-CSV inventory reconciliation. The old Darpan inventory wrapper surface has been removed.
-- This guide documents the artifact map, the recommended cutover sequence, and the rollback checklist that align with the `NetSuiteInventoryServices` implementation described in the [bulk contract](bulk-wrapper-contract.md).
+- This guide documents the artifact map, the recommended cutover sequence, and the rollback checklist that align with the `NetSuiteInventoryServices` implementation described in the [bulk contract](../netsuite/bulk-wrapper-contract.md).
 
 ## Artifact ownership map
 | Asset | Current owner | Notes |
