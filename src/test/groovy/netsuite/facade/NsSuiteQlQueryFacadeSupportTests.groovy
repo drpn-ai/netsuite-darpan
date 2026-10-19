@@ -207,9 +207,25 @@ class NsSuiteQlQueryFacadeSupportTests {
     void listReportsTheProjectionSize() {
         NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([:]))
 
-        Map<String, Object> listed = NsSuiteQlQueryFacadeSupport.listQueries(ec)
-                .find { it.get("nsSuiteQlSourceQueryId") == QUERY_ID }
+        List rows = (List) NsSuiteQlQueryFacadeSupport.listQueries(ec).get("queries")
+        Map<String, Object> listed = rows.find { (it as Map).get("nsSuiteQlSourceQueryId") == QUERY_ID } as Map
         assertNotNull(listed)
         assertEquals(2, listed.get("fieldCount"))
+    }
+
+    /** Paged like every other list service: a bounded page plus the total, never every row at once. */
+    @Test
+    void listIsPagedAndReportsTheTotal() {
+        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([:]))
+
+        Map<String, Object> listed = NsSuiteQlQueryFacadeSupport.listQueries(ec, 0, 1)
+        Map<String, Object> pagination = (Map<String, Object>) listed.get("pagination")
+
+        assertEquals(1, ((List) listed.get("queries")).size())
+        assertEquals(0, pagination.get("pageIndex"))
+        assertEquals(1, pagination.get("pageSize"))
+        // totalCount counts every check the tenant has, not the page — that is the number a
+        // heading or a pager states, and stating the page size there would be a wrong number.
+        assertTrue((pagination.get("totalCount") as int) >= 1)
     }
 }

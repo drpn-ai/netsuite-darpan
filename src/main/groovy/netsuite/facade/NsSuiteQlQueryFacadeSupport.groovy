@@ -36,7 +36,7 @@ class NsSuiteQlQueryFacadeSupport {
             "requireFulfillableOpenLine", "requireOverdueShipDate",
             "pendingStates", "statesExpectingShipment", "statesExpectingInvoice",
             "disallowedStates", "overdueExcludedShipMethods", "requireParentRecordType",
-            "amountColumn", "minAmount", "joinKeyFieldName", "originFieldName",
+            "amountColumn", "minAmount", "joinKeyFieldName", "originFieldName", "lineKeyColumn",
     ]
 
     /**
@@ -44,13 +44,26 @@ class NsSuiteQlQueryFacadeSupport {
      * every tenant's checks — and each row names an nsAuthConfigId, so the leak would be a map of
      * who holds credentials for which NetSuite account.
      */
-    static List<Map<String, Object>> listQueries(def ec) {
+    static Map<String, Object> listQueries(def ec, Object pageIndex = null, Object pageSize = null) {
+        List<Map<String, Object>> rows = collectQueries(ec)
+        int page = Math.max(0, (pageIndex ?: 0) as int)
+        int size = Math.min(200, Math.max(1, (pageSize ?: 20) as int))
+        return [
+                queries   : darpan.facade.common.PaginationSupport.pageRows(rows, page, size),
+                pagination: darpan.facade.common.PaginationSupport.pagination(page, size, rows.size()),
+        ] as Map<String, Object>
+    }
+
+    private static List<Map<String, Object>> collectQueries(def ec) {
         List<Map<String, Object>> out = []
         darpan.facade.common.TenantScopedFinder.findTenantScoped(ec, QUERY_ENTITY)
                 .useCache(false).list().each { row ->
             out.add([
                     nsSuiteQlSourceQueryId: row.nsSuiteQlSourceQueryId,
                     nsAuthConfigId        : row.nsAuthConfigId,
+                    // Lets a caller check each row's owner as defence-in-depth on top of the
+                    // tenant-scoped read, the way the other settings lists do.
+                    companyUserGroupId    : row.companyUserGroupId,
                     description           : row.description,
                     recordType            : row.recordType,
                     queryTemplate         : row.queryTemplate,
@@ -71,7 +84,9 @@ class NsSuiteQlQueryFacadeSupport {
                                    nsAuthConfigId        : row.nsAuthConfigId,
                                    description           : row.description,
                                    isActive              : row.isActive] as Map<String, Object>
-        SPEC_FIELDS.each { String f -> out.put(f, row.get(f)?.toString()) }
+        // isField, not a bare get: EntityValue.get THROWS on an undeclared field, and lineKeyColumn
+        // reaches the entity in a separate change from this one.
+        SPEC_FIELDS.each { String f -> out.put(f, row.isField(f) ? row.get(f)?.toString() : null) }
         out.put("fields", projectionOf(ec, queryId).collect { f ->
             [recordFieldName: f.recordFieldName, sourceColumn: f.sourceColumn,
              sequenceNum    : f.sequenceNum] as Map<String, Object>
@@ -111,11 +126,19 @@ class NsSuiteQlQueryFacadeSupport {
 
         def existing = one(ec, queryId)
         def row = existing ?: ec.entity.makeValue(QUERY_ENTITY)
+        // A submitted value for a column this deployment's entity lacks is refused, not dropped: the
+        // spec just validated WITH it, so dropping it would store a row that no longer runs.
+        for (String f : SPEC_FIELDS) {
+            if (!row.isField(f) && text(context.get(f))) {
+                ec.message.addError("This server cannot store ${f} yet; the NetSuite check entity predates it.")
+                return null
+            }
+        }
         row.set("nsSuiteQlSourceQueryId", queryId)
         row.set("nsAuthConfigId", text(context.get("nsAuthConfigId")))
         row.set("description", text(context.get("description")))
         row.set("isActive", asBool(context.get("isActive"), true) ? "Y" : "N")
-        SPEC_FIELDS.each { String f -> row.set(f, entityValue(f, context.get(f))) }
+        SPEC_FIELDS.each { String f -> if (row.isField(f)) row.set(f, entityValue(f, context.get(f))) }
         if (existing == null) {
             darpan.facade.common.TenantAccessSupport.assignTenantOwnershipOnCreate(row, ec)
             row.create()

@@ -20,8 +20,21 @@
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
     <service verb="list" noun="NsSuiteQlSourceQueries" allow-remote="true" authenticate="true">
-        <description>Every NetSuite SuiteQL check definition the active tenant can see.</description>
+        <description>NetSuite SuiteQL check definitions the active tenant can see, paged.
+
+            Paged like every other list service (pageIndex/pageSize in, a pagination block out), so
+            a caller gets a bounded page and the total instead of every row at once.</description>
+        <in-parameters>
+            <parameter name="pageIndex" type="Integer" default-value="0"/>
+            <parameter name="pageSize" type="Integer" default-value="20"/>
+        </in-parameters>
         <out-parameters>
+            <parameter name="pagination" type="Map">
+                <parameter name="pageIndex" type="Integer"/>
+                <parameter name="pageSize" type="Integer"/>
+                <parameter name="totalCount" type="Integer"/>
+                <parameter name="pageCount" type="Integer"/>
+            </parameter>
             <parameter name="ok" type="Boolean"/>
             <parameter name="messages" type="List"><parameter name="message"/></parameter>
             <parameter name="errors" type="List"><parameter name="error"/></parameter>
@@ -29,6 +42,7 @@
                 <parameter name="query" type="Map">
                     <parameter name="nsSuiteQlSourceQueryId"/>
                     <parameter name="nsAuthConfigId"/>
+                    <parameter name="companyUserGroupId"/>
                     <parameter name="description"/>
                     <parameter name="recordType"/>
                     <parameter name="queryTemplate"/>
@@ -38,7 +52,9 @@
             </parameter>
         </out-parameters>
         <actions>
-            <set field="queries" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.listQueries(ec)"/>
+            <set field="listed" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.listQueries(ec, pageIndex, pageSize)"/>
+            <set field="queries" from="listed.queries"/>
+            <set field="pagination" from="listed.pagination"/>
             <set field="ok" from="!ec.message.hasError()"/>
             <set field="messages" from="ec.message.messages"/>
             <set field="errors" from="ec.message.errors"/>
@@ -91,6 +107,7 @@
             <parameter name="minAmount"/>
             <parameter name="joinKeyFieldName"/>
             <parameter name="originFieldName"/>
+            <parameter name="lineKeyColumn"/>
             <parameter name="isActive" type="Boolean" default-value="true"/>
             <parameter name="fields" type="List" required="true">
                 <parameter name="field" type="Map">
