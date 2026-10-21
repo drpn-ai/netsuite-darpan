@@ -10,6 +10,7 @@ import netsuite.reconciliation.inventory.NsTokenCache
 import netsuite.reconciliation.orders.NsLifecycleSnapshot
 import netsuite.reconciliation.orders.NsOAuthTokenMinter
 import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
+import netsuite.reconciliation.orders.NsSuiteQlPageRetry
 
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -215,17 +216,26 @@ try {
 } catch (Exception ignored) { }
 long lastReportedAtMs = 0L
 
-// One page of SuiteQL, live.
+// One page of SuiteQL, live. DAR-BE-056: a page that times out, drops its connection or meets a gateway 429/5xx is
+// retried on its own (NsSuiteQlPageRetry) instead of aborting the extraction; each retry is a warning, and each
+// page's time is kept so a month-scale run shows what the timeout must cover.
 long cumulative = 0L
+List<String> pageRetryWarnings = []
+List<Long> pageMillis = []
 Closure livePage = { String query, int limit, int offset ->
+    long pageStartedAt = System.currentTimeMillis()
     String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
-    HttpResponse<String> resp = sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset)
+    HttpResponse<String> resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset) },
+            offset, pageRetryWarnings)
     if (resp.statusCode() == 401) {
         // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
         // then retry ONCE — a second 401 is a real credential problem, not a race.
         NsTokenCache.evict(authCacheKey)
-        resp = sendSuiteQl(httpClient, suiteQlUrl, mintToken(), query, limit, offset)
+        String freshToken = mintToken()
+        resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, freshToken, query, limit, offset) },
+                offset, pageRetryWarnings)
     }
+    pageMillis.add(System.currentTimeMillis() - pageStartedAt)
     if (resp.statusCode() != 200) {
         throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: " +
                 "${resp.body()?.take(500)}")
@@ -294,14 +304,20 @@ try {
 
     recordCount = extraction.recordCount ?: 0
     dataAvailable = extraction.dataAvailable == true
-    warnings = extraction.warnings ?: []
+    warnings = ((extraction.warnings ?: []) as List) + pageRetryWarnings
     requestMetadata = [
-            endpoint     : suiteQlUrl,
-            windowFrom   : fromDate,
-            windowThru   : thruDate,
-            pageCount    : extraction.pageCount,
-            excludedCount: extraction.excludedCount,
-            answeredFrom : served != null ? "run snapshot" : "NetSuite",
+            endpoint         : suiteQlUrl,
+            windowFrom       : fromDate,
+            windowThru       : thruDate,
+            pageCount        : extraction.pageCount,
+            excludedCount    : extraction.excludedCount,
+            answeredFrom     : served != null ? "run snapshot" : "NetSuite",
+            // DAR-BE-056: what the per-request timeout has to cover, measured.
+            requestsSent     : pageMillis.size(),
+            slowestRequestMs : pageMillis ? pageMillis.max() : null,
+            totalRequestMs   : pageMillis ? pageMillis.sum() : 0L,
+            requestTimeoutSec: NsSuiteQlPageRetry.REQUEST_TIMEOUT.seconds,
+            pageRetries      : pageRetryWarnings.size(),
     ]
 
     String outputFileName = (fileName ?: "netsuite-orders-${fromDate}-${thruDate}.json").toString()
@@ -317,6 +333,8 @@ try {
     }
 } catch (Exception e) {
     errors = [e.message ?: e.toString()]
+    // The pages retried before the one that gave up, so a failed read still shows how it failed.
+    warnings = (((warnings ?: []) as List) + pageRetryWarnings).unique()
     dataAvailable = false
     recordCount = 0
     fileLocation = null
@@ -333,7 +351,7 @@ static HttpResponse<String> sendSuiteQl(HttpClient client, String url, String to
     // `Prefer: transient` is REQUIRED by NetSuite: without it the SuiteQL request is rejected.
     return client.send(
             HttpRequest.newBuilder(URI.create("${url}?limit=${limit}&offset=${offset}"))
-                    .timeout(Duration.ofSeconds(120))
+                    .timeout(NsSuiteQlPageRetry.REQUEST_TIMEOUT)
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
                     .header("Prefer", "transient")
