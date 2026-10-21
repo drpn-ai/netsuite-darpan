@@ -3,6 +3,7 @@ package netsuite.reconciliation.orders
 import darpan.facade.common.OutboundHttpPolicy
 import darpan.reconciliation.source.SourceFilterSupport
 import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
+import darpan.reconciliation.flowchart.LifecycleStageCompiler
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
@@ -418,8 +419,12 @@ class NsSuiteQlOrderSupport {
                     "${TEMPLATE_LINKED_CHILD_PRESENT} or ${TEMPLATE_LINKED_CHILD_EXCUSED}; queryTemplate is ${queryTemplate}")
         }
         // DAR-BE-073. How a stage is reached: the link table unless named here, by the child record type it applies to.
-        Map<String, Map<String, String>> stageReach = parseStageReach(query.containsKey("stageReach") ? query.get("stageReach") : null)
+        Map<String, Map> stageReach = parseStageReach(query.containsKey("stageReach") ? query.get("stageReach") : null)
         List<String> asked = [absentChildRecordType, presentChildRecordType].findAll { it }
+        // DAR-UI-052. A composite stage (Settled) is no NetSuite type: it is only ever asked through its alternatives.
+        asked.findAll { LifecycleStageCompiler.isComposite(it) && !stageReach.containsKey(it) }.each { String composite ->
+            throw new IllegalArgumentException("${composite} is reached only through its stageReach anyOf, which this query does not carry")
+        }
         stageReach.keySet().each { String childType ->
             if (!asked.contains(childType)) {
                 throw new IllegalArgumentException("stageReach names ${childType}, which this query does not ask about " +
@@ -844,8 +849,27 @@ class NsSuiteQlOrderSupport {
 
     private static String linkedChildPredicate(boolean present, String childRecordType, String suffix, Map<String, Object> spec = null) {
         String link = "l${suffix}", child = "c${suffix}"
+        Map reach = (Map) ((Map) spec?.get("stageReach"))?.get(childRecordType)
+        // DAR-UI-052. A stage reached by any of several records: one OR of their predicates, each with its own aliases.
+        if (reach?.get("anyOf")) {
+            List<Map> alternatives = (List<Map>) reach.get("anyOf")
+            List<String> ors = []
+            for (int i = 0; i < alternatives.size(); i++) {
+                Map alt = alternatives[i]
+                String own = "${suffix}_${i}".toString(), type = (String) alt.get("recordType")
+                Map via = (Map) alt.get("via")
+                if (via) {
+                    ors << ("EXISTS (SELECT 1 FROM transaction v${own} JOIN transaction c${own} ON c${own}.${alt.get('stageField')} = TO_CHAR(v${own}.id) " +
+                            "WHERE v${own}.type = '${via.get('recordType')}' AND v${own}.${via.get('stageField')} = t.${via.get('startField')} " +
+                            "AND c${own}.type = '${type}')").toString()
+                } else {
+                    Map<String, Object> ownSpec = alt.get("startField") ? [stageReach: (Object) [(type): [startField: alt.get("startField"), stageField: alt.get("stageField")]]] as Map<String, Object> : null
+                    ors << linkedChildPredicate(present, type, own, ownSpec)
+                }
+            }
+            return "(" + ors.join(" OR ") + ")"
+        }
         // DAR-BE-073. A stage reached by a shared field: a record of the child type carrying the start record's value.
-        Map<String, String> reach = (Map<String, String>) ((Map) spec?.get("stageReach"))?.get(childRecordType)
         if (reach) {
             return "EXISTS (SELECT 1 FROM transaction ${child} WHERE ${child}.type = '${childRecordType}' " +
                     "AND ${child}.${reach.stageField} = t.${reach.startField})"
@@ -1061,29 +1085,64 @@ class NsSuiteQlOrderSupport {
      * [{recordType, startField, stageField}]: a record of recordType whose stageField equals the start record's startField
      * (a credit memo carrying the return's custbody_hc_return_id). Both field ids reach SuiteQL by interpolation, so they
      * must be plain identifiers. Answers recordType -> [startField, stageField].
+     *
+     * DAR-UI-052. A composite stage (LifecycleStageCompiler.COMPOSITE_STAGES, e.g. Settled) carries anyOf instead: its
+     * alternatives, each a record type from the lifecycle whitelist, linked (no fields), carrying a field, or naming in
+     * stageField the internal id of a record reached through via. Answers Settled -> [anyOf: [...]].
      */
-    static Map<String, Map<String, String>> parseStageReach(Object raw) {
+    static Map<String, Map> parseStageReach(Object raw) {
         Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
         if (parsed == null) return [:]
         if (!(parsed instanceof List)) throw new IllegalArgumentException("stageReach must be a list, got: ${raw}")
-        Map<String, Map<String, String>> out = [:]
+        Map<String, Map> out = [:]
         ((List) parsed).each { Object o ->
             if (!(o instanceof Map)) throw new IllegalArgumentException("stageReach holds a non-entry: ${o}")
             Map m = (Map) o
             String recordType = text(m.get("recordType"))
-            String startField = text(m.get("startField"))
-            String stageField = text(m.get("stageField"))
-            if (!recordType || !startField || !stageField) {
-                throw new IllegalArgumentException("stageReach needs recordType, startField and stageField, got: ${o}")
-            }
+            if (!recordType) throw new IllegalArgumentException("stageReach needs a recordType, got: ${o}")
             requireIdentifier(recordType, "stageReach recordType")
-            [startField, stageField].each { String f ->
-                if (!(f ==~ /[a-z][a-z0-9_]*/)) throw new IllegalArgumentException("stageReach field must be a field id, got: ${f}")
-            }
             if (out.containsKey(recordType)) throw new IllegalArgumentException("stageReach names ${recordType} twice")
-            out.put(recordType, [startField: startField, stageField: stageField])
+            if (LifecycleStageCompiler.isComposite(recordType)) {
+                List alternatives = (List) (m.get("anyOf") ?: [])
+                if (!alternatives) throw new IllegalArgumentException("stageReach ${recordType} needs anyOf, got: ${o}")
+                out.put(recordType, [anyOf: alternatives.collect { Object a -> reachAlternative(a) }])
+                return
+            }
+            out.put(recordType, reachFields(m, o))
         }
         return out
+    }
+
+    private static Map<String, String> reachFields(Map m, Object o) {
+        String startField = text(m.get("startField"))
+        String stageField = text(m.get("stageField"))
+        if (!startField || !stageField) {
+            throw new IllegalArgumentException("stageReach needs recordType, startField and stageField, got: ${o}")
+        }
+        [startField, stageField].each { String f ->
+            if (!(f ==~ /[a-z][a-z0-9_]*/)) throw new IllegalArgumentException("stageReach field must be a field id, got: ${f}")
+        }
+        return [startField: startField, stageField: stageField]
+    }
+
+    private static Map reachAlternative(Object a) {
+        if (!(a instanceof Map)) throw new IllegalArgumentException("stageReach anyOf holds a non-entry: ${a}")
+        Map m = (Map) a
+        String recordType = text(m.get("recordType"))
+        if (!LifecycleStageCompiler.RECORD_TYPES.containsKey(recordType)) {
+            throw new IllegalArgumentException("stageReach anyOf names '${recordType}', which is not a record type a lifecycle can use")
+        }
+        if (m.get("via") != null) {
+            Map via = (Map) m.get("via")
+            String viaType = text(via.get("recordType"))
+            if (!LifecycleStageCompiler.RECORD_TYPES.containsKey(viaType)) {
+                throw new IllegalArgumentException("stageReach via names '${viaType}', which is not a record type a lifecycle can use")
+            }
+            String stageField = text(m.get("stageField"))
+            if (!(stageField ==~ /[a-z][a-z0-9_]*/)) throw new IllegalArgumentException("stageReach field must be a field id, got: ${stageField}")
+            return [recordType: recordType, stageField: stageField, via: [recordType: viaType] + reachFields(via, a)]
+        }
+        return text(m.get("startField")) || text(m.get("stageField")) ? [recordType: recordType] + reachFields(m, a) : [recordType: recordType]
     }
 
     /** DAR-BE-073. The conditions a run snapshot reads once each, as the ids of the window's records that meet them. */

@@ -73,6 +73,62 @@ class NsStageReachQueryTest {
         assertEquals([:], spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "CustCred", stageReach: ""]).stageReach)
     }
 
+    // ------------------------------------------------- DAR-UI-052: a stage reached by any of several records
+
+    /**
+     * A return is settled by a refund or an invoice carrying its return id, or by the replacement order that names its
+     * credit memo (custbody_hc_exchange_credit_memo_id holds the credit's internal id: 4,437 of a week's returns, 0 by
+     * tranid). gorjana Sep 15-21: 6,740 of 6,750 credited returns settled.
+     */
+    static final String SETTLED = '[{"recordType":"Settled","anyOf":[' +
+            '{"recordType":"CustRfnd","startField":"custbody_hc_return_id","stageField":"custbody_hc_return_id"},' +
+            '{"recordType":"CustInvc","startField":"custbody_hc_return_id","stageField":"custbody_hc_return_id"},' +
+            '{"recordType":"SalesOrd","stageField":"custbody_hc_exchange_credit_memo_id","via":' +
+            '{"recordType":"CustCred","startField":"custbody_hc_return_id","stageField":"custbody_hc_return_id"}}]}]'
+
+    @Test
+    void aStageReachedByAnyOfSeveralRecordsIsOneOrOfTheirPredicates() {
+        String absent = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "Settled", stageReach: SETTLED])
+        assertTrue(absent.contains("AND NOT (EXISTS (SELECT 1 FROM transaction c_0 WHERE c_0.type = 'CustRfnd' " +
+                "AND c_0.custbody_hc_return_id = t.custbody_hc_return_id) " +
+                "OR EXISTS (SELECT 1 FROM transaction c_1 WHERE c_1.type = 'CustInvc' AND c_1.custbody_hc_return_id = t.custbody_hc_return_id) " +
+                "OR EXISTS (SELECT 1 FROM transaction v_2 JOIN transaction c_2 ON c_2.custbody_hc_exchange_credit_memo_id = TO_CHAR(v_2.id) " +
+                "WHERE v_2.type = 'CustCred' AND v_2.custbody_hc_return_id = t.custbody_hc_return_id AND c_2.type = 'SalesOrd'))"), absent)
+        assertFalse(absent.contains("'Settled'"), "Settled is no NetSuite type: ${absent}")
+        // The snapshot's id query asks the same single predicate.
+        String missing = NsSuiteQlOrderSupport.buildConditionIdQuery(spec([queryTemplate: "LINKED_CHILD_ABSENT",
+                absentChildRecordType: "Settled", stageReach: SETTLED]), NsSuiteQlOrderSupport.CONDITION_MISSING, "Settled",
+                "2026-09-15", "2026-09-22")
+        assertTrue(missing.contains("AND NOT (EXISTS (SELECT 1 FROM transaction c_0 WHERE c_0.type = 'CustRfnd'"), missing)
+    }
+
+    @Test
+    void anAlternativeWithNoFieldsIsALinkedRecord() {
+        String present = query([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "Settled",
+                                stageReach: '[{"recordType":"Settled","anyOf":[{"recordType":"CustRfnd"}]}]'])
+        assertTrue(present.contains("AND (EXISTS (SELECT 1 FROM nexttransactionlink l_0 JOIN transaction c_0 ON c_0.id = l_0.nextdoc " +
+                "WHERE l_0.previousdoc = t.id AND c_0.type = 'CustRfnd'))"), present)
+    }
+
+    // Settled names no NetSuite type: without what settles it, it would be asked as type 'Settled' and match nothing.
+    @Test
+    void aCompositeStageNeedsItsAlternativesAndEachMustBeARecordTypeWithPlainFields() {
+        assertThrows(IllegalArgumentException) { query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "Settled"]) }
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "Settled",
+                  stageReach: '[{"recordType":"Settled","anyOf":[{"recordType":"Journal"}]}]'])
+        }
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "Settled",
+                  stageReach: '[{"recordType":"Settled","anyOf":[{"recordType":"SalesOrd","stageField":"x = 1 OR 1",' +
+                          '"via":{"recordType":"CustCred","startField":"custbody_hc_return_id","stageField":"custbody_hc_return_id"}}]}]'])
+        }
+        assertThrows(IllegalArgumentException) {
+            spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "Settled",
+                  stageReach: '[{"recordType":"Settled","anyOf":[]}]'])
+        }
+    }
+
     // ------------------------------------------------- the one-condition id queries a run snapshot reads
 
     @Test
