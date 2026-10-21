@@ -741,7 +741,10 @@ class NsSuiteQlOrderSupport {
         sql << "SELECT ${header.join(', ')}, tl.${lineKey} AS order_line_id, " +
                 "tl.quantityshiprecv AS quantity_shipped, tl.quantitybackordered AS quantity_backordered, " +
                 "tl.isclosed AS line_closed, tl.id AS line_id, tl.itemtype AS item_type, " +
-                "tl.quantitybilled AS quantity_billed, ${LINE_STATE_CASE} AS line_state "
+                "tl.quantitybilled AS quantity_billed, ${LINE_STATE_CASE} AS line_state, " +
+                // DAR-BE-093 (gorjana R3, "every store sale carries its store"): the line's location, so a conclusion can
+                // name a completed item NetSuite cannot ship because its line has no location.
+                "tl.location AS line_location "
         sql << "FROM ${spec.get('fromTable')} t JOIN transactionline tl ON tl.transaction = t.id "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
         sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
@@ -938,6 +941,7 @@ class NsSuiteQlOrderSupport {
             item_type           : "itemType",
             quantity_billed     : "quantityBilled",
             line_state          : "lineState",
+            line_location       : "lineLocation",
     ].asImmutable()
 
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
