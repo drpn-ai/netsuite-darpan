@@ -81,6 +81,103 @@ class NsLifecycleOptionsSupportTests {
         assertEquals(0L, out.sampleSize)
     }
 
+    // --- DAR-UI-052: a stage reached by a field both records carry ---------------------------------------------
+
+    /**
+     * A return's credit memo usually carries the return's HC Return Id and no link (gorjana 2026-10-21: 2,038 linked,
+     * 5,981 by return id, of 6,281 returns). The stub answers each query by what it asks: the field list, the fill and
+     * distinct counts of every field in a query, and the followers matched on one field.
+     */
+    static Closure<List<Map>> returnAccount(List<String> asked, Map<String, List<Long>> counts, Map<String, List<Map>> joins,
+                                            List<Map> links) {
+        return { String q ->
+            asked << q
+            if (q.contains("nexttransactionlink")) return links
+            if (q.startsWith("SELECT COUNT(*)")) return [[n: "1000"]]
+            if (q.contains("FROM customfield")) return [
+                    [scriptid: "CUSTBODY_HC_RETURN_ID", name: "HC Return Id", visibleontransactions: "CustCred, RtnAuth, SalesOrd"],
+                    [scriptid: "CUSTBODY_HC_ORDER_ID", name: "HC Order Id", visibleontransactions: "RtnAuth, SalesOrd"],
+                    [scriptid: "CUSTBODY_AVA_CUSTOMERFIRSTNAME", name: "Customer Firstname", visibleontransactions: "RtnAuth"],
+                    [scriptid: "CUSTBODY_DEPOSIT_ONLY", name: "Deposit Only", visibleontransactions: "Deposit"]]
+            if (q.contains("COUNT(DISTINCT t.")) {
+                Map row = [:]
+                (q =~ /COUNT\(t\.(\w+)\) AS (n\d+), COUNT\(DISTINCT t\.\w+\) AS (d\d+)/).each { List m ->
+                    List<Long> c = counts[m[1]] ?: [0L, 0L]
+                    row[m[2]] = c[0].toString(); row[m[3]] = c[1].toString()
+                }
+                return [row]
+            }
+            def field = q =~ /JOIN transaction c ON c\.(\w+) = t\.\w+/
+            if (field.find()) return joins[field.group(1)] ?: []
+            return [[type: "RtnAuth", n: "6281"]]
+        }
+    }
+
+    @Test
+    void aFieldNamingOneReturnEachReachesItsCreditMemoAndReplacesTheThinLinkStage() {
+        List<String> asked = []
+        Map out = NsLifecycleOptionsSupport.options("RtnAuth", TODAY, returnAccount(asked,
+                [custbody_hc_return_id: [1000L, 1000L], custbody_hc_order_id: [800L, 790L], custbody_ava_customerfirstname: [900L, 400L]],
+                [custbody_hc_return_id: [
+                        [childtype: "CustCred", lag: "7", n: "950", dups: "0"], [childtype: "CustCred", lag: "-1", n: "5", dups: "0"],
+                        [childtype: "CustInvc", lag: "9", n: "200", dups: "1"],
+                        [childtype: "CustRfnd", lag: "8", n: "400", dups: "30"],
+                        [childtype: "CashSale", lag: "-30", n: "100", dups: "0"]]],
+                [[childtype: "ItemRcpt", lag: "6", n: "900"], [childtype: "CustCred", lag: "7", n: "300"]]))
+
+        String fields = asked.find { it.contains("FROM customfield") }
+        assertTrue(fields.contains("isstored = 'T'"), "a field NetSuite does not store is no column on transaction: ${fields}")
+        String distinct = asked.find { it.contains("COUNT(DISTINCT t.") }
+        assertTrue(distinct.contains("t.type = 'RtnAuth'") && distinct.contains("TO_DATE('2026-09-25', 'YYYY-MM-DD')"), distinct)
+        assertFalse(distinct.contains("custbody_deposit_only"), "only fields on the record type are counted: ${distinct}")
+        // Only a field filled on most returns with a different value on each is matched: never a name, never an order id
+        // (several returns share an order).
+        List<String> joined = asked.findAll { it.contains("JOIN transaction c ON") && !it.contains("nexttransactionlink") }
+        assertEquals(1, joined.size(), joined.toString())
+        String join = joined[0]
+        assertTrue(join.contains("JOIN transaction c ON c.custbody_hc_return_id = t.custbody_hc_return_id"), join)
+        assertTrue(join.contains("t.custbody_hc_return_id IS NOT NULL"), join)
+        assertTrue(join.contains("c.type IN ('SalesOrd', 'ItemShip', 'CustInvc', 'CashSale', 'ItemRcpt', 'CustCred', 'CustRfnd')"), join)
+
+        Map credit = out.stages.find { it.recordType == "CustCred" }
+        assertEquals([955L, 96, 7], [credit.reached, credit.rate, credit.typicalDays], "the credit memos found by return id, not the 300 linked")
+        assertEquals([startField: "custbody_hc_return_id", stageField: "custbody_hc_return_id", fieldLabel: "HC Return Id"], credit.reach)
+        assertEquals(1, credit.coverage.find { it.days == 0 }.percent, "one dated before its return counts as same-day (5 of 955)")
+        assertFalse(out.stages.find { it.recordType == "ItemRcpt" }.containsKey("reach"), "the receipt is still a link")
+        assertEquals("custbody_hc_return_id", out.stages.find { it.recordType == "CustInvc" }.reach.startField)
+        // 30 of 400 returns with several refunds, and sales found mostly before the return, are not one record each.
+        assertEquals(["ItemRcpt", "CustCred", "CustInvc"], out.stages*.recordType)
+    }
+
+    // gorjana 2026-10-21: HC POS Return Id and HC Return Id find the same 5,981 credit memos. The POS id also finds the
+    // receipts, which the link finds as well; the return id also finds refunds, which nothing else does. Neither a label
+    // sorting first nor stages the link already covers may decide.
+    @Test
+    void twoFieldsReachingAStageEquallyLeaveItToTheOneTakingMoreStagesFromTheLink() {
+        List<String> asked = []
+        Map out = NsLifecycleOptionsSupport.options("RtnAuth", TODAY, returnAccount(asked,
+                [custbody_hc_return_id: [1000L, 1000L], custbody_hc_order_id: [1000L, 1000L]],
+                [custbody_hc_order_id : [[childtype: "CustCred", lag: "0", n: "900", dups: "0"], [childtype: "ItemRcpt", lag: "6", n: "750", dups: "0"]],
+                 custbody_hc_return_id: [[childtype: "CustCred", lag: "0", n: "900", dups: "0"], [childtype: "CustRfnd", lag: "0", n: "200", dups: "0"]]],
+                [[childtype: "ItemRcpt", lag: "6", n: "750"]]))
+        assertFalse(out.stages.find { it.recordType == "ItemRcpt" }.containsKey("reach"))
+        assertEquals("custbody_hc_return_id", out.stages.find { it.recordType == "CustCred" }.reach.startField)
+        String join = asked.find { it.contains("c.custbody_hc_return_id = t.custbody_hc_return_id") }
+        assertTrue(join.contains("CASE WHEN MIN(c.trandate - t.trandate) < 0 THEN -1"), "every earlier follower in one bucket: ${join}")
+    }
+
+    @Test
+    void aFieldMatchLeavesALinkStageItBarelyBeats() {
+        List<String> asked = []
+        Map out = NsLifecycleOptionsSupport.options("RtnAuth", TODAY, returnAccount(asked,
+                [custbody_hc_return_id: [1000L, 1000L]],
+                [custbody_hc_return_id: [[childtype: "ItemRcpt", lag: "7", n: "930", dups: "0"]]],
+                [[childtype: "ItemRcpt", lag: "7", n: "900"]]))
+        Map receipt = out.stages.find { it.recordType == "ItemRcpt" }
+        assertEquals(900L, receipt.reached, "3 points more of the sample is not worth leaving NetSuite's own link")
+        assertFalse(receipt.containsKey("reach"))
+    }
+
     // --- rule options: "leave out sales orders where [field] is [value]" ------------------------------------
 
     @Test
@@ -95,6 +192,7 @@ class NsLifecycleOptionsSupportTests {
         assertEquals(1, asked.size())
         assertTrue(asked[0].contains("FROM customfield WHERE fieldtype = 'BODY' AND fieldvaluetype = 'Free-Form Text'"), asked[0])
         assertFalse(asked[0].contains("LIKE"), "SuiteQL returns nothing for a LIKE on visibleontransactions: ${asked[0]}")
+        assertTrue(asked[0].contains("isstored = 'T'"), "an unstored field answers HTTP 400 when its values are read: ${asked[0]}")
         assertEquals([["status", "Status"], ["custbody_hc_order_id", "HC Order Id"], ["custbody_hc_sales_channel", "HC Sales Channel"],
                       ["custbody_nm_loop_cancelled", "Loop Cancelled"]], out.fields.collect { [it.fieldId, it.label] })
     }

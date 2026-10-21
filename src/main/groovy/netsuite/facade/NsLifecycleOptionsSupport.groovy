@@ -15,9 +15,11 @@ import java.time.LocalDate
  *  - What follows a record: NetSuite's own link table (nexttransactionlink), over a settled week that started
  *    21 to 14 days ago so later stages have had time to happen. For each follower type: how many records reached
  *    it, the share of the sample, the typical days to the first one, and the share done by each of a few days
- *    (which is what "late after" offers).
+ *    (which is what "late after" offers). DAR-UI-052: or a field both records carry, when that reaches clearly more
+ *    (a return's credit memo by HC Return Id); such a stage says so in `reach`, which save#Lifecycle takes as stageReach.
  *
- * Three aggregate queries; every value interpolated into them comes from LifecycleStageCompiler.RECORD_TYPES.
+ * Aggregate queries only; every record type interpolated into them comes from LifecycleStageCompiler.RECORD_TYPES, and
+ * every field id from NetSuite's own customfield list for the record type.
  * Measured on gorjana 2026-10-16: a month of 127,966 sales orders took ~33s per link query, a week ~8s.
  */
 class NsLifecycleOptionsSupport {
@@ -55,25 +57,129 @@ class NsLifecycleOptionsSupport {
                 "JOIN transaction c ON c.id = l.nextdoc WHERE t.type = '${recordType}' AND ${window('t.trandate', from, thru)} " +
                 "AND c.type IN (${quoted(followers)}) GROUP BY t.id, c.type) GROUP BY childtype, lag") ?: []
 
+        Map<String, Map<Integer, Long>> byType = lagsByType(lags)
+        Map<String, Map> stagesByType = sampleSize > 0 ? byType.collectEntries { String type, Map<Integer, Long> d ->
+            [(type): stage(type, d, sampleSize)] } : [:]
+        if (sampleSize > 0) {
+            Closure<Boolean> takesOver = { String type, long reached ->
+                reached - ((stagesByType[type]?.reached ?: 0L) as long) >= sampleSize * FIELD_GAIN_PERCENT / 100 }
+            fieldReaches(recordType, followers, sampleSize, from, thru, takesOver, suiteQl).each { String type, Map found ->
+                stagesByType[type] = stage(type, found.lags as Map<Integer, Long>, sampleSize) + [reach: found.reach]
+            }
+        }
+        List<Map> stages = stagesByType.values().findAll { it.reached > 0 }
+                .sort { a, b -> a.typicalDays <=> b.typicalDays ?: b.reached <=> a.reached }
+
+        return out + [stages: stages, sampleSize: sampleSize, sampleFrom: from.toString(), sampleThru: thru.minusDays(1).toString()]
+    }
+
+    /** (follower type, days, n) rows -> type -> days -> n. A follower dated before its record counts as same-day. */
+    private static Map<String, Map<Integer, Long>> lagsByType(List<Map> rows) {
         Map<String, Map<Integer, Long>> byType = [:]
-        lags.each { Map r ->
+        rows.each { Map r ->
             String type = r.childtype as String
             if (!LifecycleStageCompiler.RECORD_TYPES.containsKey(type)) return
-            // A follower dated before its record is a same-day follower entered out of order.
             int lag = Math.max(0, Math.round(dec(r.lag)) as int)
             Map<Integer, Long> d = byType.computeIfAbsent(type) { [:] }
             d[lag] = (d[lag] ?: 0L) + num(r.n)
         }
-        List<Map> stages = sampleSize > 0 ? byType.collect { String type, Map<Integer, Long> d ->
-            long reached = (d.values().sum() ?: 0L) as long
-            Map<String, String> w = LifecycleStageCompiler.words(type)
-            [recordType : type, label: w.name, past: w.past, reached: reached,
-             rate       : percent(reached, sampleSize), typicalDays: median(d, reached),
-             coverage   : COVERAGE_DAYS.collect { int days ->
-                 [days: days, percent: percent((d.findAll { it.key <= days }.values().sum() ?: 0L) as long, reached)] }]
-        }.findAll { it.reached > 0 }.sort { a, b -> a.typicalDays <=> b.typicalDays ?: b.reached <=> a.reached } : []
+        return byType
+    }
 
-        return out + [stages: stages, sampleSize: sampleSize, sampleFrom: from.toString(), sampleThru: thru.minusDays(1).toString()]
+    private static Map stage(String type, Map<Integer, Long> d, long sampleSize) {
+        long reached = (d.values().sum() ?: 0L) as long
+        Map<String, String> w = LifecycleStageCompiler.words(type)
+        return [recordType : type, label: w.name, past: w.past, reached: reached,
+                rate       : percent(reached, sampleSize), typicalDays: median(d, reached),
+                coverage   : COVERAGE_DAYS.collect { int days ->
+                    [days: days, percent: percent((d.findAll { it.key <= days }.values().sum() ?: 0L) as long, reached)] }]
+    }
+
+    /**
+     * DAR-UI-052. A field names one start record when it is filled on at least half the sample and nearly never repeats
+     * (HC Return Id on returns; an order id repeats across an order's returns, a name across customers).
+     */
+    static final int FIELD_FILLED_PERCENT = 50
+    static final int FIELD_DISTINCT_PERCENT = 99
+    /** Followers found through such a field count only if nearly none come before the start record or several to one. */
+    static final int FIELD_STRAY_PERCENT = 2
+    /** A field match replaces NetSuite's own link only when it reaches at least this many more points of the sample. */
+    static final int FIELD_GAIN_PERCENT = 5
+    /** Fields counted per query: one aggregate column pair each. */
+    static final int FIELD_COUNT_CHUNK = 40
+
+    /**
+     * DAR-UI-052. Stages reached by a field both records carry instead of the link table: gorjana writes most return
+     * credit memos standalone, tied to the return only by custbody_hc_return_id (2026-10-21, 6,281 returns: 2,038 credits
+     * linked, 5,981 by return id). One aggregate query per FIELD_COUNT_CHUNK fields finds the fields that name one start
+     * record each, then one query per such field finds what carries it (~2.5s each on gorjana). Answers follower type ->
+     * [lags: days -> n, reach: {startField, stageField, fieldLabel}], the field reaching the most records of that type,
+     * only for types where takesOver(type, reached) says the field beats the link.
+     */
+    private static Map<String, Map> fieldReaches(String recordType, List<String> followers, long sampleSize, LocalDate from,
+                                                 LocalDate thru, Closure<Boolean> takesOver, Closure<List<Map>> suiteQl) {
+        List<Map> keys = []
+        storedTextFields(recordType, suiteQl).findAll { it.fieldId ==~ /[a-z][a-z0-9_]*/ }.collate(FIELD_COUNT_CHUNK).each { List<Map> chunk ->
+            String columns = chunk.withIndex().collect { Map f, int i -> "COUNT(t.${f.fieldId}) AS n${i}, COUNT(DISTINCT t.${f.fieldId}) AS d${i}" }.join(", ")
+            Map row = (suiteQl.call("SELECT ${columns} FROM transaction t WHERE t.type = '${recordType}' AND ${window('t.trandate', from, thru)}") ?: [[:]])[0] ?: [:]
+            chunk.eachWithIndex { Map f, int i ->
+                long filled = num(row.get("n${i}".toString())), distinct = num(row.get("d${i}".toString()))
+                if (filled * 100 >= sampleSize * FIELD_FILLED_PERCENT && distinct * 100 >= filled * FIELD_DISTINCT_PERCENT) keys << f
+            }
+        }
+        // Per field: follower type -> [reached, lags]; only types the field reaches one each, on or after the start record.
+        Map<Map, Map<String, Map>> byField = [:]
+        keys.each { Map f ->
+            String col = f.fieldId
+            // dups: start records with more than one follower of the type carrying the field. Every follower dated before
+            // its record is one bucket (-1): an order id finds the order's own sales and shipments, years of distinct lags.
+            List<Map> rows = suiteQl.call("SELECT childtype, lag, COUNT(*) AS n, SUM(CASE WHEN m > 1 THEN 1 ELSE 0 END) AS dups FROM (" +
+                    "SELECT t.id AS pid, c.type AS childtype, CASE WHEN MIN(c.trandate - t.trandate) < 0 THEN -1 " +
+                    "ELSE MIN(c.trandate - t.trandate) END AS lag, COUNT(*) AS m FROM transaction t " +
+                    "JOIN transaction c ON c.${col} = t.${col} WHERE t.type = '${recordType}' AND ${window('t.trandate', from, thru)} " +
+                    "AND t.${col} IS NOT NULL AND c.type IN (${quoted(followers)}) GROUP BY t.id, c.type) GROUP BY childtype, lag") ?: []
+            Map<String, Map> found = [:]
+            lagsByType(rows).each { String type, Map<Integer, Long> d ->
+                List<Map> ofType = rows.findAll { it.childtype == type }
+                long reached = (d.values().sum() ?: 0L) as long
+                long before = (ofType.findAll { dec(it.lag) < 0 }.collect { num(it.n) }.sum() ?: 0L) as long
+                long several = (ofType.collect { num(it.dups) }.sum() ?: 0L) as long
+                if (before * 100 > reached * FIELD_STRAY_PERCENT || several * 100 > reached * FIELD_STRAY_PERCENT) return
+                if (takesOver.call(type, reached)) found[type] = [reached: reached, lags: d]
+            }
+            byField[f] = found
+        }
+        // A type reached as often by two fields goes to the one that takes more stages from the link. gorjana 2026-10-21:
+        // HC POS Return Id and HC Return Id find the same 5,981 credit memos; the POS id also finds the receipts, which the
+        // link finds as well, while the return id also finds refunds and invoices, which nothing else does.
+        Map<Map, Long> total = byField.collectEntries { Map f, Map<String, Map> found ->
+            [(f): (found.values().collect { it.reached as long }.sum() ?: 0L) as long] }
+        Map<String, Map> best = [:]
+        byField.each { Map f, Map<String, Map> found ->
+            found.each { String type, Map m ->
+                Map held = best[type]
+                long reached = m.reached as long, heldReached = (held?.reached ?: 0L) as long
+                if (reached > heldReached || (held && reached == heldReached && total[f] > total[held.field])) {
+                    best[type] = m + [field: f, reach: [startField: f.fieldId, stageField: f.fieldId, fieldLabel: f.label]]
+                }
+            }
+        }
+        return best
+    }
+
+    /**
+     * The text fields NetSuite shows on a record type, by their own names. visibleontransactions is a list like
+     * "CashSale, SalesOrd, ..." that SuiteQL cannot filter (a LIKE on it returns no rows, measured on gorjana 2026-10-16),
+     * so it is read and matched here. A field NetSuite does not store (sourced from another record) is no column on
+     * transaction: naming one answers HTTP 400 "Field ... was not found" (gorjana 2026-10-21, the Avalara name fields).
+     */
+    private static List<Map> storedTextFields(String recordType, Closure<List<Map>> suiteQl) {
+        return (suiteQl.call("SELECT scriptid, name, visibleontransactions FROM customfield WHERE fieldtype = 'BODY' " +
+                "AND fieldvaluetype = 'Free-Form Text' AND isstored = 'T'") ?: [])
+                .findAll { Map r -> ((r.visibleontransactions ?: "") as String).split(",")*.trim().contains(recordType) }
+                .collect { Map r -> [fieldId: (r.scriptid as String)?.toLowerCase(), label: (r.name as String)?.trim()] }
+                .findAll { it.fieldId && it.label }
+                .sort { it.label.toLowerCase() }
     }
 
     /** A rule's empty value, as LifecycleRuleSupport projects it (NVL) so a filter can match it. */
@@ -115,14 +221,7 @@ class NsLifecycleOptionsSupport {
     static Map ruleOptions(String recordType, String fieldId, LocalDate today, Closure<List<Map>> suiteQl, boolean forStage = false,
                            boolean forFinding = false) {
         LifecycleStageCompiler.words(recordType)
-        // visibleontransactions is a list like "CashSale, SalesOrd, ..." that SuiteQL cannot filter (a LIKE on it
-        // returns no rows, measured on gorjana 2026-10-16), so it is read and matched here.
-        List<Map> fields = (suiteQl.call("SELECT scriptid, name, visibleontransactions FROM customfield WHERE fieldtype = 'BODY' " +
-                "AND fieldvaluetype = 'Free-Form Text'", false) ?: [])
-                .findAll { Map r -> ((r.visibleontransactions ?: "") as String).split(",")*.trim().contains(recordType) }
-                .collect { Map r -> [fieldId: (r.scriptid as String)?.toLowerCase(), label: (r.name as String)?.trim()] }
-                .findAll { it.fieldId && it.label }
-                .sort { it.label.toLowerCase() }
+        List<Map> fields = storedTextFields(recordType) { String q -> suiteQl.call(q, false) }
         Map<String, String> standardFields = forFinding ? FINDING_FIELDS : forStage ? STANDARD_STAGE_FIELDS : STANDARD_RULE_FIELDS
         fields = standardFields.collect { k, v -> [fieldId: k, label: v] + (FINDING_THRESHOLDS.containsKey(k) ? [kind: "number"] : [:]) } + fields
         Map out = [fields: fields]
