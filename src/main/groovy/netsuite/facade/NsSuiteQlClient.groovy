@@ -25,9 +25,13 @@ class NsSuiteQlClient {
     private final String authId
     private final String tokenUrl
     private final String suiteQlUrl
-    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+    private final Duration requestTimeout
+    private final HttpClient http
 
-    NsSuiteQlClient(def authConfig) {
+    /** requestTimeout caps the token and query calls alike; null keeps the extract-sized defaults. */
+    NsSuiteQlClient(def authConfig, Duration requestTimeout = null) {
+        this.requestTimeout = requestTimeout
+        this.http = HttpClient.newBuilder().connectTimeout(requestTimeout ?: Duration.ofSeconds(30)).build()
         this.authConfig = authConfig
         this.authId = authConfig.get("nsAuthConfigId") as String
         this.tokenUrl = authConfig.get("tokenUrl")?.toString()?.trim()
@@ -56,7 +60,7 @@ class NsSuiteQlClient {
 
     private HttpResponse<String> send(String token, String sql) {
         return http.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${PAGE_LIMIT}&offset=0"))
-                .timeout(Duration.ofSeconds(120))
+                .timeout(requestTimeout ?: Duration.ofSeconds(120))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json")
                 .header("Prefer", "transient")
@@ -65,7 +69,8 @@ class NsSuiteQlClient {
                 .build(), HttpResponse.BodyHandlers.ofString())
     }
 
-    private String mintToken() {
+    /** A fresh token, always minted rather than read from the cache — connection diagnostics depend on that. */
+    String mintToken() {
         String scope = authConfig.get("scope")?.toString()?.trim() ?: "restlets rest_webservices"
         String assertion = NsOAuthTokenMinter.buildClientAssertion(tokenUrl, authConfig.get("clientId")?.toString()?.trim(),
                 authConfig.get("certId")?.toString()?.trim(), authConfig.get("privateKeyPem")?.toString(), scope)
@@ -73,7 +78,7 @@ class NsSuiteQlClient {
                 "&client_assertion_type=" + enc("urn:ietf:params:oauth:client-assertion-type:jwt-bearer") +
                 "&client_assertion=" + enc(assertion)
         HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create(tokenUrl))
-                .timeout(Duration.ofSeconds(60))
+                .timeout(requestTimeout ?: Duration.ofSeconds(60))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8)).build(),
                 HttpResponse.BodyHandlers.ofString())

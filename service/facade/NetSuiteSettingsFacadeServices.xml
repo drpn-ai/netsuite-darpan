@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- DAR-BE-114: NetSuite auth profile services that need netsuite-darpan's token and SuiteQL code, which darpan
+     (where NsAuthConfig and its save service live) cannot reach — netsuite-darpan depends on darpan, not the
+     other way round. The `facade.` path keeps it inside the DARPAN_APP artifact group's `facade\..*` pattern. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="probe" noun="NsAuthConnection" allow-remote="false" authenticate="true">
+        <description>Connection diagnostics for a saved NetSuite OAuth2 auth profile. Registered on the
+            SourceSystemConnector NETSUITE row as healthCheckServiceName and invoked only through
+            facade.SettingsFacadeServices.test#SourceConnection, which owns the permission gate.
+            Read-only: one token and a one-row SuiteQL query. Never writes to ec.message: a refused
+            credential is a check row, not a service error.</description>
+        <in-parameters>
+            <parameter name="nsAuthConfigId" required="true"/>
+            <parameter name="stage">
+                <description>Run just this stage and report the next one, so the caller can show
+                    progress as each completes. Blank runs every stage in a single call.</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="checks" type="List">
+                <parameter name="check" type="Map">
+                    <parameter name="key"/>
+                    <parameter name="label"/>
+                    <parameter name="status"/>
+                    <parameter name="detail"/>
+                    <parameter name="durationMillis" type="Long"/>
+                </parameter>
+            </parameter>
+            <parameter name="nextStage">
+                <description>Stage to run next, or blank when the probe is finished — either it
+                    completed or a failure made the remaining stages meaningless.</description>
+            </parameter>
+        </out-parameters>
+        <actions>
+            <script>context.putAll(netsuite.facade.NsConnectionProbe.probeConnection(ec, nsAuthConfigId, stage))</script>
+        </actions>
+    </service>
+
+</services>
