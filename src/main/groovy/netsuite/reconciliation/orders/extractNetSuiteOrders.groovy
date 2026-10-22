@@ -367,6 +367,8 @@ try {
     fileLocation = null
     fileName = null
 } finally {
+    // The excluded-records spill holds customer records: gone on every path.
+    ExcludedRecordsSidecar.discard((Map) extraction?.excludedCollector)
     // JDK 21 HttpClient holds a selector thread and a connection pool until closed; the inventory
     // path leaked one per call before 0d713bd.
     try { httpClient.close() } catch (Exception ignored) { }
