@@ -317,6 +317,53 @@ class NsSuiteQlOrderSupportTest {
         assertTrue((boolean) result.dataAvailable)
     }
 
+    // DAR-BE-111: each page's records go to the enricher (the HotWax status lookup) before the rules see them, so a rule
+    // or a conclusion can read what it adds; a failing enricher fails the extract rather than writing half an answer.
+    @Test
+    void anEnricherSeesEachPageBeforeTheRulesAndItsFieldsAreWritten() {
+        List<Map> pages = [
+                [items: [[id: "1", custbody_hc_order_id: "145059"], [id: "2", custbody_hc_order_id: "155939"]], hasMore: true],
+                [items: [[id: "3", custbody_hc_order_id: null]], hasMore: false],
+        ]
+        List<Integer> pageSizes = []
+        StringWriter out = new StringWriter()
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec: salesOrderSpec(), fromDate: "2026-10-01", toDate: "2026-10-20", pageSize: 2,
+                 filterRules: [[sequenceNum: 1, fieldExpression: "omsStatusId", operator: "EXCLUDE_IN", filterValues: "ORDER_APPROVED"]],
+                 pageEnricher: { List<Map<String, Object>> records ->
+                     pageSizes << records.size()
+                     records.each { if (it.orderId) it.omsStatusId = it.orderId == "145059" ? "ORDER_COMPLETED" : "ORDER_APPROVED" }
+                 }],
+                { String q, int limit, int offset -> pages.remove(0) })
+
+        assertEquals([2, 1], pageSizes)
+        List<Map> written = (List<Map>) new groovy.json.JsonSlurper().parseText(out.toString()).records
+        assertEquals(["145059", null], written*.orderId, "the approved order was excluded by a rule reading the enriched field")
+        assertEquals("ORDER_COMPLETED", written[0].omsStatusId)
+        assertEquals(2, result.recordCount)
+
+        assertThrows(IllegalStateException) {
+            NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
+                    [spec: salesOrderSpec(), fromDate: "2026-10-01", toDate: "2026-10-20",
+                     pageEnricher: { List records -> throw new IllegalStateException("OMS unavailable") }],
+                    { String q, int limit, int offset -> [items: [[id: "1", custbody_hc_order_id: "145059"]], hasMore: false] })
+        }
+    }
+
+    // DAR-BE-111: which mapped field names the HotWax order, checked like every other configured fragment.
+    @Test
+    void theOmsStatusKeyMustBeAMappedFieldAndTheConfigComesWithIt() {
+        Map base = [nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"]
+        List fields = [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1]]
+        Map spec = NsSuiteQlOrderSupport.normalizeSpec(base + [omsStatusConfigId: "rails_prod", omsStatusKeyField: "orderId"], fields)
+        assertEquals(["rails_prod", "orderId"], [spec.omsStatusConfigId, spec.omsStatusKeyField])
+        assertNull(NsSuiteQlOrderSupport.normalizeSpec(base, fields).omsStatusConfigId)
+        assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec(base + [omsStatusConfigId: "rails_prod", omsStatusKeyField: "nope"], fields) }
+        assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec(base + [omsStatusConfigId: "rails_prod"], fields) }
+    }
+
     @Test
     void writesRecordsFirstThenMetadataSoPagesCanBeAppended() {
         StringWriter out = new StringWriter()

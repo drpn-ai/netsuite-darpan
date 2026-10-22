@@ -432,6 +432,21 @@ class NsSuiteQlOrderSupport {
             }
         }
 
+        // DAR-BE-111. Which OMS config to ask, and which mapped field holds the OMS order id, for each record's HotWax
+        // status (extractNetSuiteOrders asks it page by page). Both or neither; read through containsKey, as above.
+        String omsStatusConfigId = query.containsKey("omsStatusConfigId") ? text(query.get("omsStatusConfigId")) : null
+        String omsStatusKeyField = query.containsKey("omsStatusKeyField") ? text(query.get("omsStatusKeyField")) : null
+        if (omsStatusConfigId || omsStatusKeyField) {
+            if (!omsStatusConfigId || !omsStatusKeyField) {
+                throw new IllegalArgumentException("omsStatusConfigId and omsStatusKeyField go together: the OMS to ask and " +
+                        "the field that names the order there")
+            }
+            if (!normalized.any { it.get("recordFieldName") == omsStatusKeyField }) {
+                throw new IllegalArgumentException("omsStatusKeyField ${omsStatusKeyField} is not one of the mapped record " +
+                        "fields ${normalized.collect { it.get('recordFieldName') }}")
+            }
+        }
+
         return [
                 stageReach            : stageReach,
                 waiveRules            : waiveRules,
@@ -458,6 +473,8 @@ class NsSuiteQlOrderSupport {
                 minAmount                 : minAmount,
                 overdueExcludedShipMethods: overdueExcludedShipMethods,
                 lineKeyColumn             : lineKeyColumn,
+                omsStatusConfigId         : omsStatusConfigId,
+                omsStatusKeyField         : omsStatusKeyField,
         ] as Map<String, Object>
     }
 
@@ -519,6 +536,12 @@ class NsSuiteQlOrderSupport {
      * credit memos reads at ~1.4 s a page (2026-10-22), where a lookup by a custom field times out.
      */
     private static final Pattern ACCOUNT_USED = ~/^ACCOUNT_USED\(\s*([0-9]{3,10})\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * DAR-BE-111. "LINKED(ItemShip) AS shipped", "LINKED(CustInvc, CashSale) AS billed": T or F, a record of any of the
+     * types follows the record (link table). A fulfillment counts only once Shipped (STAGE_DONE_STATUS), as on every
+     * stage. A flag rather than a filter, so every record is read and an audit finding closes once the record moves on.
+     */
+    private static final Pattern LINKED = ~/^LINKED\(\s*([A-Za-z]+(?:\s*,\s*[A-Za-z]+)*)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
 
     /**
      * The SELECT list. A LINE_SUM or LINE_ITEMS column becomes a sub-select over the record's item lines, DEPOSIT_WHEN
@@ -542,6 +565,13 @@ class NsSuiteQlOrderSupport {
             if (m.matches()) {
                 return ("CASE WHEN EXISTS (SELECT 1 FROM transactionaccountingline au JOIN account aa ON aa.id = au.account " +
                         "WHERE au.transaction = ${outer}.id AND aa.acctnumber = '${m.group(1)}') THEN 'T' ELSE 'F' END AS ${m.group(2)}").toString()
+            }
+            m = LINKED.matcher(col)
+            if (m.matches()) {
+                String alias = m.group(2), lk = "lk_${alias}", lc = "lc_${alias}"
+                String types = m.group(1).split(/\s*,\s*/).collect { String type -> "(${lc}.type = '${type}'${stageDone(lc, type)})" }.join(" OR ")
+                return ("CASE WHEN EXISTS (SELECT 1 FROM ${LINK_TABLE} ${lk} JOIN transaction ${lc} ON ${lc}.id = ${lk}.nextdoc " +
+                        "WHERE ${lk}.previousdoc = ${outer}.id AND (${types})) THEN 'T' ELSE 'F' END AS ${alias}").toString()
             }
             m = DEPOSIT_WHEN.matcher(col)
             if (m.matches()) {
@@ -1275,6 +1305,7 @@ class NsSuiteQlOrderSupport {
         int maxPages = options.get("maxPages") != null ? ((Number) options.get("maxPages")).intValue() : DEFAULT_MAX_PAGES
         List<Map<String, Object>> rules = SourceFilterSupport.parseRules(options.get("filterRules"))
         List<String> keepFields = normalizeKeepFields(options.get("keepFields"))
+        Closure pageEnricher = (Closure) options.get("pageEnricher")
 
         // The day the run is taken, for the time-sensitive branches. Supplied by the caller rather
         // than read here from the clock: a query built from a hidden "now" is not reproducible, and
@@ -1296,9 +1327,12 @@ class NsSuiteQlOrderSupport {
         while (hasMore && pageCount < maxPages) {
             Map page = (Map) pageFetcher.call(query, pageSize, offset)
             pageCount++
-            List items = (List) (page?.get("items") ?: [])
-            for (Object rawRow : items) {
-                Map<String, Object> record = mapRowToRecord(spec, (Map<String, Object>) rawRow)
+            List<Map<String, Object>> mapped = ((List) (page?.get("items") ?: [])).collect { Object rawRow ->
+                mapRowToRecord(spec, (Map<String, Object>) rawRow) } as List<Map<String, Object>>
+            // DAR-BE-111. A page at a time, before the rules, so a rule or a conclusion can read what it adds (the HotWax
+            // status). It throws rather than leave records half answered.
+            if (pageEnricher != null && mapped) pageEnricher.call(mapped)
+            for (Map<String, Object> record : mapped) {
                 // Exclusions run client-side because SuiteQL has no knowledge of tenant rules, and
                 // they run AFTER mapping so a rule names the reconciliation field an operator sees
                 // (orderOrigin), not the raw NetSuite column.

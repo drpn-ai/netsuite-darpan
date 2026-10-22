@@ -827,6 +827,26 @@ class NsSuiteQlQueryTemplateTest {
         }
     }
 
+    // DAR-BE-111: an order never shipped (no Shipped fulfillment) and never billed (no invoice or cash sale), as two flags
+    // on EVERY order, so a fixed order is still read and its audit finding closes.
+    @Test
+    void linkedFlagsWhetherARecordOfTheTypesFollowsAndAFulfillmentOnlyOnceShipped() {
+        List<Map<String, Object>> fields = [[recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 1],
+                                            [recordFieldName: "shipped", sourceColumn: "LINKED(ItemShip) AS shipped", sequenceNum: 2],
+                                            [recordFieldName: "billed", sourceColumn: "LINKED(CustInvc, CashSale) AS billed", sequenceNum: 3]]
+        String records = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate"], fields), "2026-10-01", "2026-10-20")
+        assertTrue(records.startsWith("SELECT tranid, CASE WHEN EXISTS (SELECT 1 FROM nexttransactionlink lk_shipped JOIN transaction lc_shipped " +
+                "ON lc_shipped.id = lk_shipped.nextdoc WHERE lk_shipped.previousdoc = transaction.id AND ((lc_shipped.type = 'ItemShip' " +
+                "AND lc_shipped.status = 'C'))) THEN 'T' ELSE 'F' END AS shipped, CASE WHEN EXISTS (SELECT 1 FROM nexttransactionlink " +
+                "lk_billed JOIN transaction lc_billed ON lc_billed.id = lk_billed.nextdoc WHERE lk_billed.previousdoc = transaction.id AND " +
+                "((lc_billed.type = 'CustInvc') OR (lc_billed.type = 'CashSale'))) THEN 'T' ELSE 'F' END AS billed FROM transaction "), records)
+        assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"],
+                    [[recordFieldName: "x", sourceColumn: "LINKED(ItemShip OR 1=1) AS x", sequenceNum: 1]])
+        }
+    }
+
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
     // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
     @Test

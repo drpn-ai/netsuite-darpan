@@ -151,7 +151,10 @@ try {
              // DAR-UI-050. A written finding's conditions.
              matchRules            : queryRow.isField("matchRules") ? queryRow.get("matchRules") : null,
              // DAR-BE-073. How the stages this query asks about are reached, when not by link.
-             stageReach            : queryRow.isField("stageReach") ? queryRow.get("stageReach") : null],
+             stageReach            : queryRow.isField("stageReach") ? queryRow.get("stageReach") : null,
+             // DAR-BE-111. Each record's HotWax status: the OMS config to ask and the field naming the order there.
+             omsStatusConfigId     : queryRow.isField("omsStatusConfigId") ? queryRow.get("omsStatusConfigId") : null,
+             omsStatusKeyField     : queryRow.isField("omsStatusKeyField") ? queryRow.get("omsStatusKeyField") : null],
             queryFieldRows)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
@@ -282,6 +285,29 @@ try {
         }
     }
 
+    // DAR-BE-111. With an OMS config on the query row, every record naming an OMS order gets that order's HotWax
+    // statusId as omsStatusId, NOT_IN_OMS when HotWax has no such order. Asked by id, a page at a time, under the query
+    // row's own tenant (the trusted run owner); a lookup that fails fails the extract rather than call orders missing.
+    Closure omsStatusEnricher = null
+    if (querySpec.omsStatusConfigId) {
+        String keyField = querySpec.omsStatusKeyField as String
+        omsStatusEnricher = { List<Map<String, Object>> records ->
+            List<String> ids = records.collect { it.get(keyField)?.toString()?.trim() }.findAll { it }.unique()
+            if (!ids) return
+            Map looked = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
+                    .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: ids,
+                                 companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
+            if (!(looked?.ok)) {
+                throw new IllegalStateException("HotWax order status lookup failed: ${(looked?.errors ?: ec.message.errors) as List}")
+            }
+            Map statusByOrderId = (Map) looked.statusByOrderId
+            records.each { Map<String, Object> record ->
+                String id = record.get(keyField)?.toString()?.trim()
+                if (id) record.put("omsStatusId", statusByOrderId.get(id) ?: "NOT_IN_OMS")
+            }
+        }
+    }
+
     Map extraction = null
     try {
         workFile.withWriter("UTF-8") { Writer writer ->
@@ -295,7 +321,8 @@ try {
                      // clock deeper in the stack would make the query depend on where it executed.
                      asOfDate   : asOfDateValue,
                      keepFields : (keepRecordFields instanceof List ? keepRecordFields : null),
-                     filterRules: (sourceFilters instanceof List ? sourceFilters : null)],
+                     filterRules: (sourceFilters instanceof List ? sourceFilters : null),
+                     pageEnricher: omsStatusEnricher],
                     served != null ? served.fetch : livePage)
         }
     } finally {
