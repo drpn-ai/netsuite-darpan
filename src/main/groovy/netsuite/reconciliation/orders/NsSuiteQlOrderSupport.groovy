@@ -502,16 +502,53 @@ class NsSuiteQlOrderSupport {
     /** The SELECT list is exactly the mapped columns — see NsSuiteQlSourceQueryField's description. */
     /** DAR-UI-050. "LINE_SUM(quantitybackordered) AS backordered": a record's lines added up, e.g. its items on backorder. */
     private static final Pattern LINE_SUM = ~/(?i)^LINE_SUM\(\s*([a-z][a-z0-9_]*)\s*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * "LINE_ITEMS(quantitybackordered) AS backordered": the record's lines that carry the quantity, each as its SKU and
+     * quantity, so a record reads [{sku, quantity}] (mapRowToRecord). LISTAGG fails past 4000 bytes; on gorjana the
+     * widest backorder list in a month (Sep 22-Oct 21, 861 orders) was 88.
+     */
+    private static final Pattern LINE_ITEMS = ~/(?i)^LINE_ITEMS\(\s*([a-z][a-z0-9_]*)\s*\)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * "DEPOSIT_WHEN(SalesOrd, F, 0) AS deposit": T or F, a customer deposit follows the record (link type OrdDep), asked
+     * only of that record type in that status at that total (Aditi: Pending Billing at 0); empty on every other record.
+     */
+    private static final Pattern DEPOSIT_WHEN = ~/^DEPOSIT_WHEN\(\s*([A-Za-z]+)\s*,\s*([A-Z])\s*,\s*([0-9]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
 
     /**
-     * The SELECT list. A LINE_SUM column becomes a sub-select over the record's item lines; outer names the record as
-     * the query does: "t" where it is aliased, "transaction" in the RECORDS query, which carries no alias.
+     * The SELECT list. A LINE_SUM or LINE_ITEMS column becomes a sub-select over the record's item lines, DEPOSIT_WHEN
+     * one over its links; outer names the record as the query does: "t" where it is aliased, "transaction" in the
+     * RECORDS query, which carries no alias.
      */
     static List<String> selectColumns(Map<String, Object> spec, String outer = "t") {
         return ((List<Map<String, Object>>) spec.get("fields")).collect { Map<String, Object> f ->
             String col = ((String) f.get("sourceColumn")).trim()
             def m = LINE_SUM.matcher(col)
-            m.matches() ? "(SELECT SUM(bl.${m.group(1)}) FROM transactionline bl WHERE bl.transaction = ${outer}.id AND bl.mainline = 'F') AS ${m.group(2)}".toString() : col
+            if (m.matches()) {
+                return "(SELECT SUM(bl.${m.group(1)}) FROM transactionline bl WHERE bl.transaction = ${outer}.id AND bl.mainline = 'F') AS ${m.group(2)}".toString()
+            }
+            m = LINE_ITEMS.matcher(col)
+            if (m.matches()) {
+                return ("(SELECT LISTAGG(bi.itemid || ':' || TO_CHAR(bl.${m.group(1)}), '|') WITHIN GROUP (ORDER BY bl.id) " +
+                        "FROM transactionline bl JOIN item bi ON bi.id = bl.item WHERE bl.transaction = ${outer}.id " +
+                        "AND bl.mainline = 'F' AND bl.${m.group(1)} <> 0) AS ${m.group(2)}").toString()
+            }
+            m = DEPOSIT_WHEN.matcher(col)
+            if (m.matches()) {
+                return ("CASE WHEN ${outer}.type = '${m.group(1)}' AND ${outer}.status = '${m.group(2)}' AND ${outer}.foreigntotal = ${m.group(3)} " +
+                        "THEN CASE WHEN EXISTS (SELECT 1 FROM nexttransactionlink dk JOIN transaction dd ON dd.id = dk.nextdoc " +
+                        "WHERE dk.previousdoc = ${outer}.id AND dd.type = 'CustDep') THEN 'T' ELSE 'F' END END AS ${m.group(4)}").toString()
+            }
+            return col
+        }
+    }
+
+    /** A LINE_ITEMS value, "SKU:qty|SKU:qty", as [{sku, quantity}]; split at the last ':' so a SKU may hold one. */
+    static List<Map<String, String>> lineItems(Object value) {
+        String listed = text(value)
+        if (!listed) return []
+        return listed.split(/\|/).collect { String entry ->
+            int at = entry.lastIndexOf(':')
+            [sku: text(at < 0 ? entry : entry.substring(0, at)), quantity: at < 0 ? null : text(entry.substring(at + 1))] as Map<String, String>
         }
     }
 
@@ -972,7 +1009,9 @@ class NsSuiteQlOrderSupport {
         if (row == null) return [:]
         Map<String, Object> record = [:]
         for (Map<String, Object> field : (List<Map<String, Object>>) spec.get("fields")) {
-            record.put((String) field.get("recordFieldName"), text(row.get(field.get("rowKey"))))
+            Object value = row.get(field.get("rowKey"))
+            record.put((String) field.get("recordFieldName"),
+                    LINE_ITEMS.matcher(((String) field.get("sourceColumn")).trim()).matches() ? lineItems(value) : text(value))
         }
         // Columns the TEMPLATE adds, as opposed to the ones an operator configured. Without this the
         // query selected `contradiction` and the record dropped it — 57 findings arrived with no

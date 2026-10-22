@@ -759,6 +759,43 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(records.contains("WHERE bl.transaction = transaction.id AND bl.mainline = 'F') AS backordered FROM transaction WHERE"), records)
     }
 
+    // DAR-UI-050 (Aditi: "a nested JSON that has the SKU and quantity"): a record lists its backordered lines.
+    @Test
+    void lineItemsListEachBackorderedLineBySkuAndQuantity() {
+        List<Map<String, Object>> fields = [[recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1],
+                                            [recordFieldName: "itemsBackordered", sourceColumn: "LINE_ITEMS(quantitybackordered) AS backordered", sequenceNum: 2]]
+        Map<String, Object> linkedSpec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"], fields)
+        String linked = NsSuiteQlOrderSupport.buildRecordsQuery(linkedSpec, "2026-08-01", "2026-09-01")
+        assertTrue(linked.startsWith("SELECT id, (SELECT LISTAGG(bi.itemid || ':' || TO_CHAR(bl.quantitybackordered), '|') " +
+                "WITHIN GROUP (ORDER BY bl.id) FROM transactionline bl JOIN item bi ON bi.id = bl.item WHERE bl.transaction = t.id " +
+                "AND bl.mainline = 'F' AND bl.quantitybackordered <> 0) AS backordered FROM transaction t "), linked)
+        String records = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate"], fields), "2026-08-01", "2026-09-01")
+        assertTrue(records.contains("WHERE bl.transaction = transaction.id AND bl.mainline = 'F' AND bl.quantitybackordered <> 0) AS backordered"), records)
+
+        assertEquals([[sku: "221-102-171-G", quantity: "1"], [sku: "235-109-G", quantity: "2"]],
+                NsSuiteQlOrderSupport.mapRowToRecord(linkedSpec, [id: "1", backordered: "221-102-171-G:1|235-109-G:2"]).itemsBackordered)
+        assertEquals([], NsSuiteQlOrderSupport.mapRowToRecord(linkedSpec, [id: "2", backordered: null]).itemsBackordered)
+        assertEquals([[sku: "KIT:A", quantity: "3"]], NsSuiteQlOrderSupport.lineItems("KIT:A:3"))
+    }
+
+    // DAR-UI-050 (Aditi: Pending Billing at a total of 0, "check if the customer deposit exists... T/F").
+    @Test
+    void depositWhenAsksForADepositOnlyOfTheNamedStatusAndTotal() {
+        List<Map<String, Object>> fields = [[recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1],
+                                            [recordFieldName: "customerDeposit", sourceColumn: "DEPOSIT_WHEN(SalesOrd, F, 0) AS deposit", sequenceNum: 2]]
+        String linked = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "CustInvc"], fields), "2026-08-01", "2026-09-01")
+        assertTrue(linked.startsWith("SELECT id, CASE WHEN t.type = 'SalesOrd' AND t.status = 'F' AND t.foreigntotal = 0 THEN CASE WHEN EXISTS " +
+                "(SELECT 1 FROM nexttransactionlink dk JOIN transaction dd ON dd.id = dk.nextdoc WHERE dk.previousdoc = t.id " +
+                "AND dd.type = 'CustDep') THEN 'T' ELSE 'F' END END AS deposit FROM transaction t "), linked)
+        String records = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate"], fields), "2026-08-01", "2026-09-01")
+        assertTrue(records.contains("CASE WHEN transaction.type = 'SalesOrd' AND transaction.status = 'F'"), records)
+        assertTrue(records.contains("WHERE dk.previousdoc = transaction.id AND dd.type = 'CustDep')"), records)
+    }
+
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
     // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
     @Test

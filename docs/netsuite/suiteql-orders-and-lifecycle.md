@@ -128,7 +128,7 @@ Instead a row picks a vetted template and names its parts:
 | `joinKeyFieldName`, `originFieldName` | The record field that joins to the other side; an optional field marking each record `HOTWAX` or `NETSUITE_NATIVE`. |
 | `lineKeyColumn` | For `SALES_LINES`, the line key column. |
 | `waiveRules`, `matchRules`, `stageReach` | JSON written by the lifecycle builder: stage exceptions, written findings, and stages reached by a shared field instead of the link table. |
-| `NsSuiteQlSourceQueryField` rows | The SELECT list: `recordFieldName` ← `sourceColumn` (a column or a single function call, optionally aliased), in `sequenceNum` order. `LINE_SUM(col) AS name` sums a column over the record's item lines. |
+| `NsSuiteQlSourceQueryField` rows | The SELECT list: `recordFieldName` ← `sourceColumn` (a column or a single function call, optionally aliased), in `sequenceNum` order. `LINE_SUM(col) AS name` sums a column over the record's item lines. `LINE_ITEMS(col) AS name` lists the lines where the column is not 0 as `[{sku, quantity}]` (LISTAGG of `item.itemid`; a lifecycle's `itemsBackordered`). `DEPOSIT_WHEN(type, status, total) AS name` is `T`/`F` (a customer deposit follows the record, link type `OrdDep`) on records of that type, status code and total, and empty on the rest (a lifecycle's `customerDeposit`: `SalesOrd`, `F` Pending Billing, `0`). |
 
 Templates (`NsSuiteQlOrderSupport.QUERY_TEMPLATES`):
 
