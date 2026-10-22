@@ -812,6 +812,21 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(records.contains("WHERE dk.previousdoc = transaction.id AND dd.type = 'CustDep')"), records)
     }
 
+    // DAR-BE-094 R7: a Happiness Guarantee credit memo posts to account 42065.
+    @Test
+    void accountUsedAsksWhetherAnyLineOfTheRecordPostsToTheAccount() {
+        List<Map<String, Object>> fields = [[recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 1],
+                                            [recordFieldName: "onHgAccount", sourceColumn: "ACCOUNT_USED(42065) AS on_hg_account", sequenceNum: 2]]
+        String records = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "CustCred",
+                fromTable: "transaction", dateColumn: "trandate"], fields), "2026-10-01", "2026-10-23")
+        assertTrue(records.startsWith("SELECT tranid, CASE WHEN EXISTS (SELECT 1 FROM transactionaccountingline au JOIN account aa ON aa.id = au.account " +
+                "WHERE au.transaction = transaction.id AND aa.acctnumber = '42065') THEN 'T' ELSE 'F' END AS on_hg_account FROM transaction "), records)
+        assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "CustCred", fromTable: "transaction", dateColumn: "trandate"],
+                    [[recordFieldName: "x", sourceColumn: "ACCOUNT_USED(42065 OR 1=1) AS x", sequenceNum: 1]])
+        }
+    }
+
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
     // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
     @Test

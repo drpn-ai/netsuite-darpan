@@ -513,6 +513,12 @@ class NsSuiteQlOrderSupport {
      * only of that record type in that status at that total (Aditi: Pending Billing at 0); empty on every other record.
      */
     private static final Pattern DEPOSIT_WHEN = ~/^DEPOSIT_WHEN\(\s*([A-Za-z]+)\s*,\s*([A-Z])\s*,\s*([0-9]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * DAR-BE-094 R7. "ACCOUNT_USED(42065) AS on_hg_account": T or F, any accounting line of the record posts to the account
+     * with that number (gorjana's 42065 Happiness Guarantee). Keyed by the record's own id, so it is cheap: one month of
+     * credit memos reads at ~1.4 s a page (2026-10-22), where a lookup by a custom field times out.
+     */
+    private static final Pattern ACCOUNT_USED = ~/^ACCOUNT_USED\(\s*([0-9]{3,10})\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
 
     /**
      * The SELECT list. A LINE_SUM or LINE_ITEMS column becomes a sub-select over the record's item lines, DEPOSIT_WHEN
@@ -531,6 +537,11 @@ class NsSuiteQlOrderSupport {
                 return ("(SELECT LISTAGG(bi.itemid || ':' || TO_CHAR(bl.${m.group(1)}), '|') WITHIN GROUP (ORDER BY bl.id) " +
                         "FROM transactionline bl JOIN item bi ON bi.id = bl.item WHERE bl.transaction = ${outer}.id " +
                         "AND bl.mainline = 'F' AND bl.${m.group(1)} <> 0) AS ${m.group(2)}").toString()
+            }
+            m = ACCOUNT_USED.matcher(col)
+            if (m.matches()) {
+                return ("CASE WHEN EXISTS (SELECT 1 FROM transactionaccountingline au JOIN account aa ON aa.id = au.account " +
+                        "WHERE au.transaction = ${outer}.id AND aa.acctnumber = '${m.group(1)}') THEN 'T' ELSE 'F' END AS ${m.group(2)}").toString()
             }
             m = DEPOSIT_WHEN.matcher(col)
             if (m.matches()) {
