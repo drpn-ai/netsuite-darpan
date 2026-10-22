@@ -898,7 +898,7 @@ class NsSuiteQlOrderSupport {
                 if (via) {
                     ors << ("EXISTS (SELECT 1 FROM transaction v${own} JOIN transaction c${own} ON c${own}.${alt.get('stageField')} = TO_CHAR(v${own}.id) " +
                             "WHERE v${own}.type = '${via.get('recordType')}' AND v${own}.${via.get('stageField')} = t.${via.get('startField')} " +
-                            "AND c${own}.type = '${type}')").toString()
+                            "AND c${own}.type = '${type}'${stageDone("c${own}", type)})").toString()
                 } else {
                     Map<String, Object> ownSpec = alt.get("startField") ? [stageReach: (Object) [(type): [startField: alt.get("startField"), stageField: alt.get("stageField")]]] as Map<String, Object> : null
                     ors << linkedChildPredicate(present, type, own, ownSpec)
@@ -909,11 +909,23 @@ class NsSuiteQlOrderSupport {
         // DAR-BE-073. A stage reached by a shared field: a record of the child type carrying the start record's value.
         if (reach) {
             return "EXISTS (SELECT 1 FROM transaction ${child} WHERE ${child}.type = '${childRecordType}' " +
-                    "AND ${child}.${reach.stageField} = t.${reach.startField})"
+                    "AND ${child}.${reach.stageField} = t.${reach.startField}${stageDone(child, childRecordType)})"
         }
         return "EXISTS (SELECT 1 FROM ${LINK_TABLE} ${link} " +
                 "JOIN transaction ${child} ON ${child}.id = ${link}.nextdoc " +
-                "WHERE ${link}.previousdoc = t.id AND ${child}.type = '${childRecordType}')"
+                "WHERE ${link}.previousdoc = t.id AND ${child}.type = '${childRecordType}'${stageDone(child, childRecordType)})"
+    }
+
+    /**
+     * DAR-UI-050 bug. The status a child must carry to count as reaching its stage, where existing is not enough. A
+     * fulfillment is made at the pick, so a Picked (A) or Packed (B) one sits on a Pending Fulfillment order (gorjana
+     * Oct 12-21: all 17, linktype PickPack; a RAILS one read "Shipped, never billed"). Only Shipped (C) has shipped.
+     */
+    private static final Map<String, String> STAGE_DONE_STATUS = [ItemShip: "C"].asImmutable()
+
+    private static String stageDone(String child, String childRecordType) {
+        String status = STAGE_DONE_STATUS.get(childRecordType)
+        return status ? " AND ${child}.status = '${status}'" : ""
     }
 
     /**
