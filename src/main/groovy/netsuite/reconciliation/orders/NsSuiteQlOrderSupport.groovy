@@ -1098,8 +1098,10 @@ class NsSuiteQlOrderSupport {
             shipmethod      : "BUILTIN.DF(t.shipmethod)",
             itemsbackordered: "(SELECT SUM(mb.quantitybackordered) FROM transactionline mb WHERE mb.transaction = t.id AND mb.mainline = 'F')",
             total           : "t.foreigntotal",
+            otherrefnum     : "t.otherrefnum",
     ].asImmutable()
-    static final List<String> MATCH_OPS = ["IN", "GT", "NOT_EMPTY"].asImmutable()
+    /** STARTS_WITH (DAR-BE-095): a reference that begins with a value, e.g. otherrefnum WTY- (a warranty replacement). */
+    static final List<String> MATCH_OPS = ["IN", "GT", "NOT_EMPTY", "STARTS_WITH"].asImmutable()
 
     static String matchColumn(String fieldId) {
         if (MATCH_COLUMNS.containsKey(fieldId)) return MATCH_COLUMNS[fieldId]
@@ -1115,6 +1117,7 @@ class NsSuiteQlOrderSupport {
             List<String> values = (List<String>) r.get("values")
             if (r.get("op") == "GT") return "${column} > ${values[0]}".toString()
             if (r.get("op") == "NOT_EMPTY") return "${column} IS NOT NULL".toString()
+            if (r.get("op") == "STARTS_WITH") return "(${values.collect { "${column} LIKE '${it}%'" }.join(' OR ')})".toString()
             List<String> named = values.findAll { it != "NO_VALUE" }
             List<String> parts = []
             if (named) parts << "${column} IN (${named.collect { "'${it}'" }.join(', ')})".toString()
@@ -1144,6 +1147,10 @@ class NsSuiteQlOrderSupport {
                 return [fieldId: (Object) fieldId, op: (Object) op, values: (Object) []] as Map<String, Object>
             }
             if (!values) throw new IllegalArgumentException("matchRules field ${fieldId} needs a value")
+            // LIKE's own wildcards (% and _) are refused, so a prefix means exactly its letters.
+            if (op == "STARTS_WITH" && values.any { !(it ==~ /[A-Za-z0-9#\-]{1,40}/) }) {
+                throw new IllegalArgumentException("matchRules 'starts with' takes letters, digits, # and -, got: ${values}")
+            }
             if (op == "GT" && !(values.size() == 1 && values[0] ==~ /-?\d+(\.\d+)?/)) {
                 throw new IllegalArgumentException("matchRules 'more than' needs one number, got: ${values}")
             }

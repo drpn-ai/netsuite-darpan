@@ -1,5 +1,7 @@
 package netsuite.reconciliation.orders
 
+import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
+
 import org.junit.jupiter.api.Test
 
 import static org.junit.jupiter.api.Assertions.assertEquals
@@ -847,6 +849,18 @@ class NsSuiteQlQueryTemplateTest {
         }
     }
 
+    // DAR-BE-095 R12: a warranty replacement's invoice is the one whose reference starts WTY-; the filter belongs in SuiteQL
+    // (reading every invoice to drop 95% of them ran a 512 MB JVM out of heap in the conclusion step).
+    @Test
+    void startsWithMatchesAPrefixAndRefusesLikeWildcards() {
+        String sql = query([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["WTY-"]]]])
+        assertTrue(sql.contains("AND ((t.otherrefnum LIKE 'WTY-%')) ORDER BY t.id"), sql)
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["W%"]]]]) }
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["W_Y"]]]]) }
+    }
+
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
     // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
     @Test
@@ -1044,8 +1058,8 @@ class NsSuiteQlQueryTemplateTest {
                 })
         Map c = (Map) result.excludedCollector
         assertEquals(1, c.total)
-        assertEquals("1", ((Map) ((List) c.records)[0]).quantityBackordered, "the whole record, not the keepFields projection")
-        assertEquals("1:quantityShipped", ((Map) ((List) c.records)[0])._excludedBy)
+        assertEquals("1", ((Map) ExcludedRecordsSidecar.records(c)[0]).quantityBackordered, "the whole record, not the keepFields projection")
+        assertEquals("1:quantityShipped", ((Map) ExcludedRecordsSidecar.records(c)[0])._excludedBy)
     }
 
     @Test
