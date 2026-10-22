@@ -1007,7 +1007,7 @@ class NsSuiteQlOrderSupport {
             itemsbackordered: "(SELECT SUM(mb.quantitybackordered) FROM transactionline mb WHERE mb.transaction = t.id AND mb.mainline = 'F')",
             total           : "t.foreigntotal",
     ].asImmutable()
-    static final List<String> MATCH_OPS = ["IN", "GT"].asImmutable()
+    static final List<String> MATCH_OPS = ["IN", "GT", "NOT_EMPTY"].asImmutable()
 
     static String matchColumn(String fieldId) {
         if (MATCH_COLUMNS.containsKey(fieldId)) return MATCH_COLUMNS[fieldId]
@@ -1015,13 +1015,14 @@ class NsSuiteQlOrderSupport {
         throw new IllegalArgumentException("'${fieldId}' is not a field a finding can ask about")
     }
 
-    /** Every condition holds: IN names values (NO_VALUE = empty), GT a number the field is more than. */
+    /** Every condition holds: IN names values (NO_VALUE = empty), GT a number the field is more than, NOT_EMPTY any value. */
     private static String matchPredicate(Map<String, Object> spec) {
         List<Map<String, Object>> rules = (List<Map<String, Object>>) spec.get("matchRules")
         return "(" + rules.collect { Map<String, Object> r ->
             String column = matchColumn((String) r.get("fieldId"))
             List<String> values = (List<String>) r.get("values")
             if (r.get("op") == "GT") return "${column} > ${values[0]}".toString()
+            if (r.get("op") == "NOT_EMPTY") return "${column} IS NOT NULL".toString()
             List<String> named = values.findAll { it != "NO_VALUE" }
             List<String> parts = []
             if (named) parts << "${column} IN (${named.collect { "'${it}'" }.join(', ')})".toString()
@@ -1044,6 +1045,12 @@ class NsSuiteQlOrderSupport {
             String op = (text(m.get("op")) ?: "IN").toUpperCase()
             if (!MATCH_OPS.contains(op)) throw new IllegalArgumentException("matchRules op must be one of ${MATCH_OPS}, got: ${op}")
             List<String> values = ((m.get("values") ?: []) as List).collect { text(it) }.findAll { it } as List<String>
+            // DAR-BE-095: NOT_EMPTY is "has a value" without reading it as a number (GT 0 on a text field makes SuiteQL
+            // convert every scanned row and refuse the search when one is not a number). It takes no values.
+            if (op == "NOT_EMPTY") {
+                if (values) throw new IllegalArgumentException("matchRules 'has a value' takes no values, got: ${values}")
+                return [fieldId: (Object) fieldId, op: (Object) op, values: (Object) []] as Map<String, Object>
+            }
             if (!values) throw new IllegalArgumentException("matchRules field ${fieldId} needs a value")
             if (op == "GT" && !(values.size() == 1 && values[0] ==~ /-?\d+(\.\d+)?/)) {
                 throw new IllegalArgumentException("matchRules 'more than' needs one number, got: ${values}")

@@ -759,6 +759,16 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(records.contains("WHERE bl.transaction = transaction.id AND bl.mainline = 'F') AS backordered FROM transaction WHERE"), records)
     }
 
+    // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
+    // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
+    @Test
+    void notEmptyMatchesARecordWithAnyValueAndTakesNoValues() {
+        String sql = query([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "custbody_hc_exchange_credit_memo_id", op: "NOT_EMPTY"]]])
+        assertTrue(sql.contains("AND (t.custbody_hc_exchange_credit_memo_id IS NOT NULL) ORDER BY t.id"), sql)
+        assertThrows(IllegalArgumentException) { spec([queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "custbody_hc_exchange_credit_memo_id", op: "NOT_EMPTY", values: ["x"]]]]) }
+    }
+
     // DAR-UI-050: a finding a person writes: records whose fields match, every condition holding.
     @Test
     void aWrittenFindingIsTheRecordsWhoseFieldsMatch() {
