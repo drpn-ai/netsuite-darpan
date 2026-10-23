@@ -183,6 +183,23 @@ class NsSuiteQlQueryFacadeSupportTests {
         assertFalse(rowExists(), "a preview stores nothing")
     }
 
+    /** A turned-off NetSuite account is not queried from the preview, as from every other NetSuite read. */
+    @Test
+    void previewRefusesATurnedOffAccount() {
+        def auth = ec.entity.find("darpan.reconciliation.NsAuthConfig").condition("nsAuthConfigId", AUTH_ID)
+                .disableAuthz().useCache(false).one()
+        // The tenant's own account, so the refusal is "turned off" and not "not found".
+        auth.set("companyUserGroupId", "KREWE"); auth.set("isActive", "N"); auth.update()
+        try {
+            Map<String, Object> preview = NsSuiteQlQueryFacadeSupport.previewQuery(ec, ctx([:]))
+
+            assertNull(preview)
+            assertTrue(ec.message.errorsString.contains("is turned off"), ec.message.errorsString)
+        } finally {
+            auth.set("companyUserGroupId", null); auth.set("isActive", "Y"); auth.update()
+        }
+    }
+
     @Test
     void optionsOfferTheMatchFieldsAndOperatorsTheExtractorAccepts() {
         Map<String, Object> options = NsSuiteQlQueryFacadeSupport.queryOptions(ec)

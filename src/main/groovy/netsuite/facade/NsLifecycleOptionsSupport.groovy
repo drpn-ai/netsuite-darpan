@@ -290,7 +290,8 @@ class NsLifecycleOptionsSupport {
         }
     }
 
-    private static def accessibleAccount(def ec, String authId) {
+    /** The account when the active tenant may read through it (its own or shared, and not turned off); null with the error otherwise. */
+    static def accessibleAccount(def ec, String authId) {
         def auth = authId ? SharedConfigAccessSupport.listAccessibleConfigRows(ec, SharedConfigAccessSupport.CONFIG_TYPE_NS_AUTH)
                 .find { it.get("nsAuthConfigId") == authId } : null
         if (auth == null) { ec.message.addError("NetSuite account '${authId}' was not found."); return null }

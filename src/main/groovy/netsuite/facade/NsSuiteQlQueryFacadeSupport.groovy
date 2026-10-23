@@ -218,12 +218,9 @@ class NsSuiteQlQueryFacadeSupport {
         }
         String sql = NsSuiteQlOrderSupport.buildRecordsQuery(spec, day.toString(), day.plusDays(1).toString(), day.toString())
         String authId = text(context.get("nsAuthConfigId"))
-        def auth = authId ? SharedConfigAccessSupport.listAccessibleConfigRows(ec, SharedConfigAccessSupport.CONFIG_TYPE_NS_AUTH)
-                .find { it.get("nsAuthConfigId") == authId } : null
-        if (auth == null) {
-            ec.message.addError("NetSuite account '${authId}' was not found.")
-            return null
-        }
+        // The tenant's own or a shared account, and not turned off: the same gate as every NetSuite read.
+        def auth = NsLifecycleOptionsSupport.accessibleAccount(ec, authId)
+        if (auth == null) return null
         List<Map> rows
         try {
             rows = new NsSuiteQlClient(auth).query(sql, true)
