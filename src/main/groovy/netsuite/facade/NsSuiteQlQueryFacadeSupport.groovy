@@ -1,7 +1,12 @@
 package netsuite.facade
 
+import darpan.facade.common.SharedConfigAccessSupport
+import groovy.json.JsonOutput
 import groovy.transform.CompileDynamic
 import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
+
+import java.time.LocalDate
+import java.time.ZoneId
 
 /**
  * DAR-BE-058: the SPA's read and write path for NetSuite SuiteQL check definitions.
@@ -37,7 +42,19 @@ class NsSuiteQlQueryFacadeSupport {
             "pendingStates", "statesExpectingShipment", "statesExpectingInvoice",
             "disallowedStates", "overdueExcludedShipMethods", "requireParentRecordType",
             "amountColumn", "minAmount", "joinKeyFieldName", "originFieldName", "lineKeyColumn",
+            // DAR-UI-064: a RECORDS_MATCHING query's conditions, JSON [{fieldId, op, values}]. The entity has carried
+            // it since DAR-UI-050; without it here a query written in the app could not say which records it reads.
+            "matchRules",
     ]
+
+    /** DAR-UI-064: what the query editor offers. normalizeSpec still decides; these are the editor's choices. */
+    static final List<String> EDITOR_TEMPLATES = [NsSuiteQlOrderSupport.TEMPLATE_RECORDS,
+                                                  NsSuiteQlOrderSupport.TEMPLATE_RECORDS_MATCHING].asImmutable()
+    static final List<String> EDITOR_DATE_COLUMNS = ["trandate", "lastmodifieddate", "createddate"].asImmutable()
+    /** The common transaction types; any other identifier is still accepted and validated by normalizeSpec. */
+    static final List<String> EDITOR_RECORD_TYPES = ["SalesOrd", "CustInvc", "CashSale", "CustCred", "CashRfnd",
+                                                     "CustRfnd", "CustDep", "RtnAuth", "ItemShip", "ItemRcpt"].asImmutable()
+    static final int PREVIEW_ROWS = 5
 
     /**
      * Tenant-scoped, through the shared finder. A bare {@code disableAuthz()} read here would list
@@ -102,22 +119,9 @@ class NsSuiteQlQueryFacadeSupport {
     static Map<String, Object> saveQuery(def ec, Map<String, Object> context) {
         String queryId = text(context.get("nsSuiteQlSourceQueryId"))
         List<Map<String, Object>> fields = normalizeSubmittedFields(context.get("fields"))
-        if (fields.isEmpty()) {
-            ec.message.addError("Add at least one column: a check with no projection selects nothing.")
-            return null
-        }
-
-        Map<String, Object> spec = [nsSuiteQlSourceQueryId: queryId] as Map<String, Object>
-        SPEC_FIELDS.each { String f -> spec.put(f, specValue(context.get(f))) }
-
         // THE GATE. Anything the extractor would refuse is refused here, in the operator's words
         // rather than as a 500 halfway through a run against a client's account.
-        try {
-            NsSuiteQlOrderSupport.normalizeSpec(spec, fields)
-        } catch (IllegalArgumentException e) {
-            ec.message.addError(e.message)
-            return null
-        }
+        if (validatedSpec(ec, queryId, context, fields) == null) return null
 
         if (!darpan.facade.common.TenantAccessSupport.requireActiveTenantWriteAccess(
                 ec, "Your active tenant only has view access for NetSuite checks.")) {
@@ -158,6 +162,78 @@ class NsSuiteQlQueryFacadeSupport {
         }
 
         return getQuery(ec, queryId)
+    }
+
+    /** The submitted values as the extractor's spec, through normalizeSpec; null (with the reason on ec.message) if refused. */
+    private static Map<String, Object> validatedSpec(def ec, String queryId, Map<String, Object> context,
+                                                     List<Map<String, Object>> fields) {
+        if (fields.isEmpty()) {
+            ec.message.addError("Add at least one column: a check with no projection selects nothing.")
+            return null
+        }
+        Map<String, Object> spec = [nsSuiteQlSourceQueryId: queryId] as Map<String, Object>
+        SPEC_FIELDS.each { String f -> spec.put(f, specValue(context.get(f))) }
+        try {
+            return NsSuiteQlOrderSupport.normalizeSpec(spec, fields)
+        } catch (IllegalArgumentException e) {
+            ec.message.addError(e.message)
+            return null
+        }
+    }
+
+    /**
+     * DAR-UI-064. The editor's choices: templates, date columns, common record types, the fields a match rule may ask
+     * about (any custbody_ field besides), its operators, and the NetSuite accounts this tenant may read.
+     */
+    static Map<String, Object> queryOptions(def ec) {
+        List<Map<String, Object>> accounts = SharedConfigAccessSupport.listAccessibleConfigRows(ec, SharedConfigAccessSupport.CONFIG_TYPE_NS_AUTH)
+                .findAll { (it.get("isActive") ?: "Y").toString() != "N" }
+                .collect { [nsAuthConfigId: it.get("nsAuthConfigId"), description: it.get("description")] as Map<String, Object> }
+                .sort { it.nsAuthConfigId as String }
+        return [templates   : EDITOR_TEMPLATES, dateColumns: EDITOR_DATE_COLUMNS, recordTypes: EDITOR_RECORD_TYPES,
+                matchFields : NsSuiteQlOrderSupport.MATCH_COLUMNS.keySet().toList(), matchOps: NsSuiteQlOrderSupport.MATCH_OPS,
+                customFieldPattern: "custbody_...", accounts: accounts] as Map<String, Object>
+    }
+
+    /**
+     * DAR-UI-064. Runs the submitted (not yet saved) query for one day and answers its first rows as records, plus the
+     * SuiteQL it sent, so a typo shows before a run exists: a mistyped status does not fail, it reads a different
+     * population forever (DAR-BE-058). Read-only, one page, against an account this tenant may read; nothing is stored.
+     */
+    static Map<String, Object> previewQuery(def ec, Map<String, Object> context) {
+        List<Map<String, Object>> fields = normalizeSubmittedFields(context.get("fields"))
+        Map<String, Object> spec = validatedSpec(ec, text(context.get("nsSuiteQlSourceQueryId")) ?: "PREVIEW", context, fields)
+        if (spec == null) return null
+        if (!darpan.facade.common.TenantAccessSupport.requireActiveTenantRunAccess(
+                ec, "Your active tenant only has view access, so it cannot read NetSuite.")) {
+            return null
+        }
+        LocalDate day
+        try {
+            day = text(context.get("day")) ? LocalDate.parse(text(context.get("day"))) : LocalDate.now(ZoneId.of(
+                    darpan.facade.common.TenantAccessSupport.resolveActiveTenantTimeZone(ec) as String)).minusDays(1)
+        } catch (Exception ignored) {
+            ec.message.addError("The preview day must read YYYY-MM-DD.")
+            return null
+        }
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(spec, day.toString(), day.plusDays(1).toString(), day.toString())
+        String authId = text(context.get("nsAuthConfigId"))
+        def auth = authId ? SharedConfigAccessSupport.listAccessibleConfigRows(ec, SharedConfigAccessSupport.CONFIG_TYPE_NS_AUTH)
+                .find { it.get("nsAuthConfigId") == authId } : null
+        if (auth == null) {
+            ec.message.addError("NetSuite account '${authId}' was not found.")
+            return null
+        }
+        List<Map> rows
+        try {
+            rows = new NsSuiteQlClient(auth).query(sql, true)
+        } catch (Exception e) {
+            ec.message.addError("NetSuite refused the query: ${e.message}")
+            return [day: day.toString(), sql: sql, records: [], more: false] as Map<String, Object>
+        }
+        return [day    : day.toString(), sql: sql,
+                records: rows.take(PREVIEW_ROWS).collect { NsSuiteQlOrderSupport.mapRowToRecord(spec, (Map<String, Object>) it) },
+                more   : rows.size() > PREVIEW_ROWS] as Map<String, Object>
     }
 
     /**
@@ -209,12 +285,14 @@ class NsSuiteQlQueryFacadeSupport {
         if (field == "requireFulfillableOpenLine" || field == "requireOverdueShipDate") {
             return asBool(value, false) ? "Y" : "N"
         }
+        if (value instanceof Collection || value instanceof Map) return JsonOutput.toJson(value)
         return text(value)
     }
 
     /** normalizeSpec reads the same Y/N strings the entity stores, not Booleans. */
     private static Object specValue(Object value) {
         if (value instanceof Boolean) return ((Boolean) value) ? "Y" : "N"
+        if (value instanceof Collection || value instanceof Map) return JsonOutput.toJson(value)
         return text(value)
     }
 

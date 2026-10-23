@@ -108,6 +108,8 @@
             <parameter name="joinKeyFieldName"/>
             <parameter name="originFieldName"/>
             <parameter name="lineKeyColumn"/>
+            <parameter name="matchRules" type="Object"><description>DAR-UI-064. RECORDS_MATCHING conditions: a list (or its
+                JSON) of {fieldId, op IN/GT/NOT_EMPTY/STARTS_WITH, values}. Validated by normalizeSpec like every other field.</description></parameter>
             <parameter name="isActive" type="Boolean" default-value="true"/>
             <parameter name="fields" type="List" required="true">
                 <parameter name="field" type="Map">
@@ -131,4 +133,51 @@
         </actions>
     </service>
 
+    <service verb="get" noun="NsSuiteQlQueryOptions" allow-remote="true" authenticate="true">
+        <description>DAR-UI-064. What the SuiteQL query editor offers: templates, date columns, common record types, the
+            fields and operators a match rule may use, and the NetSuite accounts the active tenant may read.</description>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="options" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="options" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.queryOptions(ec)"/>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
+
+    <service verb="preview" noun="NsSuiteQlSourceQuery" allow-remote="true" authenticate="true">
+        <description>DAR-UI-064. Runs a query as submitted (nothing is saved) against NetSuite for one day and answers its
+            first rows as records with the SuiteQL sent. Read-only, one page. Same validation as save.</description>
+        <in-parameters>
+            <parameter name="nsSuiteQlSourceQueryId"/>
+            <parameter name="nsAuthConfigId" required="true"/>
+            <parameter name="day"><description>YYYY-MM-DD; default yesterday in the tenant's zone.</description></parameter>
+            <parameter name="recordType" required="true"/>
+            <parameter name="fromTable" default-value="transaction"/>
+            <parameter name="dateColumn" default-value="trandate"/>
+            <parameter name="queryTemplate" default-value="RECORDS"/>
+            <parameter name="joinKeyFieldName"/>
+            <parameter name="originFieldName"/>
+            <parameter name="matchRules" type="Object"/>
+            <parameter name="fields" type="List" required="true">
+                <parameter name="field" type="Map">
+                    <parameter name="recordFieldName"/>
+                    <parameter name="sourceColumn"/>
+                </parameter>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="preview" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="preview" from="netsuite.facade.NsSuiteQlQueryFacadeSupport.previewQuery(ec, context)"/>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
 </services>

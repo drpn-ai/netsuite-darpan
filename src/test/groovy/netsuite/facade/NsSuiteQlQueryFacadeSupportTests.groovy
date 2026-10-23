@@ -142,6 +142,56 @@ class NsSuiteQlQueryFacadeSupportTests {
         assertFalse(rowExists())
     }
 
+    /** DAR-UI-064: a query written in the app says which records it reads; the conditions round-trip as stored JSON. */
+    @Test
+    void savesMatchRulesAndReadsThemBack() {
+        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["WTY-"]]]]))
+
+        assertFalse(ec.message.hasError(), ec.message.errorsString)
+        assertEquals('[{"fieldId":"otherrefnum","op":"STARTS_WITH","values":["WTY-"]}]', saved.get("matchRules"))
+        Map<String, Object> again = NsSuiteQlQueryFacadeSupport.getQuery(ec, QUERY_ID)
+        assertEquals(saved.get("matchRules"), again.get("matchRules"))
+    }
+
+    /** A LIKE wildcard in a prefix would widen the population silently, so it never reaches the database. */
+    @Test
+    void refusesAMatchRuleThatWouldWidenThePopulation() {
+        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "RECORDS_MATCHING",
+                matchRules: '[{"fieldId":"otherrefnum","op":"STARTS_WITH","values":["%"]}]']))
+
+        assertTrue(ec.message.hasError())
+        assertFalse(rowExists())
+    }
+
+    @Test
+    void refusesAMatchRuleOnAFieldNoQueryMayAskAbout() {
+        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "entity) OR (1", op: "NOT_EMPTY"]]]))
+
+        assertTrue(ec.message.hasError())
+        assertFalse(rowExists())
+    }
+
+    /** The preview refuses exactly what save refuses, before any NetSuite call. */
+    @Test
+    void previewRefusesWhatSaveRefusesWithoutCallingNetSuite() {
+        Map<String, Object> preview = NsSuiteQlQueryFacadeSupport.previewQuery(ec, ctx([recordType: "ItemShip' OR '1'='1"]))
+
+        assertNull(preview)
+        assertTrue(ec.message.hasError())
+        assertFalse(rowExists(), "a preview stores nothing")
+    }
+
+    @Test
+    void optionsOfferTheMatchFieldsAndOperatorsTheExtractorAccepts() {
+        Map<String, Object> options = NsSuiteQlQueryFacadeSupport.queryOptions(ec)
+
+        assertEquals(NsSuiteQlOrderSupport.MATCH_OPS, options.get("matchOps"))
+        assertTrue(((List) options.get("matchFields")).contains("status"))
+        assertTrue(((List) options.get("templates")).contains("RECORDS_MATCHING"))
+    }
+
     /**
      * The whole point of the service. A row the form accepted must produce a runnable query —
      * otherwise the failure surfaces mid-run against a client's NetSuite account.
