@@ -607,6 +607,11 @@ class NsSuiteQlOrderSupport {
      * page-skew this prevents.
      */
     static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate, String asOfDate = null) {
+        List<String> lookupIds = (List<String>) spec.get("lookupIds")
+        if (lookupIds) {
+            return "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} t WHERE t.type = '${spec.get('recordType')}' " +
+                    "AND t.id IN (${lookupIds.join(', ')}) AND ${matchPredicate(spec)} ORDER BY t.id"
+        }
         requireIsoDate(fromDate, "fromDate")
         requireIsoDate(toDate, "toDate")
         String dateColumn = (String) spec.get("dateColumn")
@@ -1124,6 +1129,23 @@ class NsSuiteQlOrderSupport {
             if (values.contains("NO_VALUE")) parts << "${column} IS NULL".toString()
             return parts.size() == 1 ? parts[0] : "(${parts.join(' OR ')})".toString()
         }.join(" AND ") + ")"
+    }
+
+    /** DAR-BE-118: most internal ids one lookup asks for; SuiteQL refuses a longer IN list. */
+    static final int MAX_LOOKUP_IDS = 1000
+
+    /**
+     * DAR-BE-118. The internal ids a conclusion lookup names: digits only (they reach SuiteQL by interpolation), at most
+     * MAX_LOOKUP_IDS, and only on RECORDS_MATCHING, the one template whose population is "records matching these conditions".
+     */
+    static List<String> lookupIdList(Object raw, Map<String, Object> spec) {
+        if (spec.get("queryTemplate") != TEMPLATE_RECORDS_MATCHING) {
+            throw new IllegalArgumentException("A lookup by id needs queryTemplate ${TEMPLATE_RECORDS_MATCHING}, got: ${spec.get('queryTemplate')}")
+        }
+        List<String> ids = ((raw ?: []) as List).collect { text(it) }.findAll { it }.unique() as List<String>
+        if (ids.size() > MAX_LOOKUP_IDS) throw new IllegalArgumentException("A lookup asks for at most ${MAX_LOOKUP_IDS} ids, got ${ids.size()}")
+        ids.each { if (!(it ==~ /\d{1,20}/)) throw new IllegalArgumentException("A lookup id is a NetSuite internal id (digits), got: ${it}") }
+        return ids
     }
 
     /** A written finding's conditions, stored as JSON [{fieldId, op, values}]; fields and values reach SuiteQL. */

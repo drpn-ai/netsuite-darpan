@@ -861,6 +861,23 @@ class NsSuiteQlQueryTemplateTest {
                 matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["W_Y"]]]]) }
     }
 
+    /**
+     * DAR-BE-118: a conclusion lookup asks for the records it names, by internal id and with no date window (an April order
+     * behind an October return is still its order), and keeps the row's own conditions: only the matches come back.
+     */
+    @Test
+    void aLookupAsksForTheNamedRecordsOnlyAndKeepsTheRowsConditions() {
+        Map<String, Object> s = spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "itemsbackordered", op: "GT", values: ["0"]]]])
+        s.lookupIds = NsSuiteQlOrderSupport.lookupIdList(["80970426", "76168721"], s)
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(s, null, null)
+        assertTrue(sql.contains("WHERE t.type = 'SalesOrd' AND t.id IN (80970426, 76168721) AND ((SELECT SUM(mb.quantitybackordered)"), sql)
+        assertFalse(sql.contains("TO_DATE"), "no window: the ids bound the read")
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.lookupIdList(["80970426", "1 OR 1=1"], s) }
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.lookupIdList((1..1001).collect { "${it}" }, s) }
+        assertThrows(IllegalArgumentException, { NsSuiteQlOrderSupport.lookupIdList(["1"], spec([:])) },
+                "only RECORDS_MATCHING answers by id")
+    }
+
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
     // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
     @Test

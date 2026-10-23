@@ -52,13 +52,22 @@
                 <description>Trusted automation owner tenant. When present, config access is checked
                     against this tenant instead of a user-session active tenant.</description>
             </parameter>
-            <parameter name="windowStart" required="true">
+            <parameter name="windowStart">
                 <description>Start of the window (inclusive); accepts Timestamp, ISO-8601 text, SQL
-                    timestamp text, epoch millis or yyyy-MM-dd. Reduced to a whole date.</description>
+                    timestamp text, epoch millis or yyyy-MM-dd. Reduced to a whole date. Required unless
+                    lookupIds is given.</description>
             </parameter>
-            <parameter name="windowEnd" required="true">
+            <parameter name="windowEnd">
                 <description>End of the window, EXCLUSIVE — an order dated exactly at the bound belongs
-                    to the next window, so consecutive chunks do not double-count their boundary.</description>
+                    to the next window, so consecutive chunks do not double-count their boundary.
+                    Required unless lookupIds is given.</description>
+            </parameter>
+            <parameter name="lookupIds" type="List">
+                <description>DAR-BE-118. A conclusion lookup: read only these NetSuite internal ids (at most
+                    1000, digits), with no window, still under the query row's own conditions. Only a
+                    RECORDS_MATCHING query answers by id. A caller checks this parameter is declared before
+                    sending ids, so a connector without it is never asked for a whole window instead.</description>
+                <parameter name="lookupId"/>
             </parameter>
             <parameter name="outputLocation">
                 <description>Optional output directory. Defaults to runtime://datamanager/reconciliation-runs/{automationExecutionId}/{timestamp}/.</description>

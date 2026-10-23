@@ -118,8 +118,11 @@ try {
     asOfDateValue = java.time.LocalDate.now(
             java.time.ZoneId.of(darpan.facade.common.TenantAccessSupport.resolveActiveTenantTimeZone(ec) as String)
     ).toString()
-    fromDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowStart)
-    thruDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowEnd)
+    // DAR-BE-118: a conclusion lookup names its records by id, so it has no window.
+    if (!lookupIds) {
+        fromDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowStart)
+        thruDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowEnd)
+    }
     suiteQlUrl = NsSuiteQlOrderSupport.suiteQlUrlFromTokenUrl(authConfig.tokenUrl?.toString())
     // Validates every configured fragment BEFORE it can reach the interpolated query text.
     querySpec = NsSuiteQlOrderSupport.normalizeSpec(
@@ -156,6 +159,7 @@ try {
              omsStatusConfigId     : queryRow.isField("omsStatusConfigId") ? queryRow.get("omsStatusConfigId") : null,
              omsStatusKeyField     : queryRow.isField("omsStatusKeyField") ? queryRow.get("omsStatusKeyField") : null],
             queryFieldRows)
+    if (lookupIds) querySpec.lookupIds = NsSuiteQlOrderSupport.lookupIdList(lookupIds, querySpec)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
     return
@@ -263,7 +267,7 @@ try {
     // they add. Anything else, and every run outside a walk, reads live.
     Map<String, Closure> served = null
     RunSnapshotScope runScope = RunSnapshotScope.current()
-    if (runScope != null && NsLifecycleSnapshot.canAnswer(querySpec)) {
+    if (runScope != null && !querySpec.lookupIds && NsLifecycleSnapshot.canAnswer(querySpec)) {
         String snapshotKey = NsLifecycleSnapshot.keyFor(querySpec, fromDate, thruDate,
                 "${authConfigIdValue}|${queryRow.companyUserGroupId}".toString())
         NsLifecycleSnapshot snapshot = (NsLifecycleSnapshot) runScope.get(snapshotKey)
