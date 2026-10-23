@@ -607,13 +607,10 @@ class NsSuiteQlOrderSupport {
      * page-skew this prevents.
      */
     static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate, String asOfDate = null) {
-        List<String> lookupIds = (List<String>) spec.get("lookupIds")
-        if (lookupIds) {
-            return "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} t WHERE t.type = '${spec.get('recordType')}' " +
-                    "AND t.id IN (${lookupIds.join(', ')}) AND ${matchPredicate(spec)} ORDER BY t.id"
+        if (!spec.get("lookupKeys")) {
+            requireIsoDate(fromDate, "fromDate")
+            requireIsoDate(toDate, "toDate")
         }
-        requireIsoDate(fromDate, "fromDate")
-        requireIsoDate(toDate, "toDate")
         String dateColumn = (String) spec.get("dateColumn")
         String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
 
@@ -623,8 +620,7 @@ class NsSuiteQlOrderSupport {
         if (template == TEMPLATE_RECORDS) {
             return "SELECT ${selectColumns(spec, (String) spec.get('fromTable')).join(', ')} FROM ${spec.get('fromTable')} " +
                     "WHERE type = '${spec.get('recordType')}' " +
-                    "AND ${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
-                    "AND ${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') " +
+                    population(spec, dateColumn, fromDate, toDate, null) +
                     "ORDER BY id"
         }
 
@@ -639,8 +635,7 @@ class NsSuiteQlOrderSupport {
         StringBuilder sql = new StringBuilder()
         sql << "SELECT ${selectColumns(spec).join(', ')} FROM ${spec.get('fromTable')} t "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
-        sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
-        sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
+        sql << population(spec, dateColumn, fromDate, toDate, "t")
         String waived = waivePredicate(spec)
         if (template == TEMPLATE_RECORDS_MATCHING) {
             sql << "AND ${matchPredicate(spec)} ORDER BY t.id"
@@ -781,8 +776,7 @@ class NsSuiteQlOrderSupport {
                 "${briefColumn} AS contradiction_brief "
         sql << "FROM ${spec.get('fromTable')} t "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
-        sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
-        sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
+        sql << population(spec, dateColumn, fromDate, toDate, "t")
         String parentType = (String) spec.get("requireParentRecordType")
         if (parentType) sql << "AND ${linkedParentPredicate(parentType)} "
         // IS NOT NULL is redundant against SQL's three-valued logic — `NULL >= 1` is unknown and
@@ -835,8 +829,7 @@ class NsSuiteQlOrderSupport {
                 "tl.location AS line_location "
         sql << "FROM ${spec.get('fromTable')} t JOIN transactionline tl ON tl.transaction = t.id "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
-        sql << "AND t.${dateColumn} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') "
-        sql << "AND t.${dateColumn} < TO_DATE('${toDate}', 'YYYY-MM-DD') "
+        sql << population(spec, dateColumn, fromDate, toDate, "t")
         sql << "AND tl.mainline = 'F' "
         sql << "AND tl.${lineKey} IS NOT NULL AND t.${joinKeyColumn} IS NOT NULL "
         sql << "ORDER BY t.id, tl.id"
@@ -1131,21 +1124,36 @@ class NsSuiteQlOrderSupport {
         }.join(" AND ") + ")"
     }
 
-    /** DAR-BE-118: most internal ids one lookup asks for; SuiteQL refuses a longer IN list. */
-    static final int MAX_LOOKUP_IDS = 1000
+    /** DAR-BE-118 / DAR-BE-119: most keys one read by key asks for; SuiteQL refuses a longer IN list. */
+    static final int MAX_LOOKUP_KEYS = 1000
 
     /**
-     * DAR-BE-118. The internal ids a conclusion lookup names: digits only (they reach SuiteQL by interpolation), at most
-     * MAX_LOOKUP_IDS, and only on RECORDS_MATCHING, the one template whose population is "records matching these conditions".
+     * DAR-BE-118 / DAR-BE-119. The keys a read by key names: values of one of the query's own record fields (lookupKeyField),
+     * at most MAX_LOOKUP_KEYS, of identifier characters only (they reach SuiteQL by interpolation).
      */
-    static List<String> lookupIdList(Object raw, Map<String, Object> spec) {
-        if (spec.get("queryTemplate") != TEMPLATE_RECORDS_MATCHING) {
-            throw new IllegalArgumentException("A lookup by id needs queryTemplate ${TEMPLATE_RECORDS_MATCHING}, got: ${spec.get('queryTemplate')}")
-        }
-        List<String> ids = ((raw ?: []) as List).collect { text(it) }.findAll { it }.unique() as List<String>
-        if (ids.size() > MAX_LOOKUP_IDS) throw new IllegalArgumentException("A lookup asks for at most ${MAX_LOOKUP_IDS} ids, got ${ids.size()}")
-        ids.each { if (!(it ==~ /\d{1,20}/)) throw new IllegalArgumentException("A lookup id is a NetSuite internal id (digits), got: ${it}") }
-        return ids
+    static List<String> lookupKeyList(Object raw, Map<String, Object> spec) {
+        keyColumn(spec, null)
+        List<String> keys = ((raw ?: []) as List).collect { text(it) }.findAll { it }.unique() as List<String>
+        if (keys.size() > MAX_LOOKUP_KEYS) throw new IllegalArgumentException("A read by key asks for at most ${MAX_LOOKUP_KEYS} keys, got ${keys.size()}")
+        keys.each { if (!(it ==~ /[A-Za-z0-9#_.\-]{1,64}/)) throw new IllegalArgumentException("A key holds letters, digits, # _ . - only, got: ${it}") }
+        return keys
+    }
+
+    /** The column a read by key matches: lookupKeyField's own source column, its alias dropped; a bare column is qualified. */
+    private static String keyColumn(Map<String, Object> spec, String qualifier) {
+        Map field = ((List<Map<String, Object>>) spec.get("fields")).find { it.get("recordFieldName") == spec.get("lookupKeyField") }
+        if (field == null) throw new IllegalArgumentException("A read by key needs one of the query's fields, got: ${spec.get('lookupKeyField')}")
+        String column = field.get("sourceColumn").toString().trim().replaceFirst(/(?i)\s+AS\s+\w+$/, "")
+        return qualifier && column ==~ /\w+/ ? "${qualifier}.${column}".toString() : column
+    }
+
+    /** The records a query reads: its window, or, read by key, the records whose key column holds one of lookupKeys. */
+    private static String population(Map<String, Object> spec, String dateColumn, String fromDate, String toDate, String qualifier) {
+        List<String> keys = (List<String>) spec.get("lookupKeys")
+        if (keys) return "AND ${keyColumn(spec, qualifier)} IN (${keys.collect { "'${it}'" }.join(', ')}) ".toString()
+        String column = qualifier ? "${qualifier}.${dateColumn}" : dateColumn
+        return ("AND ${column} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
+                "AND ${column} < TO_DATE('${toDate}', 'YYYY-MM-DD') ").toString()
     }
 
     /** A written finding's conditions, stored as JSON [{fieldId, op, values}]; fields and values reach SuiteQL. */

@@ -862,20 +862,31 @@ class NsSuiteQlQueryTemplateTest {
     }
 
     /**
-     * DAR-BE-118: a conclusion lookup asks for the records it names, by internal id and with no date window (an April order
-     * behind an October return is still its order), and keeps the row's own conditions: only the matches come back.
+     * DAR-BE-118 / DAR-BE-119: a read by key asks for the records it names, by one of the query's own fields and with no
+     * date window (an April order behind an October return is still its order), keeping the row's own conditions. The key
+     * is the field's own column: a conclusion lookup asks by internal id, a re-check of an older finding by its join key.
      */
     @Test
-    void aLookupAsksForTheNamedRecordsOnlyAndKeepsTheRowsConditions() {
-        Map<String, Object> s = spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "itemsbackordered", op: "GT", values: ["0"]]]])
-        s.lookupIds = NsSuiteQlOrderSupport.lookupIdList(["80970426", "76168721"], s)
+    void aReadByKeyAsksForTheNamedRecordsOnlyAndKeepsTheRowsConditions() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "itemsbackordered", op: "GT", values: ["0"]]]],
+                [[recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1],
+                 [recordFieldName: "returnId", sourceColumn: "REPLACE(custbody_hc_return_id, 'HG-', '') AS return_id", sequenceNum: 2]])
+        s.lookupKeyField = "internalId"
+        s.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["80970426", "76168721"], s)
         String sql = NsSuiteQlOrderSupport.buildRecordsQuery(s, null, null)
-        assertTrue(sql.contains("WHERE t.type = 'SalesOrd' AND t.id IN (80970426, 76168721) AND ((SELECT SUM(mb.quantitybackordered)"), sql)
-        assertFalse(sql.contains("TO_DATE"), "no window: the ids bound the read")
-        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.lookupIdList(["80970426", "1 OR 1=1"], s) }
-        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.lookupIdList((1..1001).collect { "${it}" }, s) }
-        assertThrows(IllegalArgumentException, { NsSuiteQlOrderSupport.lookupIdList(["1"], spec([:])) },
-                "only RECORDS_MATCHING answers by id")
+        assertTrue(sql.contains("WHERE t.type = 'SalesOrd' AND t.id IN ('80970426', '76168721') AND ((SELECT SUM(mb.quantitybackordered)"), sql)
+        assertFalse(sql.contains("TO_DATE"), "no window: the keys bound the read")
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.lookupKeyList(["80970426", "1' OR '1'='1"], s) }
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.lookupKeyList((1..1001).collect { "${it}" }, s) }
+        assertThrows(IllegalArgumentException, { NsSuiteQlOrderSupport.lookupKeyList(["1"], s + [lookupKeyField: "nope"]) },
+                "only a field the query reads")
+        // An older R8 finding: its RMA, by the return id the query derives (an expression keeps its own columns).
+        Map<String, Object> byReturn = s + [lookupKeyField: "returnId"]
+        byReturn.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["M259415"], byReturn)
+        assertTrue(NsSuiteQlOrderSupport.buildRecordsQuery(byReturn, null, null)
+                .contains("AND REPLACE(custbody_hc_return_id, 'HG-', '') IN ('M259415') AND"))
     }
 
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
