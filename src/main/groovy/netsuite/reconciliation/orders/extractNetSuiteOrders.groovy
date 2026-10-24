@@ -264,6 +264,8 @@ Closure livePage = { String query, int limit, int offset ->
     return [items: (parsed.items ?: []), hasMore: parsed.hasMore == true]
 }
 
+// Held out here, not left to the stream, so the finally reaches it however the read ends.
+Map excludedCollector = ExcludedRecordsSidecar.newCollector()
 try {
     // DAR-BE-073. Inside a run's walk, a lifecycle question is answered from one read of its window (NsLifecycleSnapshot)
     // when it can be answered exactly; the first such question reads it, the rest only read the ids of the conditions
@@ -329,7 +331,8 @@ try {
                      asOfDate   : asOfDateValue,
                      keepFields : (keepRecordFields instanceof List ? keepRecordFields : null),
                      filterRules: (sourceFilters instanceof List ? sourceFilters : null),
-                     pageEnricher: omsStatusEnricher],
+                     pageEnricher: omsStatusEnricher,
+                     excludedCollector: excludedCollector],
                     served != null ? served.fetch : livePage)
         }
     } finally {
@@ -361,7 +364,7 @@ try {
     DataManagerSupport.moveIntoLocation(ec, workFile, fileLocation as String)
     // DAR-UI-044: what the source filters dropped, beside the extract, for the conclude pass.
     try {
-        ExcludedRecordsSidecar.writeBeside(ec, (Map) extraction.excludedCollector, outputBaseLocation, outputFileName, outputDirectory)
+        ExcludedRecordsSidecar.writeBeside(ec, excludedCollector, outputBaseLocation, outputFileName, outputDirectory)
     } catch (Exception sidecarError) {
         warnings = ((warnings ?: []) as List) + ["Excluded-records sidecar not written: ${sidecarError.message}".toString()]
     }
@@ -375,7 +378,7 @@ try {
     fileName = null
 } finally {
     // The excluded-records spill holds customer records: gone on every path.
-    ExcludedRecordsSidecar.discard((Map) extraction?.excludedCollector)
+    ExcludedRecordsSidecar.discard(excludedCollector)
     // JDK 21 HttpClient holds a selector thread and a connection pool until closed; the inventory
     // path leaked one per call before 0d713bd.
     try { httpClient.close() } catch (Exception ignored) { }

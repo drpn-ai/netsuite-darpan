@@ -1354,8 +1354,9 @@ class NsSuiteQlOrderSupport {
         int excludedCount = 0
         Map<Integer, Integer> excludedByRuleCounts = [:]
         Map<Integer, Integer> fieldAbsentByRuleCounts = [:]
-        // DAR-UI-044: what the rules drop, whole and before projection, for the conclude pass.
-        Map excludedCollector = ExcludedRecordsSidecar.newCollector()
+        // DAR-UI-044: what the rules drop, whole and before projection, for the conclude pass. A caller that passes its
+        // own collector can discard it even when the stream throws.
+        Map excludedCollector = (Map) options.get("excludedCollector") ?: ExcludedRecordsSidecar.newCollector()
         int pageCount = 0
         int offset = 0
         boolean hasMore = true

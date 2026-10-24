@@ -1090,6 +1090,27 @@ class NsSuiteQlQueryTemplateTest {
         assertEquals("1:quantityShipped", ((Map) ExcludedRecordsSidecar.records(c)[0])._excludedBy)
     }
 
+    /** DAR-BE-127: a read that fails mid-stream leaves the caller its collector, so the spill can still be discarded. */
+    @Test
+    void aStreamThatThrowsLeavesTheCallerItsCollector() {
+        Map mine = ExcludedRecordsSidecar.newCollector()
+        int calls = 0
+        assertThrows(IllegalStateException) {
+            NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
+                    [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 1, excludedCollector: mine,
+                     filterRules: [[sequenceNum: 1, fieldExpression: "quantityShipped", operator: "EXCLUDE_IN", filterValues: "0"]]],
+                    { String q, int limit, int offset ->
+                        if (calls++ > 0) throw new IllegalStateException("page 2 failed")
+                        [items: [[custbody_hc_order_id: "M1", tranid: "SO1", order_line_id: "01", quantity_shipped: "0",
+                                  line_closed: "F", line_id: "1", item_type: "InvtPart"]], hasMore: true]
+                    })
+        }
+        File spill = (File) mine.spill
+        assertTrue(spill.exists(), "the excluded line reached the caller's collector before the throw")
+        ExcludedRecordsSidecar.discard(mine)
+        assertFalse(spill.exists())
+    }
+
     @Test
     void noRulesCollectNothing() {
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
