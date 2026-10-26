@@ -264,14 +264,18 @@ class NsSuiteQlOrderSupport {
             // Header columns are emitted as t.<col>, which only means something for a bare column.
             // Expressions are refused rather than rewritten: a named column list carrying
             // BUILTIN.DISPLAY(...) came back as an opaque 400 from gorjana where plain columns worked.
-            // DAR-UI-080: LINKED_RECORDS is the one exception, a sub-select over the line's order.
+            // DAR-UI-080: LINKED_RECORDS is an exception, a sub-select over the line's order; DAR-UI-081: LINE_LINKED,
+            // one over the line itself.
             normalized.each { Map<String, Object> f ->
                 String col = ((String) f.get("sourceColumn")).trim()
-                if (!IDENTIFIER.matcher(col).matches() && !LINKED_RECORDS.matcher(col).matches()) {
+                if (!IDENTIFIER.matcher(col).matches() && !LINKED_RECORDS.matcher(col).matches() && !LINE_LINKED.matcher(col).matches()) {
                     throw new IllegalArgumentException("${TEMPLATE_SALES_LINES} fields must be bare header " +
                             "columns; ${f.get('recordFieldName')} maps to the expression: ${col}")
                 }
             }
+        } else if (normalized.any { LINE_LINKED.matcher(((String) it.get("sourceColumn")).trim()).matches() }) {
+            throw new IllegalArgumentException("LINE_LINKED reads a line, so it is only meaningful on ${TEMPLATE_SALES_LINES}; " +
+                    "queryTemplate is ${queryTemplate}")
         } else if (lineKeyColumn) {
             // Refused rather than ignored, like every other template-specific attribute here.
             throw new IllegalArgumentException("lineKeyColumn is only meaningful on " +
@@ -549,6 +553,12 @@ class NsSuiteQlOrderSupport {
      * sales order's customer deposits. "^" parts the fields, as status words hold ":" ("Customer Deposit : Deposited").
      */
     private static final Pattern LINKED_RECORDS = ~/^LINKED_RECORDS\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * DAR-UI-081. "LINE_LINKED(ItemShip) AS fulfillments", SALES_LINES only: the numbers of the records of the type that
+     * follow THIS line (line link table), e.g. the item fulfillments that shipped it; a record reads [tranId, ...].
+     */
+    private static final Pattern LINE_LINKED = ~/^LINE_LINKED\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    private static final String LINE_LINK_TABLE = "nexttransactionlinelink"
 
     /**
      * The SELECT list. A LINE_SUM or LINE_ITEMS column becomes a sub-select over the record's item lines, DEPOSIT_WHEN
@@ -840,6 +850,13 @@ class NsSuiteQlOrderSupport {
         String lineKey = (String) spec.get("lineKeyColumn")
         List<String> header = ((List<Map<String, Object>>) spec.get("fields")).collect { Map<String, Object> f ->
             String col = ((String) f.get('sourceColumn')).trim()
+            def lineLinked = LINE_LINKED.matcher(col)
+            if (lineLinked.matches()) {
+                String alias = lineLinked.group(2), ll = "ll_${alias}", lr = "lr_${alias}"
+                return ("(SELECT LISTAGG(${lr}.tranid, '|') WITHIN GROUP (ORDER BY ${lr}.id) FROM ${LINE_LINK_TABLE} ${ll} " +
+                        "JOIN transaction ${lr} ON ${lr}.id = ${ll}.nextdoc WHERE ${ll}.previousdoc = t.id AND ${ll}.previousline = tl.id " +
+                        "AND ${lr}.type = '${lineLinked.group(1)}') AS ${alias}").toString()
+            }
             LINKED_RECORDS.matcher(col).matches() ? selectColumns([fields: [f]] as Map<String, Object>, "t")[0] :
                     "t.${col} AS ${f.get('rowKey')}".toString()
         }
@@ -1091,7 +1108,8 @@ class NsSuiteQlOrderSupport {
             Object value = row.get(field.get("rowKey"))
             String column = ((String) field.get("sourceColumn")).trim()
             record.put((String) field.get("recordFieldName"), LINE_ITEMS.matcher(column).matches() ? lineItems(value) :
-                    LINKED_RECORDS.matcher(column).matches() ? linkedRecords(value) : text(value))
+                    LINKED_RECORDS.matcher(column).matches() ? linkedRecords(value) :
+                    LINE_LINKED.matcher(column).matches() ? (text(value)?.split(/\|/)?.toList()?.unique() ?: []) : text(value))
         }
         // Columns the TEMPLATE adds, as opposed to the ones an operator configured. Without this the
         // query selected `contradiction` and the record dropped it — 57 findings arrived with no

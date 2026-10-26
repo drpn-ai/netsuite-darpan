@@ -843,6 +843,26 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(lines.contains("WHERE lk_deposits.previousdoc = t.id AND lr_deposits.type = 'CustDep') AS deposits, tl.custcol_hc_order_line_id"), lines)
     }
 
+    // DAR-UI-081 (Aditi: "add the IF id"): a sales order line names the item fulfillments that shipped it, by the line link.
+    @Test
+    void lineLinkedListsTheFulfillmentsOfEachLine() {
+        Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q2", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id",
+                joinKeyFieldName: "orderId"], [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                                               [recordFieldName: "fulfillments", sourceColumn: "LINE_LINKED(ItemShip) AS fulfillments", sequenceNum: 2]])
+        String lines = NsSuiteQlOrderSupport.buildRecordsQuery(spec, "2026-08-01", "2026-09-01")
+        assertTrue(lines.contains("(SELECT LISTAGG(lr_fulfillments.tranid, '|') WITHIN GROUP (ORDER BY lr_fulfillments.id) " +
+                "FROM nexttransactionlinelink ll_fulfillments JOIN transaction lr_fulfillments ON lr_fulfillments.id = ll_fulfillments.nextdoc " +
+                "WHERE ll_fulfillments.previousdoc = t.id AND ll_fulfillments.previousline = tl.id AND lr_fulfillments.type = 'ItemShip') AS fulfillments"), lines)
+        // One fulfillment reached under two link types is listed once.
+        assertEquals(["IF1", "IF2"], NsSuiteQlOrderSupport.mapRowToRecord(spec, [custbody_hc_order_id: "M1", fulfillments: "IF1|IF1|IF2"]).fulfillments)
+        assertEquals([], NsSuiteQlOrderSupport.mapRowToRecord(spec, [custbody_hc_order_id: "M1", fulfillments: null]).fulfillments)
+        assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q3", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"],
+                    [[recordFieldName: "fulfillments", sourceColumn: "LINE_LINKED(ItemShip) AS fulfillments", sequenceNum: 1]])
+        }
+    }
+
     // DAR-BE-094 R7: a Happiness Guarantee credit memo posts to account 42065.
     @Test
     void accountUsedAsksWhetherAnyLineOfTheRecordPostsToTheAccount() {
