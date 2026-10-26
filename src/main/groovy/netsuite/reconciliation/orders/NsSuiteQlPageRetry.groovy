@@ -1,5 +1,8 @@
 package netsuite.reconciliation.orders
 
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
+
 import java.net.http.HttpResponse
 import java.net.http.HttpTimeoutException
 import java.time.Duration
@@ -32,6 +35,17 @@ class NsSuiteQlPageRetry {
     static final Set<Integer> RETRYABLE_STATUS_CODES = [429, 502, 503, 504].toSet().asImmutable()
 
     private static final Closure DEFAULT_SLEEPER = { long ms -> sleepQuietly(ms) }
+    private static final Logger logger = LoggerFactory.getLogger(NsSuiteQlPageRetry.class)
+
+    /**
+     * DAR-BE-129. One line per NetSuite request on the real network path, so a run's calls can be counted by system
+     * and record type: op is suiteql or token, from is the first table the SQL reads (never a value or an id).
+     */
+    static void logCall(String op, String sql, int offset, Integer status, long startedMillis) {
+        def table = sql ? (sql =~ /(?i)\bfrom\s+(\w+)/) : null
+        logger.info("netsuite call op={} from={} offset={} status={} ms={}", op, table?.find() ? table.group(1) : null,
+                offset, status, System.currentTimeMillis() - startedMillis)
+    }
 
     /**
      * Sends one page through {@code request}, retrying as above. Returns the first response that is not retryable

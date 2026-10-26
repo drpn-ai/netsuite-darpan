@@ -186,6 +186,7 @@ Closure<String> mintToken = {
             "&client_assertion_type=" + URLEncoder.encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer", StandardCharsets.UTF_8) +
             "&client_assertion=" + URLEncoder.encode(assertionJwt, StandardCharsets.UTF_8)
 
+    long tokenStartedAt = System.currentTimeMillis()
     HttpResponse<String> resp = httpClient.send(
             HttpRequest.newBuilder(URI.create(tokenUrl))
                     .timeout(Duration.ofSeconds(60))
@@ -193,6 +194,7 @@ Closure<String> mintToken = {
                     .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8))
                     .build(),
             HttpResponse.BodyHandlers.ofString())
+    NsSuiteQlPageRetry.logCall("token", null, 0, resp.statusCode(), tokenStartedAt)
     if (resp.statusCode() != 200) {
         // NetSuite answers every client-assertion problem with an opaque 500 {"error":"server_error"} —
         // a wrong scope, a wrong certificate id and swapped iss/kid are indistinguishable here. Name
@@ -388,14 +390,22 @@ try {
 static HttpResponse<String> sendSuiteQl(HttpClient client, String url, String token,
                                         String query, int limit, int offset) {
     // `Prefer: transient` is REQUIRED by NetSuite: without it the SuiteQL request is rejected.
-    return client.send(
-            HttpRequest.newBuilder(URI.create("${url}?limit=${limit}&offset=${offset}"))
-                    .timeout(NsSuiteQlPageRetry.REQUEST_TIMEOUT)
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json")
-                    .header("Prefer", "transient")
-                    .header("Authorization", "Bearer ${token}")
-                    .POST(HttpRequest.BodyPublishers.ofString(JsonOutput.toJson([q: query]), StandardCharsets.UTF_8))
-                    .build(),
-            HttpResponse.BodyHandlers.ofString())
+    long startedAt = System.currentTimeMillis()
+    Integer status = null
+    try {
+        HttpResponse<String> resp = client.send(
+                HttpRequest.newBuilder(URI.create("${url}?limit=${limit}&offset=${offset}"))
+                        .timeout(NsSuiteQlPageRetry.REQUEST_TIMEOUT)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "application/json")
+                        .header("Prefer", "transient")
+                        .header("Authorization", "Bearer ${token}")
+                        .POST(HttpRequest.BodyPublishers.ofString(JsonOutput.toJson([q: query]), StandardCharsets.UTF_8))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString())
+        status = resp.statusCode()
+        return resp
+    } finally {
+        NsSuiteQlPageRetry.logCall("suiteql", query, offset, status, startedAt)
+    }
 }

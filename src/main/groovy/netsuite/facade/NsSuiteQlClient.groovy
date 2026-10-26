@@ -5,6 +5,7 @@ import groovy.json.JsonSlurper
 import netsuite.reconciliation.inventory.NsTokenCache
 import netsuite.reconciliation.orders.NsOAuthTokenMinter
 import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
+import netsuite.reconciliation.orders.NsSuiteQlPageRetry
 
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -59,14 +60,22 @@ class NsSuiteQlClient {
     }
 
     private HttpResponse<String> send(String token, String sql) {
-        return http.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${PAGE_LIMIT}&offset=0"))
-                .timeout(requestTimeout ?: Duration.ofSeconds(120))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Prefer", "transient")
-                .header("Authorization", "Bearer ${token}")
-                .POST(HttpRequest.BodyPublishers.ofString(JsonOutput.toJson([q: sql]), StandardCharsets.UTF_8))
-                .build(), HttpResponse.BodyHandlers.ofString())
+        long startedAt = System.currentTimeMillis()
+        Integer status = null
+        try {
+            HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${PAGE_LIMIT}&offset=0"))
+                    .timeout(requestTimeout ?: Duration.ofSeconds(120))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("Prefer", "transient")
+                    .header("Authorization", "Bearer ${token}")
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonOutput.toJson([q: sql]), StandardCharsets.UTF_8))
+                    .build(), HttpResponse.BodyHandlers.ofString())
+            status = resp.statusCode()
+            return resp
+        } finally {
+            NsSuiteQlPageRetry.logCall("suiteql", sql, 0, status, startedAt)
+        }
     }
 
     /** A fresh token, always minted rather than read from the cache — connection diagnostics depend on that. */
@@ -77,11 +86,13 @@ class NsSuiteQlClient {
         String form = "grant_type=" + enc("client_credentials") +
                 "&client_assertion_type=" + enc("urn:ietf:params:oauth:client-assertion-type:jwt-bearer") +
                 "&client_assertion=" + enc(assertion)
+        long startedAt = System.currentTimeMillis()
         HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create(tokenUrl))
                 .timeout(requestTimeout ?: Duration.ofSeconds(60))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8)).build(),
                 HttpResponse.BodyHandlers.ofString())
+        NsSuiteQlPageRetry.logCall("token", null, 0, resp.statusCode(), startedAt)
         if (resp.statusCode() != 200) {
             throw new IllegalStateException("NetSuite token endpoint returned ${resp.statusCode()}. Check that the account's " +
                     "Client ID (64 hex) and Certificate ID (43-char base64url) are not swapped.")
