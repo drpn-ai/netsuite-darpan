@@ -264,9 +264,10 @@ class NsSuiteQlOrderSupport {
             // Header columns are emitted as t.<col>, which only means something for a bare column.
             // Expressions are refused rather than rewritten: a named column list carrying
             // BUILTIN.DISPLAY(...) came back as an opaque 400 from gorjana where plain columns worked.
+            // DAR-UI-080: LINKED_RECORDS is the one exception, a sub-select over the line's order.
             normalized.each { Map<String, Object> f ->
                 String col = ((String) f.get("sourceColumn")).trim()
-                if (!IDENTIFIER.matcher(col).matches()) {
+                if (!IDENTIFIER.matcher(col).matches() && !LINKED_RECORDS.matcher(col).matches()) {
                     throw new IllegalArgumentException("${TEMPLATE_SALES_LINES} fields must be bare header " +
                             "columns; ${f.get('recordFieldName')} maps to the expression: ${col}")
                 }
@@ -542,6 +543,12 @@ class NsSuiteQlOrderSupport {
      * stage. A flag rather than a filter, so every record is read and an audit finding closes once the record moves on.
      */
     private static final Pattern LINKED = ~/^LINKED\(\s*([A-Za-z]+(?:\s*,\s*[A-Za-z]+)*)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * DAR-UI-080. "LINKED_RECORDS(CustDep) AS deposits": the records of the type that follow the record (link table), each
+     * as its number, amount and status in words, so a record reads [{tranId, amount, status}] (mapRowToRecord), e.g. a
+     * sales order's customer deposits. "^" parts the fields, as status words hold ":" ("Customer Deposit : Deposited").
+     */
+    private static final Pattern LINKED_RECORDS = ~/^LINKED_RECORDS\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
 
     /**
      * The SELECT list. A LINE_SUM or LINE_ITEMS column becomes a sub-select over the record's item lines, DEPOSIT_WHEN
@@ -573,6 +580,13 @@ class NsSuiteQlOrderSupport {
                 return ("CASE WHEN EXISTS (SELECT 1 FROM ${LINK_TABLE} ${lk} JOIN transaction ${lc} ON ${lc}.id = ${lk}.nextdoc " +
                         "WHERE ${lk}.previousdoc = ${outer}.id AND (${types})) THEN 'T' ELSE 'F' END AS ${alias}").toString()
             }
+            m = LINKED_RECORDS.matcher(col)
+            if (m.matches()) {
+                String alias = m.group(2), lk = "lk_${alias}", lr = "lr_${alias}"
+                return ("(SELECT LISTAGG(${lr}.tranid || '^' || TO_CHAR(${lr}.foreigntotal) || '^' || BUILTIN.DF(${lr}.status), '|') " +
+                        "WITHIN GROUP (ORDER BY ${lr}.id) FROM ${LINK_TABLE} ${lk} JOIN transaction ${lr} ON ${lr}.id = ${lk}.nextdoc " +
+                        "WHERE ${lk}.previousdoc = ${outer}.id AND ${lr}.type = '${m.group(1)}') AS ${alias}").toString()
+            }
             m = DEPOSIT_WHEN.matcher(col)
             if (m.matches()) {
                 return ("CASE WHEN ${outer}.type = '${m.group(1)}' AND ${outer}.status = '${m.group(2)}' AND ${outer}.foreigntotal = ${m.group(3)} " +
@@ -580,6 +594,18 @@ class NsSuiteQlOrderSupport {
                         "WHERE dk.previousdoc = ${outer}.id AND dd.type = 'CustDep') THEN 'T' ELSE 'F' END END AS ${m.group(4)}").toString()
             }
             return col
+        }
+    }
+
+    /** A LINKED_RECORDS value, "number^amount^status|...", as [{tranId, amount, status}]; TO_CHAR's ".83" reads 0.83. */
+    static List<Map<String, String>> linkedRecords(Object value) {
+        String listed = text(value)
+        if (!listed) return []
+        return listed.split(/\|/).collect { String entry ->
+            List<String> parts = entry.split(/\^/, 3).toList()
+            String amount = text(parts.size() > 1 ? parts[1] : null)
+            try { amount = amount ? new BigDecimal(amount).toPlainString() : null } catch (NumberFormatException ignored) { }
+            [tranId: text(parts[0]), amount: amount, status: text(parts.size() > 2 ? parts[2] : null)] as Map<String, String>
         }
     }
 
@@ -813,7 +839,9 @@ class NsSuiteQlOrderSupport {
                                                String dateColumn) {
         String lineKey = (String) spec.get("lineKeyColumn")
         List<String> header = ((List<Map<String, Object>>) spec.get("fields")).collect { Map<String, Object> f ->
-            "t.${((String) f.get('sourceColumn')).trim()} AS ${f.get('rowKey')}".toString()
+            String col = ((String) f.get('sourceColumn')).trim()
+            LINKED_RECORDS.matcher(col).matches() ? selectColumns([fields: [f]] as Map<String, Object>, "t")[0] :
+                    "t.${col} AS ${f.get('rowKey')}".toString()
         }
         String joinKeyColumn = ((List<Map<String, Object>>) spec.get("fields"))
                 .find { it.get("recordFieldName") == spec.get("joinKeyFieldName") }
@@ -1061,8 +1089,9 @@ class NsSuiteQlOrderSupport {
         Map<String, Object> record = [:]
         for (Map<String, Object> field : (List<Map<String, Object>>) spec.get("fields")) {
             Object value = row.get(field.get("rowKey"))
-            record.put((String) field.get("recordFieldName"),
-                    LINE_ITEMS.matcher(((String) field.get("sourceColumn")).trim()).matches() ? lineItems(value) : text(value))
+            String column = ((String) field.get("sourceColumn")).trim()
+            record.put((String) field.get("recordFieldName"), LINE_ITEMS.matcher(column).matches() ? lineItems(value) :
+                    LINKED_RECORDS.matcher(column).matches() ? linkedRecords(value) : text(value))
         }
         // Columns the TEMPLATE adds, as opposed to the ones an operator configured. Without this the
         // query selected `contradiction` and the record dropped it — 57 findings arrived with no

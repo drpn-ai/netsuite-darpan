@@ -814,6 +814,35 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(records.contains("WHERE dk.previousdoc = transaction.id AND dd.type = 'CustDep')"), records)
     }
 
+    // DAR-UI-080 (Aditi: "customer deposit info from NS", its number, amount and status): a sales order lists its deposits.
+    @Test
+    void linkedRecordsListEachDepositByNumberAmountAndStatus() {
+        List<Map<String, Object>> fields = [[recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1],
+                                            [recordFieldName: "deposits", sourceColumn: "LINKED_RECORDS(CustDep) AS deposits", sequenceNum: 2]]
+        Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate"], fields)
+        String records = NsSuiteQlOrderSupport.buildRecordsQuery(spec, "2026-08-01", "2026-09-01")
+        assertTrue(records.startsWith("SELECT id, (SELECT LISTAGG(lr_deposits.tranid || '^' || TO_CHAR(lr_deposits.foreigntotal) || '^' || " +
+                "BUILTIN.DF(lr_deposits.status), '|') WITHIN GROUP (ORDER BY lr_deposits.id) FROM nexttransactionlink lk_deposits " +
+                "JOIN transaction lr_deposits ON lr_deposits.id = lk_deposits.nextdoc WHERE lk_deposits.previousdoc = transaction.id " +
+                "AND lr_deposits.type = 'CustDep') AS deposits FROM transaction "), records)
+
+        assertEquals([[tranId: "CD10422", amount: "118", status: "Customer Deposit : Deposited"], [tranId: "CD10500", amount: "20.5", status: "Customer Deposit : Fully Applied"]],
+                NsSuiteQlOrderSupport.mapRowToRecord(spec, [id: "1", deposits: "CD10422^118^Customer Deposit : Deposited|CD10500^20.5^Customer Deposit : Fully Applied"]).deposits)
+        assertEquals([[tranId: "CD6559352", amount: "0.83", status: "Customer Deposit : Not Deposited"]],
+                NsSuiteQlOrderSupport.linkedRecords("CD6559352^.83^Customer Deposit : Not Deposited"))
+        assertEquals([], NsSuiteQlOrderSupport.mapRowToRecord(spec, [id: "2", deposits: null]).deposits)
+
+        // R1 reads sales order LINES: each line carries its order's deposits, read in the same query.
+        String lines = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q2", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id",
+                joinKeyFieldName: "orderId"], [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                                               [recordFieldName: "deposits", sourceColumn: "LINKED_RECORDS(CustDep) AS deposits", sequenceNum: 2]]),
+                "2026-08-01", "2026-09-01")
+        assertTrue(lines.startsWith("SELECT t.custbody_hc_order_id AS custbody_hc_order_id, (SELECT LISTAGG(lr_deposits.tranid"), lines)
+        assertTrue(lines.contains("WHERE lk_deposits.previousdoc = t.id AND lr_deposits.type = 'CustDep') AS deposits, tl.custcol_hc_order_line_id"), lines)
+    }
+
     // DAR-BE-094 R7: a Happiness Guarantee credit memo posts to account 42065.
     @Test
     void accountUsedAsksWhetherAnyLineOfTheRecordPostsToTheAccount() {
