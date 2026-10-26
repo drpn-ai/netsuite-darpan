@@ -86,7 +86,8 @@
             Rejects anything the extractor would reject, by running the extractor's own
             normalizeSpec over the submitted values before writing a row.</description>
         <in-parameters>
-            <parameter name="nsSuiteQlSourceQueryId" required="true"/>
+            <parameter name="nsSuiteQlSourceQueryId"><description>DAR-BE-135: names a check this tenant owns, to update it.
+                Leave it out to create one; the server mints the id.</description></parameter>
             <parameter name="nsAuthConfigId" required="true"/>
             <parameter name="description"/>
             <parameter name="recordType" required="true"/>

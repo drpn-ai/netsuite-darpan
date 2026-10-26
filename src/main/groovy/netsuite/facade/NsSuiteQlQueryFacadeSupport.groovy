@@ -128,7 +128,14 @@ class NsSuiteQlQueryFacadeSupport {
             return null
         }
 
-        def existing = one(ec, queryId)
+        // DAR-BE-135: a named id only updates this tenant's own check; another tenant's reads the same
+        // as a missing one. A new check gets a minted id, so no tenant can squat or probe an id.
+        def existing = queryId ? one(ec, queryId) : null
+        if (queryId && existing == null) {
+            ec.message.addError("NetSuite check '${queryId}' was not found.")
+            return null
+        }
+        if (!queryId) queryId = darpan.facade.common.TenantScopedFinder.mintId(ec, QUERY_ENTITY, "nsSuiteQlSourceQueryId")
         def row = existing ?: ec.entity.makeValue(QUERY_ENTITY)
         // A submitted value for a column this deployment's entity lacks is refused, not dropped: the
         // spec just validated WITH it, so dropping it would store a row that no longer runs.

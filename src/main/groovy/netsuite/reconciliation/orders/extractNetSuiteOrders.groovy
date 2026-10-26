@@ -48,19 +48,14 @@ def queryRow = ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQuery")
         .disableAuthz().useCache(false).one()
 
 if (companyUserGroupIdValue) {
-    if (!queryRow) {
+    if (queryRow?.companyUserGroupId?.toString()?.trim() != companyUserGroupIdValue) {
         errors = ["NetSuite SuiteQL source query ${queryIdValue} not found.".toString()]
-        return
-    }
-    if (queryRow.companyUserGroupId?.toString()?.trim() != companyUserGroupIdValue) {
-        errors = ["NetSuite SuiteQL source query ${queryIdValue} is not available in this automation tenant.".toString()]
         return
     }
 } else {
     TenantAccessSupport.requireTenantRecordAccess(
             ec, queryRow,
-            "NetSuite SuiteQL source query ${queryIdValue} not found.".toString(),
-            "NetSuite SuiteQL source query ${queryIdValue} is not available in your active tenant.".toString())
+            "NetSuite SuiteQL source query ${queryIdValue} not found.".toString())
     if (ec.message.hasError()) {
         errors = new ArrayList<String>(ec.message.getErrors())
         return

@@ -28,10 +28,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class NsSuiteQlQueryFacadeSupportTests {
 
-    private static final String QUERY_ID = "TEST_NS_CHECK"
     private static final String AUTH_ID = "TEST_NS_AUTH"
+    private static final String DESCRIPTION = "test check"
 
     private ExecutionContext ec
+    /** DAR-BE-135: the server mints a check's id, so a test learns it from its first save. */
+    private String lastId
 
     @BeforeAll
     void setup() {
@@ -58,11 +60,13 @@ class NsSuiteQlQueryFacadeSupportTests {
     void resetState() {
         ec.message.clearErrors()
         ec.artifactExecution.disableAuthz()
-        ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQueryField")
-                .condition("nsSuiteQlSourceQueryId", QUERY_ID).disableAuthz().deleteAll()
-        def row = ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQuery")
-                .condition("nsSuiteQlSourceQueryId", QUERY_ID).disableAuthz().useCache(false).one()
-        if (row != null) row.delete()
+        lastId = null
+        ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQuery").condition("description", DESCRIPTION)
+                .disableAuthz().useCache(false).list().each { row ->
+            ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQueryField")
+                    .condition("nsSuiteQlSourceQueryId", row.nsSuiteQlSourceQueryId).disableAuthz().deleteAll()
+            row.delete()
+        }
     }
 
     private static List<Map<String, Object>> projection() {
@@ -70,29 +74,70 @@ class NsSuiteQlQueryFacadeSupportTests {
                 [recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 2]] as List<Map<String, Object>>
     }
 
-    private static Map<String, Object> ctx(Map<String, Object> overrides) {
-        Map<String, Object> base = [nsSuiteQlSourceQueryId: QUERY_ID, nsAuthConfigId: AUTH_ID,
-                                    description           : "test check", recordType: "SalesOrd",
+    private Map<String, Object> ctx(Map<String, Object> overrides) {
+        Map<String, Object> base = [nsAuthConfigId        : AUTH_ID,
+                                    description           : DESCRIPTION, recordType: "SalesOrd",
                                     fromTable             : "transaction", dateColumn: "trandate",
                                     queryTemplate         : "RECORDS", isActive: true,
                                     fields                : projection()] as Map<String, Object>
+        if (lastId) base.put("nsSuiteQlSourceQueryId", lastId)
         base.putAll(overrides)
         return base
     }
 
+    private Map<String, Object> save(Map<String, Object> context) {
+        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.saveQuery(ec, context)
+        if (saved) lastId = saved.get("nsSuiteQlSourceQueryId") as String
+        return saved
+    }
+
     private boolean rowExists() {
         return ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQuery")
-                .condition("nsSuiteQlSourceQueryId", QUERY_ID).disableAuthz().useCache(false).one() != null
+                .condition("description", DESCRIPTION).disableAuthz().useCache(false).count() > 0
     }
 
     @Test
     void savesTheRowAndItsProjection() {
-        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([:]))
+        Map<String, Object> saved = save(ctx([:]))
 
         assertFalse(ec.message.hasError(), ec.message.errorsString)
         assertNotNull(saved)
         assertEquals("SalesOrd", saved.get("recordType"))
         assertEquals(2, ((List) saved.get("fields")).size())
+    }
+
+    @Test
+    void aNewCheckTakesAMintedId() {
+        Map<String, Object> saved = save(ctx([:]))
+
+        assertFalse(ec.message.hasError(), ec.message.errorsString)
+        assertTrue((saved.get("nsSuiteQlSourceQueryId") as String) ==~ /\d+/,
+                "DAR-BE-135: a new check takes a minted id, got ${saved.get('nsSuiteQlSourceQueryId')}")
+    }
+
+    /** DAR-BE-135: ids span every tenant, so a named id answers the same whether it is missing or another tenant's. */
+    @Test
+    void aForeignIdAndAMissingIdAnswerAlikeAndNeitherCreatesARow() {
+        ec.entity.makeValue("moqui.security.UserGroup").setAll([userGroupId: "GORJANA", description: "Gorjana"]).createOrUpdate()
+        def foreign = ec.entity.makeValue("darpan.reconciliation.NsSuiteQlSourceQuery")
+        foreign.setAll([nsSuiteQlSourceQueryId: "OTHER_TENANT_CHECK", nsAuthConfigId: AUTH_ID, description: "other tenant",
+                        recordType: "SalesOrd", companyUserGroupId: "GORJANA", isActive: "Y"])
+        foreign.createOrUpdate()
+        try {
+            save(ctx([nsSuiteQlSourceQueryId: "OTHER_TENANT_CHECK"]))
+            List<String> foreignErrors = new ArrayList<String>(ec.message.errors)
+            ec.message.clearErrors()
+            save(ctx([nsSuiteQlSourceQueryId: "NO_SUCH_CHECK"]))
+            List<String> missingErrors = new ArrayList<String>(ec.message.errors)
+
+            assertEquals(["NetSuite check 'OTHER_TENANT_CHECK' was not found."], foreignErrors)
+            assertEquals(["NetSuite check 'NO_SUCH_CHECK' was not found."], missingErrors)
+            assertFalse(rowExists(), "a caller-named id must never create a row")
+            assertEquals("other tenant", ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQuery")
+                    .condition("nsSuiteQlSourceQueryId", "OTHER_TENANT_CHECK").disableAuthz().useCache(false).one().description)
+        } finally {
+            foreign.delete()
+        }
     }
 
     /**
@@ -101,7 +146,7 @@ class NsSuiteQlQueryFacadeSupportTests {
      */
     @Test
     void refusesARecordTypeThatWouldWidenTheTypePredicate() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([recordType: "ItemShip' OR '1'='1"]))
+        save(ctx([recordType: "ItemShip' OR '1'='1"]))
 
         assertTrue(ec.message.hasError())
         assertFalse(rowExists(), "an injected record type must not reach the database")
@@ -109,7 +154,7 @@ class NsSuiteQlQueryFacadeSupportTests {
 
     @Test
     void refusesAnEmptyProjection() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([fields: []]))
+        save(ctx([fields: []]))
 
         assertTrue(ec.message.hasError())
         assertFalse(rowExists(), "a check with no columns selects nothing and must not be saved")
@@ -118,7 +163,7 @@ class NsSuiteQlQueryFacadeSupportTests {
     /** Cross-field rules come from normalizeSpec, so the save path inherits them for free. */
     @Test
     void refusesAHalfConfiguredAmountFloor() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate   : "STATE_CONTRADICTION",
+        save(ctx([queryTemplate   : "STATE_CONTRADICTION",
                                                        disallowedStates: "F", minAmount: "1"]))
 
         assertTrue(ec.message.hasError())
@@ -128,7 +173,7 @@ class NsSuiteQlQueryFacadeSupportTests {
 
     @Test
     void refusesALinkTemplateWithNoChildType() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "LINKED_CHILD_ABSENT"]))
+        save(ctx([queryTemplate: "LINKED_CHILD_ABSENT"]))
 
         assertTrue(ec.message.hasError())
         assertFalse(rowExists())
@@ -136,7 +181,7 @@ class NsSuiteQlQueryFacadeSupportTests {
 
     @Test
     void refusesAJoinKeyThatIsNotAMappedField() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([joinKeyFieldName: "orderId"]))
+        save(ctx([joinKeyFieldName: "orderId"]))
 
         assertTrue(ec.message.hasError())
         assertFalse(rowExists())
@@ -145,19 +190,19 @@ class NsSuiteQlQueryFacadeSupportTests {
     /** DAR-UI-064: a query written in the app says which records it reads; the conditions round-trip as stored JSON. */
     @Test
     void savesMatchRulesAndReadsThemBack() {
-        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "RECORDS_MATCHING",
+        Map<String, Object> saved = save(ctx([queryTemplate: "RECORDS_MATCHING",
                 matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["WTY-"]]]]))
 
         assertFalse(ec.message.hasError(), ec.message.errorsString)
         assertEquals('[{"fieldId":"otherrefnum","op":"STARTS_WITH","values":["WTY-"]}]', saved.get("matchRules"))
-        Map<String, Object> again = NsSuiteQlQueryFacadeSupport.getQuery(ec, QUERY_ID)
+        Map<String, Object> again = NsSuiteQlQueryFacadeSupport.getQuery(ec, lastId)
         assertEquals(saved.get("matchRules"), again.get("matchRules"))
     }
 
     /** A LIKE wildcard in a prefix would widen the population silently, so it never reaches the database. */
     @Test
     void refusesAMatchRuleThatWouldWidenThePopulation() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "RECORDS_MATCHING",
+        save(ctx([queryTemplate: "RECORDS_MATCHING",
                 matchRules: '[{"fieldId":"otherrefnum","op":"STARTS_WITH","values":["%"]}]']))
 
         assertTrue(ec.message.hasError())
@@ -166,7 +211,7 @@ class NsSuiteQlQueryFacadeSupportTests {
 
     @Test
     void refusesAMatchRuleOnAFieldNoQueryMayAskAbout() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([queryTemplate: "RECORDS_MATCHING",
+        save(ctx([queryTemplate: "RECORDS_MATCHING",
                 matchRules: [[fieldId: "entity) OR (1", op: "NOT_EMPTY"]]]))
 
         assertTrue(ec.message.hasError())
@@ -215,7 +260,7 @@ class NsSuiteQlQueryFacadeSupportTests {
      */
     @Test
     void anythingThatSavesAlsoBuildsAQuery() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([
+        save(ctx([
                 queryTemplate          : "STATE_CONTRADICTION", disallowedStates: "A",
                 requireParentRecordType: "SalesOrd", recordType: "CustInvc",
                 amountColumn           : "foreignamountunpaid", minAmount: "1",
@@ -225,7 +270,7 @@ class NsSuiteQlQueryFacadeSupportTests {
                                                           sequenceNum    : 3]]]))
         assertFalse(ec.message.hasError(), ec.message.errorsString)
 
-        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.getQuery(ec, QUERY_ID)
+        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.getQuery(ec, lastId)
         Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec(
                 saved, (List<Map<String, Object>>) saved.get("fields"))
         String sql = NsSuiteQlOrderSupport.buildRecordsQuery(spec, "2026-09-01", "2026-09-02", "2026-09-29")
@@ -241,24 +286,24 @@ class NsSuiteQlQueryFacadeSupportTests {
      */
     @Test
     void replacingTheProjectionLeavesNoStaleColumns() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([:]))
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([fields: [[recordFieldName: "internalId",
+        save(ctx([:]))
+        save(ctx([fields: [[recordFieldName: "internalId",
                                                                  sourceColumn   : "id", sequenceNum: 1]]]))
 
         assertFalse(ec.message.hasError(), ec.message.errorsString)
-        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.getQuery(ec, QUERY_ID)
+        Map<String, Object> saved = NsSuiteQlQueryFacadeSupport.getQuery(ec, lastId)
         assertEquals(1, ((List) saved.get("fields")).size())
     }
 
     /** Submitted order wins, and the stored sequence is dense — a gap reorders the projection. */
     @Test
     void renumbersTheProjectionDenselyFromOne() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([fields: [
+        save(ctx([fields: [
                 [recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 40],
                 [recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 90]]]))
 
         assertFalse(ec.message.hasError(), ec.message.errorsString)
-        List fields = (List) NsSuiteQlQueryFacadeSupport.getQuery(ec, QUERY_ID).get("fields")
+        List fields = (List) NsSuiteQlQueryFacadeSupport.getQuery(ec, lastId).get("fields")
         assertEquals([1, 2], fields.collect { (it as Map).get("sequenceNum") as Integer })
         assertEquals(["internalId", "tranId"], fields.collect { (it as Map).get("recordFieldName") })
     }
@@ -272,10 +317,10 @@ class NsSuiteQlQueryFacadeSupportTests {
 
     @Test
     void listReportsTheProjectionSize() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([:]))
+        save(ctx([:]))
 
         List rows = (List) NsSuiteQlQueryFacadeSupport.listQueries(ec).get("queries")
-        Map<String, Object> listed = rows.find { (it as Map).get("nsSuiteQlSourceQueryId") == QUERY_ID } as Map
+        Map<String, Object> listed = rows.find { (it as Map).get("nsSuiteQlSourceQueryId") == lastId } as Map
         assertNotNull(listed)
         assertEquals(2, listed.get("fieldCount"))
     }
@@ -283,7 +328,7 @@ class NsSuiteQlQueryFacadeSupportTests {
     /** Paged like every other list service: a bounded page plus the total, never every row at once. */
     @Test
     void listIsPagedAndReportsTheTotal() {
-        NsSuiteQlQueryFacadeSupport.saveQuery(ec, ctx([:]))
+        save(ctx([:]))
 
         Map<String, Object> listed = NsSuiteQlQueryFacadeSupport.listQueries(ec, 0, 1)
         Map<String, Object> pagination = (Map<String, Object>) listed.get("pagination")
