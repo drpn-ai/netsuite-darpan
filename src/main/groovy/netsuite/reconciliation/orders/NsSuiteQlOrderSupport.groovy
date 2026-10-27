@@ -542,6 +542,13 @@ class NsSuiteQlOrderSupport {
      */
     private static final Pattern ACCOUNT_USED = ~/^ACCOUNT_USED\(\s*([0-9]{3,10})\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
     /**
+     * DAR-BE-149 R21. "ITEM_AMOUNT(34838) AS pos_tax_variance": the record's lines of that item (internal id) added up, e.g.
+     * gorjana's POS Tax Variance on a credit memo. "ITEM_AMOUNT(34838 - foreignpaymentamountunused) AS line_after_fix" is
+     * that sum less a column of the record, so a rule can ask whether the line covers the memo's open amount. Blank when
+     * the record has no line of the item.
+     */
+    private static final Pattern ITEM_AMOUNT = ~/^ITEM_AMOUNT\(\s*([0-9]{1,10})\s*(?:-\s*([a-z][a-z0-9_]*)\s*)?\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
      * DAR-BE-111. "LINKED(ItemShip) AS shipped", "LINKED(CustInvc, CashSale) AS billed": T or F, a record of any of the
      * types follows the record (link table). A fulfillment counts only once Shipped (STAGE_DONE_STATUS), as on every
      * stage. A flag rather than a filter, so every record is read and an audit finding closes once the record moves on.
@@ -582,6 +589,12 @@ class NsSuiteQlOrderSupport {
             if (m.matches()) {
                 return ("CASE WHEN EXISTS (SELECT 1 FROM transactionaccountingline au JOIN account aa ON aa.id = au.account " +
                         "WHERE au.transaction = ${outer}.id AND aa.acctnumber = '${m.group(1)}') THEN 'T' ELSE 'F' END AS ${m.group(2)}").toString()
+            }
+            m = ITEM_AMOUNT.matcher(col)
+            if (m.matches()) {
+                String sum = "(SELECT SUM(ia.foreignamount) FROM transactionline ia WHERE ia.transaction = ${outer}.id " +
+                        "AND ia.item = ${m.group(1)} AND ia.mainline = 'F')"
+                return "${m.group(2) ? "${sum} - ${outer}.${m.group(2)}" : sum} AS ${m.group(3)}".toString()
             }
             m = LINKED.matcher(col)
             if (m.matches()) {

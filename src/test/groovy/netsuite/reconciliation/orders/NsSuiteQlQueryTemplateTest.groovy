@@ -878,6 +878,25 @@ class NsSuiteQlQueryTemplateTest {
         }
     }
 
+    // DAR-BE-149 R21: a Happiness Guarantee memo left open by its POS Tax Variance line (item 34838). The line, and the
+    // line less the memo's open amount, which is what the line should read once corrected (CM7661593: 49.95 - 49.92).
+    @Test
+    void itemAmountAddsUpOneItemsLinesAndCanTakeAColumnOff() {
+        List<Map<String, Object>> fields = [[recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 1],
+                                            [recordFieldName: "posTaxVariance", sourceColumn: "ITEM_AMOUNT(34838) AS pos_tax_variance", sequenceNum: 2],
+                                            [recordFieldName: "lineAfterFix", sourceColumn: "ITEM_AMOUNT(34838 - foreignpaymentamountunused) AS line_after_fix", sequenceNum: 3]]
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "CustCred",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "RECORDS_MATCHING",
+                matchRules: [[fieldId: "custbody_hc_return_channel", op: "IN", values: ["HAPPINESS_GUARANTEE"]]]], fields), "2026-10-01", "2026-10-28")
+        String line = "(SELECT SUM(ia.foreignamount) FROM transactionline ia WHERE ia.transaction = t.id AND ia.item = 34838 AND ia.mainline = 'F')"
+        assertTrue(sql.startsWith("SELECT tranid, ${line} AS pos_tax_variance, ${line} - t.foreignpaymentamountunused AS line_after_fix FROM transaction t"), sql)
+        assertTrue(sql.contains("t.custbody_hc_return_channel IN ('HAPPINESS_GUARANTEE')"), sql)
+        ["ITEM_AMOUNT(34838 OR 1=1) AS x", "ITEM_AMOUNT(34838 - 1) AS x"].each { String bad ->
+            String expanded = NsSuiteQlOrderSupport.selectColumns([fields: [[sourceColumn: bad]]])[0]
+            assertFalse(expanded.contains("transactionline"), "${bad} is not the macro: ${expanded}")
+        }
+    }
+
     // DAR-BE-111: an order never shipped (no Shipped fulfillment) and never billed (no invoice or cash sale), as two flags
     // on EVERY order, so a fixed order is still read and its audit finding closes.
     @Test
