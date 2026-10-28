@@ -1295,7 +1295,8 @@ class NsSuiteQlQueryTemplateTest {
 
     // ------------------------------------------------- ACTIVE_ITEMS (DAR-BE-157)
 
-    // The text proven on gorjana prod 2026-10-28: 9,085 rows in 10 pages, ~31 s a page.
+    // The text proven on gorjana prod 2026-10-28 (stock items and kits: 9,085 rows in 10 pages, ~31 s a page); non-inventory
+    // items added after the first R22 run matched 110 HotWax products (packaging) to nothing.
     private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
             "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
             "CASE WHEN EXISTS (SELECT 1 FROM aggregateItemLocation a WHERE a.item = i.id AND a.quantityonhand <> 0) " +
@@ -1303,7 +1304,7 @@ class NsSuiteQlQueryTemplateTest {
             "WHERE tl.item = i.id AND t.trandate >= TO_DATE('2026-07-30', 'YYYY-MM-DD')) " +
             "OR i.createddate >= TO_DATE('2026-07-30', 'YYYY-MM-DD') " +
             "THEN 'Y' ELSE 'N' END AS live " +
-            "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit') "
+            "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit', 'NonInvtPart') "
 
     private static Map<String, Object> activeItemsSpec(Map<String, Object> overrides = [:], List<String> columns = ["id", "itemid", "live"]) {
         int seq = 0

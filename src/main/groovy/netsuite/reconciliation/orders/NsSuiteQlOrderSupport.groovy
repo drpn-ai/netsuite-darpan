@@ -116,14 +116,15 @@ class NsSuiteQlOrderSupport {
      */
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     /**
-     * DAR-BE-157. Every non-inactive stock item and kit, whatever its age, with a live flag: stock on hand, any
+     * DAR-BE-157. Every non-inactive stock item, kit and non-inventory item, whatever its age, with a live flag: stock on hand, any
      * transaction line in the last ACTIVE_ITEM_DAYS, or created in them. Not windowed: presence is a whole-catalogue
      * question, so a product missing since August never falls inside a day's window. Quiet items are still read (live
      * N) so a run can exclude them and its conclusions can still say why HotWax has one. Proven on gorjana 2026-10-28:
-     * 9,085 rows, ~31 s a 1,000-row page.
+     * 9,085 stock items and kits, ~31 s a 1,000-row page. NonInvtPart is read too: HotWax sells 110 of them (packaging,
+     * glue dots) as finished goods, which matched nothing without it; the rest are NetSuite's own accounting lines.
      */
     static final String TEMPLATE_ACTIVE_ITEMS = "ACTIVE_ITEMS"
-    static final List<String> ACTIVE_ITEM_TYPES = ["InvtPart", "Kit"].asImmutable()
+    static final List<String> ACTIVE_ITEM_TYPES = ["InvtPart", "Kit", "NonInvtPart"].asImmutable()
     static final int ACTIVE_ITEM_DAYS = 90
     private static final List<String> ACTIVE_ITEM_COLUMNS = ["id", "itemid", "itemtype", "created", "stock", "live"].asImmutable()
     private static final List<String> QUERY_TEMPLATES =
