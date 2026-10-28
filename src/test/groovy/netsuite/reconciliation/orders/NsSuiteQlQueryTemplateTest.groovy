@@ -1292,4 +1292,57 @@ class NsSuiteQlQueryTemplateTest {
                 "AND trandate < TO_DATE('2026-09-01', 'YYYY-MM-DD') ORDER BY id",
                 NsSuiteQlOrderSupport.buildRecordsQuery(s, "2026-08-01", "2026-09-01"))
     }
+
+    // ------------------------------------------------- ACTIVE_ITEMS (DAR-BE-157)
+
+    // The text proven on gorjana prod 2026-10-28: 9,085 rows in 10 pages, ~31 s a page.
+    private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
+            "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
+            "CASE WHEN EXISTS (SELECT 1 FROM aggregateItemLocation a WHERE a.item = i.id AND a.quantityonhand <> 0) " +
+            "OR EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
+            "WHERE tl.item = i.id AND t.trandate >= TO_DATE('2026-07-30', 'YYYY-MM-DD')) " +
+            "OR i.createddate >= TO_DATE('2026-07-30', 'YYYY-MM-DD') " +
+            "THEN 'Y' ELSE 'N' END AS live " +
+            "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit') "
+
+    private static Map<String, Object> activeItemsSpec(Map<String, Object> overrides = [:], List<String> columns = ["id", "itemid", "live"]) {
+        int seq = 0
+        return NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "item", fromTable: "item",
+                queryTemplate: "ACTIVE_ITEMS", joinKeyFieldName: "id"] + overrides,
+                columns.collect { [recordFieldName: it, sourceColumn: it, sequenceNum: ++seq] as Map<String, Object> })
+    }
+
+    @Test
+    void activeItemsQueryIsTheProvenText() {
+        assertEquals(ACTIVE_ITEMS_SQL + "ORDER BY i.id", NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec(), null, null, "2026-10-28"))
+    }
+
+    @Test
+    void activeItemsNeedsNoWindow() {
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec(), null, null, "2026-10-28")
+        assertFalse(sql.contains("'null'"), sql)
+        assertThrows(IllegalArgumentException, { NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec(), null, null, null) },
+                "the 90 days count back from the tenant's today, so asOfDate is required")
+    }
+
+    @Test
+    void activeItemsReadByKey() {
+        Map<String, Object> s = activeItemsSpec()
+        s.lookupKeyField = "id"
+        s.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["43429", "42808"], s)
+        assertEquals(ACTIVE_ITEMS_SQL + "AND i.id IN ('43429', '42808') ORDER BY i.id",
+                NsSuiteQlOrderSupport.buildRecordsQuery(s, null, null, "2026-10-28"))
+    }
+
+    @Test
+    void activeItemsRefusesAnotherTable() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException) { activeItemsSpec([fromTable: "transaction"]) }
+        assertTrue(e.message.contains("ACTIVE_ITEMS reads the item table, so fromTable must be item"), e.message)
+    }
+
+    @Test
+    void activeItemsFieldsMustBeTemplateColumns() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException) { activeItemsSpec([:], ["id", "custitem_x"]) }
+        assertTrue(e.message.contains("id, itemid, itemtype, created, stock, live"), e.message)
+    }
 }

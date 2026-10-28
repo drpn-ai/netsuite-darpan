@@ -106,6 +106,7 @@ List<Map<String, Object>> queryFieldRows = ec.entity.find("darpan.reconciliation
                     sourceColumnAlias: it.sourceColumnAlias, sequenceNum: it.sequenceNum] as Map<String, Object> }
 
 String fromDate, thruDate, suiteQlUrl, asOfDateValue
+boolean unwindowed = queryRow.queryTemplate?.toString()?.trim()?.toUpperCase() == NsSuiteQlOrderSupport.TEMPLATE_ACTIVE_ITEMS
 Map<String, Object> querySpec
 try {
     // Today, in the tenant's zone rather than the JVM's — the same lesson DAR-BE-057 taught about the
@@ -113,8 +114,9 @@ try {
     asOfDateValue = java.time.LocalDate.now(
             java.time.ZoneId.of(darpan.facade.common.TenantAccessSupport.resolveActiveTenantTimeZone(ec) as String)
     ).toString()
-    // DAR-BE-118 / DAR-BE-119: a read by key names its records, so it has no window.
-    if (!lookupKeys) {
+    // DAR-BE-118 / DAR-BE-119: a read by key names its records, so it has no window. DAR-BE-157: nor does a whole-catalogue
+    // template, which reads every item whatever the run's window says.
+    if (!lookupKeys && !unwindowed) {
         fromDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowStart)
         thruDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowEnd)
     }
@@ -343,6 +345,8 @@ try {
             endpoint         : suiteQlUrl,
             windowFrom       : fromDate,
             windowThru       : thruDate,
+            // DAR-BE-157: the run's window was not applied (a whole-catalogue template), so a clean run is not a clean window.
+            windowIgnored    : unwindowed,
             pageCount        : extraction.pageCount,
             excludedCount    : extraction.excludedCount,
             answeredFrom     : served != null ? "run snapshot" : "NetSuite",

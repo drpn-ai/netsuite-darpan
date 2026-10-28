@@ -115,10 +115,21 @@ class NsSuiteQlOrderSupport {
      * a rule set excludes them by name rather than by a gate nobody can see.
      */
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
+    /**
+     * DAR-BE-157. Every non-inactive stock item and kit, whatever its age, with a live flag: stock on hand, any
+     * transaction line in the last ACTIVE_ITEM_DAYS, or created in them. Not windowed: presence is a whole-catalogue
+     * question, so a product missing since August never falls inside a day's window. Quiet items are still read (live
+     * N) so a run can exclude them and its conclusions can still say why HotWax has one. Proven on gorjana 2026-10-28:
+     * 9,085 rows, ~31 s a 1,000-row page.
+     */
+    static final String TEMPLATE_ACTIVE_ITEMS = "ACTIVE_ITEMS"
+    static final List<String> ACTIVE_ITEM_TYPES = ["InvtPart", "Kit"].asImmutable()
+    static final int ACTIVE_ITEM_DAYS = 90
+    private static final List<String> ACTIVE_ITEM_COLUMNS = ["id", "itemid", "itemtype", "created", "stock", "live"].asImmutable()
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
              TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED, TEMPLATE_RECORDS_MATCHING, TEMPLATE_STATE_CONTRADICTION,
-             TEMPLATE_SALES_LINES].asImmutable()
+             TEMPLATE_SALES_LINES, TEMPLATE_ACTIVE_ITEMS].asImmutable()
     private static final List<String> LINK_TEMPLATES =
             [TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT, TEMPLATE_LINKED_CHILD_EXCUSED].asImmutable()
 
@@ -239,6 +250,18 @@ class NsSuiteQlOrderSupport {
                     "has unsupported queryTemplate ${query.get('queryTemplate')}. Supported values: ${QUERY_TEMPLATES.join(', ')}")
         }
         boolean linkTemplate = LINK_TEMPLATES.contains(queryTemplate)
+        if (queryTemplate == TEMPLATE_ACTIVE_ITEMS) {
+            if (fromTable != "item") {
+                throw new IllegalArgumentException("queryTemplate ${queryTemplate} reads the item table, so fromTable must be item, got: ${fromTable}")
+            }
+            // The template's columns are fixed; a field can only pick one of them.
+            normalized.each { Map<String, Object> f ->
+                if (!ACTIVE_ITEM_COLUMNS.contains(((String) f.get("sourceColumn")).trim())) {
+                    throw new IllegalArgumentException("${TEMPLATE_ACTIVE_ITEMS} fields name its columns " +
+                            "(${ACTIVE_ITEM_COLUMNS.join(', ')}); ${f.get('recordFieldName')} maps to: ${f.get('sourceColumn')}")
+                }
+            }
+        }
 
         // Read through containsKey, never a bare get: the row may be a Moqui EntityValue, whose get()
         // THROWS on a field its entity does not declare, and a deployment whose entity predates this
@@ -656,12 +679,13 @@ class NsSuiteQlOrderSupport {
      * page-skew this prevents.
      */
     static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate, String asOfDate = null) {
+        String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
+        if (template == TEMPLATE_ACTIVE_ITEMS) return buildActiveItemsQuery(spec, asOfDate)
         if (!spec.get("lookupKeys")) {
             requireIsoDate(fromDate, "fromDate")
             requireIsoDate(toDate, "toDate")
         }
         String dateColumn = (String) spec.get("dateColumn")
-        String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
 
         // RECORDS stays BYTE-IDENTICAL to what shipped for DAR-BE-032/044, alias and all (there is
         // none). Every stored row predates the template field, so a default that even reformatted this
@@ -1205,6 +1229,22 @@ class NsSuiteQlOrderSupport {
         if (field == null) throw new IllegalArgumentException("A read by key needs one of the query's fields, got: ${spec.get('lookupKeyField')}")
         String column = field.get("sourceColumn").toString().trim().replaceFirst(/(?i)\s+AS\s+\w+$/, "")
         return qualifier && column ==~ /\w+/ ? "${qualifier}.${column}".toString() : column
+    }
+
+    /** DAR-BE-157: ACTIVE_ITEMS. No window; the cutoff counts ACTIVE_ITEM_DAYS back from asOfDate (the tenant's today). */
+    static String buildActiveItemsQuery(Map<String, Object> spec, String asOfDate) {
+        requireIsoDate(asOfDate, "asOfDate")
+        String cutoff = java.time.LocalDate.parse(asOfDate).minusDays(ACTIVE_ITEM_DAYS).toString()
+        String byKey = spec.get("lookupKeys") ? population(spec, null, null, null, "i") : ""
+        return ("SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
+                "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
+                "CASE WHEN EXISTS (SELECT 1 FROM aggregateItemLocation a WHERE a.item = i.id AND a.quantityonhand <> 0) " +
+                "OR EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
+                "WHERE tl.item = i.id AND t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD')) " +
+                "OR i.createddate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') " +
+                "THEN 'Y' ELSE 'N' END AS live " +
+                "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN (${ACTIVE_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) " +
+                byKey + "ORDER BY i.id").toString()
     }
 
     /** The records a query reads: its window, or, read by key, the records whose key column holds one of lookupKeys. */
