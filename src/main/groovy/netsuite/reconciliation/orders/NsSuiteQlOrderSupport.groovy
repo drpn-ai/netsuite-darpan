@@ -116,8 +116,9 @@ class NsSuiteQlOrderSupport {
      */
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     /**
-     * DAR-BE-157. Every non-inactive stock item, kit and non-inventory item, whatever its age, with a live flag: stock on hand, any
-     * transaction line in the last ACTIVE_ITEM_DAYS, or created in them. Not windowed: presence is a whole-catalogue
+     * DAR-BE-157. Every non-inactive stock item, kit and non-inventory item, whatever its age, with a live flag: used, i.e. on
+     * a transaction line, in the last ACTIVE_ITEM_DAYS (Aditi 2026-10-29: "the item must have been used within the last year
+     * in NS"). Stock on hand is read for the record, not for the flag. Not windowed: presence is a whole-catalogue
      * question, so a product missing since August never falls inside a day's window. Quiet items are still read (live
      * N) so a run can exclude them and its conclusions can still say why HotWax has one. Proven on gorjana 2026-10-28:
      * 9,085 stock items and kits, ~31 s a 1,000-row page. NonInvtPart is read too: HotWax sells 110 of them (packaging,
@@ -125,7 +126,7 @@ class NsSuiteQlOrderSupport {
      */
     static final String TEMPLATE_ACTIVE_ITEMS = "ACTIVE_ITEMS"
     static final List<String> ACTIVE_ITEM_TYPES = ["InvtPart", "Kit", "NonInvtPart"].asImmutable()
-    static final int ACTIVE_ITEM_DAYS = 90
+    static final int ACTIVE_ITEM_DAYS = 365
     private static final List<String> ACTIVE_ITEM_COLUMNS = ["id", "itemid", "itemtype", "created", "stock", "live"].asImmutable()
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
@@ -1242,10 +1243,8 @@ class NsSuiteQlOrderSupport {
         }
         return ("SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
                 "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
-                "CASE WHEN EXISTS (SELECT 1 FROM aggregateItemLocation a WHERE a.item = i.id AND a.quantityonhand <> 0) " +
-                "OR EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
+                "CASE WHEN EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
                 "WHERE tl.item = i.id AND t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD')) " +
-                "OR i.createddate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') " +
                 "THEN 'Y' ELSE 'N' END AS live${extra} " +
                 "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN (${ACTIVE_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) " +
                 byKey + "ORDER BY i.id").toString()
