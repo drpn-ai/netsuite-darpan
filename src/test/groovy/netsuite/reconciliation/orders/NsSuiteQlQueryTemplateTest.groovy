@@ -1299,9 +1299,11 @@ class NsSuiteQlQueryTemplateTest {
     // items added after the first R22 run matched 110 HotWax products (packaging) to nothing.
     private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
             "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
-            // Aditi 2026-10-29: "the item must have been used within the last year in NS": a transaction line in 365 days.
+            // Aditi 2026-10-29: "the item must have been used within the last year in NS", on what HotWax sees: "The order you
+            // found is not expected to sync to HW... so the item will never come to HW either" (PKG109, a gifting SalesOrd).
             "CASE WHEN EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
-            "WHERE tl.item = i.id AND t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD')) " +
+            "WHERE tl.item = i.id AND t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') " +
+            "AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL) OR t.type = 'TrnfrOrd')) " +
             "THEN 'Y' ELSE 'N' END AS live " +
             "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit', 'NonInvtPart') "
 
