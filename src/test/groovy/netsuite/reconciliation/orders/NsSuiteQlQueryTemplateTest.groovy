@@ -1309,8 +1309,8 @@ class NsSuiteQlQueryTemplateTest {
     private static Map<String, Object> activeItemsSpec(Map<String, Object> overrides = [:], List<String> columns = ["id", "itemid", "live"]) {
         int seq = 0
         return NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "item", fromTable: "item",
-                queryTemplate: "ACTIVE_ITEMS", joinKeyFieldName: "id"] + overrides,
-                columns.collect { [recordFieldName: it, sourceColumn: it, sequenceNum: ++seq] as Map<String, Object> })
+                queryTemplate: "ACTIVE_ITEMS", joinKeyFieldName: "field1"] + overrides,
+                columns.collect { [recordFieldName: "field${++seq}".toString(), sourceColumn: it, sequenceNum: seq] as Map<String, Object> })
     }
 
     @Test
@@ -1329,7 +1329,7 @@ class NsSuiteQlQueryTemplateTest {
     @Test
     void activeItemsReadByKey() {
         Map<String, Object> s = activeItemsSpec()
-        s.lookupKeyField = "id"
+        s.lookupKeyField = "field1"
         s.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["43429", "42808"], s)
         assertEquals(ACTIVE_ITEMS_SQL + "AND i.id IN ('43429', '42808') ORDER BY i.id",
                 NsSuiteQlOrderSupport.buildRecordsQuery(s, null, null, "2026-10-28"))
@@ -1341,9 +1341,20 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(e.message.contains("ACTIVE_ITEMS reads the item table, so fromTable must be item"), e.message)
     }
 
+    // Aditi 2026-10-29 on 193-102-G: gorjana's own "Active Status" (custitem1) says Discontinued. A tenant's item column rides
+    // along after the template's columns; the shapes the vetted SQL uses stay fixed.
     @Test
-    void activeItemsFieldsMustBeTemplateColumns() {
-        IllegalArgumentException e = assertThrows(IllegalArgumentException) { activeItemsSpec([:], ["id", "custitem_x"]) }
-        assertTrue(e.message.contains("id, itemid, itemtype, created, stock, live"), e.message)
+    void activeItemsCarriesATenantsOwnItemColumns() {
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec([:], ["id", "itemid", "live", "BUILTIN.DF(custitem1) AS activestatus"]),
+                null, null, "2026-10-28")
+        assertTrue(sql.contains("THEN 'Y' ELSE 'N' END AS live, BUILTIN.DF(i.custitem1) AS activestatus FROM item i"), sql)
+        String bare = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec([:], ["id", "custitem1"]), null, null, "2026-10-28")
+        assertTrue(bare.contains("END AS live, i.custitem1 FROM item i"), bare)
+    }
+
+    @Test
+    void activeItemsStillRefusesAnUnsafeColumn() {
+        assertThrows(IllegalArgumentException) { activeItemsSpec([:], ["id", "custitem1) OR (1=1"]) }
+        assertThrows(IllegalArgumentException) { activeItemsSpec([:], ["id", "(SELECT 1 FROM employee)"]) }
     }
 }

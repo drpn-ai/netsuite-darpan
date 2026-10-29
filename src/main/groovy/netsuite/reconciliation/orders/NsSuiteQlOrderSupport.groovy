@@ -255,13 +255,8 @@ class NsSuiteQlOrderSupport {
             if (fromTable != "item") {
                 throw new IllegalArgumentException("queryTemplate ${queryTemplate} reads the item table, so fromTable must be item, got: ${fromTable}")
             }
-            // The template's columns are fixed; a field can only pick one of them.
-            normalized.each { Map<String, Object> f ->
-                if (!ACTIVE_ITEM_COLUMNS.contains(((String) f.get("sourceColumn")).trim())) {
-                    throw new IllegalArgumentException("${TEMPLATE_ACTIVE_ITEMS} fields name its columns " +
-                            "(${ACTIVE_ITEM_COLUMNS.join(', ')}); ${f.get('recordFieldName')} maps to: ${f.get('sourceColumn')}")
-                }
-            }
+            // The template's own columns are fixed; any other field is one of the tenant's item columns (gorjana's Active
+            // Status, custitem1), already checked by requireColumnExpression above and emitted after the template's.
         }
 
         // Read through containsKey, never a bare get: the row may be a Moqui EntityValue, whose get()
@@ -1237,13 +1232,21 @@ class NsSuiteQlOrderSupport {
         requireIsoDate(asOfDate, "asOfDate")
         String cutoff = java.time.LocalDate.parse(asOfDate).minusDays(ACTIVE_ITEM_DAYS).toString()
         String byKey = spec.get("lookupKeys") ? population(spec, null, null, null, "i") : ""
+        StringBuilder extra = new StringBuilder()
+        for (Map<String, Object> f : (List<Map<String, Object>>) spec.get("fields")) {
+            String c = ((String) f.get("sourceColumn")).trim()
+            if (ACTIVE_ITEM_COLUMNS.contains(c)) continue
+            // A tenant's own column, qualified with the item alias: custitem1 -> i.custitem1, BUILTIN.DF(custitem1) AS x ->
+            // BUILTIN.DF(i.custitem1) AS x.
+            extra.append(", ").append(IDENTIFIER.matcher(c).matches() ? "i." + c : c.replaceFirst(/\(\s*([A-Za-z_]\w*)\s*([,)])/, '(i.$1$2'))
+        }
         return ("SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
                 "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
                 "CASE WHEN EXISTS (SELECT 1 FROM aggregateItemLocation a WHERE a.item = i.id AND a.quantityonhand <> 0) " +
                 "OR EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
                 "WHERE tl.item = i.id AND t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD')) " +
                 "OR i.createddate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') " +
-                "THEN 'Y' ELSE 'N' END AS live " +
+                "THEN 'Y' ELSE 'N' END AS live${extra} " +
                 "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN (${ACTIVE_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) " +
                 byKey + "ORDER BY i.id").toString()
     }
