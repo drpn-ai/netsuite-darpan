@@ -109,6 +109,8 @@
             <parameter name="joinKeyFieldName"/>
             <parameter name="originFieldName"/>
             <parameter name="lineKeyColumn"/>
+            <parameter name="usedTransactionTypes"><description>DAR-BE-157. ACTIVE_ITEMS only: the order types whose lines make an
+                item used (SalesOrd, TrnfrOrd, PurchOrd; blank = all).</description></parameter>
             <parameter name="matchRules" type="Object"><description>DAR-UI-064. RECORDS_MATCHING conditions: a list (or its
                 JSON) of {fieldId, op IN/GT/NOT_EMPTY/STARTS_WITH, values}. Validated by normalizeSpec like every other field.</description></parameter>
             <parameter name="isActive" type="Boolean" default-value="true"/>

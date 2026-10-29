@@ -45,6 +45,8 @@ class NsSuiteQlQueryFacadeSupport {
             // DAR-UI-064: a RECORDS_MATCHING query's conditions, JSON [{fieldId, op, values}]. The entity has carried
             // it since DAR-UI-050; without it here a query written in the app could not say which records it reads.
             "matchRules",
+            // DAR-BE-157: ACTIVE_ITEMS, the order types whose lines make an item used (blank = all).
+            "usedTransactionTypes",
     ]
 
     /** DAR-UI-064: what the query editor offers. normalizeSpec still decides; these are the editor's choices. */

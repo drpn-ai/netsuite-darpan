@@ -1319,8 +1319,8 @@ class NsSuiteQlQueryTemplateTest {
 
     // The item read: every non-inactive stock item, kit and non-inventory item. Whether NetSuite used it for HotWax is read
     // apart (ACTIVE_ITEMS_USED_SQL) and joined in the extract: as one query, the per-item test timed out at 180 s a page.
-    private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
-            "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock " +
+    // No stock: nothing reads it since live stopped counting it, and its per-item sub-select was a quarter of the read.
+    private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created " +
             "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit', 'NonInvtPart') "
 
     private static Map<String, Object> activeItemsSpec(Map<String, Object> overrides = [:], List<String> columns = ["id", "itemid", "live"]) {
@@ -1364,9 +1364,9 @@ class NsSuiteQlQueryTemplateTest {
     void activeItemsCarriesATenantsOwnItemColumns() {
         String sql = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec([:], ["id", "itemid", "live", "BUILTIN.DF(custitem1) AS activestatus"]),
                 null, null, "2026-10-28")
-        assertTrue(sql.contains("AS stock, BUILTIN.DF(i.custitem1) AS activestatus FROM item i"), sql)
+        assertTrue(sql.contains("AS created, BUILTIN.DF(i.custitem1) AS activestatus FROM item i"), sql)
         String bare = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec([:], ["id", "custitem1"]), null, null, "2026-10-28")
-        assertTrue(bare.contains("AS stock, i.custitem1 FROM item i"), bare)
+        assertTrue(bare.contains("AS created, i.custitem1 FROM item i"), bare)
     }
 
     @Test
@@ -1388,6 +1388,28 @@ class NsSuiteQlQueryTemplateTest {
         s.lookupKeyField = "field1"
         s.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["43429"], s)
         assertTrue(NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(s, "2026-10-28").contains("AND tl.item IN ('43429') ORDER BY"))
+    }
+
+    // Aditi 2026-10-29 (the daily run must not take long): the year of HotWax sales-order lines is 447 s of a 13-minute run
+    // on gorjana; transfer and purchase orders alone are 19 s. An item on a HotWax sales order was in HotWax (HotWax made the
+    // order), so the daily run's question, "never reached HotWax", loses nothing without them.
+    @Test
+    void aQueryMayCountUseOnSomeOrderTypesOnly() {
+        String used = NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec([usedTransactionTypes: "TrnfrOrd, PurchOrd"]), "2026-10-28")
+        assertTrue(used.contains("WHERE t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') AND t.type IN ('TrnfrOrd', 'PurchOrd') ORDER BY tl.item"), used)
+        assertTrue(NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec([usedTransactionTypes: "SalesOrd"]), "2026-10-28")
+                .contains("AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL)) ORDER BY"), "a sales order still counts only when HotWax sent it")
+        assertEquals(NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec(), "2026-10-28"),
+                NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec([usedTransactionTypes: "SalesOrd,TrnfrOrd,PurchOrd"]), "2026-10-28"),
+                "blank means all three")
+        IllegalArgumentException e = assertThrows(IllegalArgumentException) { activeItemsSpec([usedTransactionTypes: "CashSale"]) }
+        assertTrue(e.message.contains("usedTransactionTypes"), e.message)
+        assertThrows(IllegalArgumentException) { activeItemsSpec([usedTransactionTypes: "TrnfrOrd') OR ('1'='1"]) }
+        IllegalArgumentException other = assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction",
+                    dateColumn: "trandate", usedTransactionTypes: "TrnfrOrd"], [[recordFieldName: "id", sourceColumn: "id", sequenceNum: 1]])
+        }
+        assertTrue(other.message.contains("only meaningful on ACTIVE_ITEMS"), other.message)
     }
 
     @Test

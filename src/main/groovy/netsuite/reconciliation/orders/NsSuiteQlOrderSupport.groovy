@@ -116,12 +116,12 @@ class NsSuiteQlOrderSupport {
      */
     static final String TEMPLATE_SALES_LINES = "SALES_LINES"
     /**
-     * DAR-BE-157. Every non-inactive stock item, kit and non-inventory item, whatever its age, with a live flag: used, i.e. on
-     * a HotWax order line or a transfer order line, in the last ACTIVE_ITEM_DAYS (Aditi 2026-10-29: "the item must have
-     * been used within the last year in NS"). Stock on hand is read for the record, not for the flag. Not windowed: presence is a whole-catalogue
-     * question, so a product missing since August never falls inside a day's window. Quiet items are still read (live
-     * N) so a run can exclude them and its conclusions can still say why HotWax has one. Proven on gorjana 2026-10-28:
-     * 9,085 stock items and kits, ~31 s a 1,000-row page. NonInvtPart is read too: HotWax sells 110 of them (packaging,
+     * DAR-BE-157. Every non-inactive stock item, kit and non-inventory item, whatever its age, with a live flag: new, or used,
+     * i.e. on a HotWax order line, a transfer order line or a purchase order line, in the last ACTIVE_ITEM_DAYS (Aditi
+     * 2026-10-29: "the item must have been used within the last year in NS"); usedTransactionTypes narrows which. Not
+     * windowed: presence is a whole-catalogue question, so a product missing since August never falls inside a day's window.
+     * Quiet items are still read (live N) so a run can exclude them and its conclusions can still say why HotWax has one.
+     * Proven on gorjana 2026-10-29: 9,312 items in 10 s. NonInvtPart is read too: HotWax sells 110 of them (packaging,
      * glue dots) as finished goods, which matched nothing without it; the rest are NetSuite's own accounting lines.
      */
     static final String TEMPLATE_ACTIVE_ITEMS = "ACTIVE_ITEMS"
@@ -139,7 +139,13 @@ class NsSuiteQlOrderSupport {
      * days is live before anything uses it; purchase orders count as use, since HotWax receives them.
      */
     static final int NEW_ITEM_DAYS = 90
-    private static final List<String> ACTIVE_ITEM_COLUMNS = ["id", "itemid", "itemtype", "created", "stock", "live"].asImmutable()
+    /**
+     * The order types whose lines make an item used (usedTransactionTypes; blank = all). SalesOrd counts only an order HotWax
+     * sent. Measured on gorjana 2026-10-29: the year of HotWax sales-order lines is 447 s, transfer and purchase orders 19 s,
+     * so a daily run counts those two and leaves the sales orders to a weekly one.
+     */
+    static final List<String> ACTIVE_ITEM_USE_TYPES = ["SalesOrd", "TrnfrOrd", "PurchOrd"].asImmutable()
+    private static final List<String> ACTIVE_ITEM_COLUMNS = ["id", "itemid", "itemtype", "created", "live"].asImmutable()
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
              TEMPLATE_LINKED_CHILD_PRESENT, TEMPLATE_LINKED_CHILD_EXCUSED, TEMPLATE_RECORDS_MATCHING, TEMPLATE_STATE_CONTRADICTION,
@@ -270,6 +276,15 @@ class NsSuiteQlOrderSupport {
             }
             // The template's own columns are fixed; any other field is one of the tenant's item columns (gorjana's Active
             // Status, custitem1), already checked by requireColumnExpression above and emitted after the template's.
+        }
+        // Guarded like lineKeyColumn: an EntityValue whose entity predates the column throws on a bare get.
+        String usedTypesText = query.containsKey("usedTransactionTypes") ? text(query.get("usedTransactionTypes")) : null
+        List<String> usedTransactionTypes = usedTypesText ? usedTypesText.split(",")*.trim().findAll { it } as List<String> : ACTIVE_ITEM_USE_TYPES
+        if (usedTypesText && queryTemplate != TEMPLATE_ACTIVE_ITEMS) {
+            throw new IllegalArgumentException("usedTransactionTypes is only meaningful on ${TEMPLATE_ACTIVE_ITEMS}; queryTemplate is ${queryTemplate}")
+        }
+        if (!usedTransactionTypes || !ACTIVE_ITEM_USE_TYPES.containsAll(usedTransactionTypes)) {
+            throw new IllegalArgumentException("usedTransactionTypes must be some of ${ACTIVE_ITEM_USE_TYPES}, got: ${usedTypesText}")
         }
 
         // Read through containsKey, never a bare get: the row may be a Moqui EntityValue, whose get()
@@ -510,6 +525,7 @@ class NsSuiteQlOrderSupport {
                 minAmount                 : minAmount,
                 overdueExcludedShipMethods: overdueExcludedShipMethods,
                 lineKeyColumn             : lineKeyColumn,
+                usedTransactionTypes      : usedTransactionTypes,
                 omsStatusConfigId         : omsStatusConfigId,
                 omsStatusKeyField         : omsStatusKeyField,
         ] as Map<String, Object>
@@ -1256,25 +1272,28 @@ class NsSuiteQlOrderSupport {
             // BUILTIN.DF(i.custitem1) AS x.
             extra.append(", ").append(IDENTIFIER.matcher(c).matches() ? "i." + c : c.replaceFirst(/\(\s*([A-Za-z_]\w*)\s*([,)])/, '(i.$1$2'))
         }
-        return ("SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
-                "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock${extra} " +
+        return ("SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created${extra} " +
                 "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN (${ACTIVE_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) " +
                 byKey + "ORDER BY i.id").toString()
     }
 
     /**
      * DAR-BE-157: the items NetSuite used for HotWax in the last ACTIVE_ITEM_DAYS: a line on a sales order HotWax sent (it
-     * carries the HotWax order id), a transfer order or a purchase order (HotWax imports and receives both). Read by key,
-     * narrowed to those items.
+     * carries the HotWax order id), a transfer order or a purchase order (HotWax imports and receives both), as many of those
+     * as the query's usedTransactionTypes names. Read by key, narrowed to those items.
      */
     static String buildActiveItemsUsedQuery(Map<String, Object> spec, String asOfDate) {
         requireIsoDate(asOfDate, "asOfDate")
         String cutoff = java.time.LocalDate.parse(asOfDate).minusDays(ACTIVE_ITEM_DAYS).toString()
         List<String> keys = (List<String>) spec.get("lookupKeys")
         String byKey = keys ? "AND tl.item IN (${keys.collect { "'${it}'" }.join(', ')}) ".toString() : ""
+        List<String> types = (List<String>) (spec.get("usedTransactionTypes") ?: ACTIVE_ITEM_USE_TYPES)
+        List<String> others = types.findAll { it != "SalesOrd" }
+        List<String> uses = (types.contains("SalesOrd") ? ["(t.type = 'SalesOrd' AND t.${HOTWAX_ORDER_ID_COLUMN} IS NOT NULL)".toString()] : []) +
+                (others ? ["t.type IN (${others.collect { "'${it}'" }.join(', ')})".toString()] : [])
+        String use = uses.size() == 1 && !types.contains("SalesOrd") ? uses[0] : "(${uses.join(' OR ')})"
         return ("SELECT DISTINCT tl.item AS item FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
-                "WHERE t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') " +
-                "AND ((t.type = 'SalesOrd' AND t.${HOTWAX_ORDER_ID_COLUMN} IS NOT NULL) OR t.type IN ('TrnfrOrd', 'PurchOrd')) " +
+                "WHERE t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') AND ${use} " +
                 byKey + "ORDER BY tl.item").toString()
     }
 

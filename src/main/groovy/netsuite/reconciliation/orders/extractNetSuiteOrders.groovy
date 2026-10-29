@@ -147,6 +147,8 @@ try {
              // Guarded: EntityValue.get THROWS on a field the entity does not declare, and a
              // deployment whose entity predates lineKeyColumn must keep running every other check.
              lineKeyColumn         : queryRow.isField("lineKeyColumn") ? queryRow.get("lineKeyColumn") : null,
+             // DAR-BE-157. ACTIVE_ITEMS: which order types make an item used; guarded the same way.
+             usedTransactionTypes  : queryRow.isField("usedTransactionTypes") ? queryRow.get("usedTransactionTypes") : null,
              // DAR-UI-050. A lifecycle stage's exceptions; guarded the same way for an entity that predates them.
              waiveRules            : queryRow.isField("waiveRules") ? queryRow.get("waiveRules") : null,
              // DAR-UI-050. A written finding's conditions.
