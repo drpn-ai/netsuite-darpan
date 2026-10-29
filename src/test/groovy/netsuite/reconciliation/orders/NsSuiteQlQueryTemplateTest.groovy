@@ -1295,16 +1295,10 @@ class NsSuiteQlQueryTemplateTest {
 
     // ------------------------------------------------- ACTIVE_ITEMS (DAR-BE-157)
 
-    // The text proven on gorjana prod 2026-10-28 (stock items and kits: 9,085 rows in 10 pages, ~31 s a page); non-inventory
-    // items added after the first R22 run matched 110 HotWax products (packaging) to nothing.
+    // The item read: every non-inactive stock item, kit and non-inventory item. Whether NetSuite used it for HotWax is read
+    // apart (ACTIVE_ITEMS_USED_SQL) and joined in the extract: as one query, the per-item test timed out at 180 s a page.
     private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
-            "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
-            // Aditi 2026-10-29: "the item must have been used within the last year in NS", on what HotWax sees: "The order you
-            // found is not expected to sync to HW... so the item will never come to HW either" (PKG109, a gifting SalesOrd).
-            "CASE WHEN EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
-            "WHERE tl.item = i.id AND t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') " +
-            "AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL) OR t.type = 'TrnfrOrd')) " +
-            "THEN 'Y' ELSE 'N' END AS live " +
+            "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock " +
             "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit', 'NonInvtPart') "
 
     private static Map<String, Object> activeItemsSpec(Map<String, Object> overrides = [:], List<String> columns = ["id", "itemid", "live"]) {
@@ -1348,14 +1342,51 @@ class NsSuiteQlQueryTemplateTest {
     void activeItemsCarriesATenantsOwnItemColumns() {
         String sql = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec([:], ["id", "itemid", "live", "BUILTIN.DF(custitem1) AS activestatus"]),
                 null, null, "2026-10-28")
-        assertTrue(sql.contains("THEN 'Y' ELSE 'N' END AS live, BUILTIN.DF(i.custitem1) AS activestatus FROM item i"), sql)
+        assertTrue(sql.contains("AS stock, BUILTIN.DF(i.custitem1) AS activestatus FROM item i"), sql)
         String bare = NsSuiteQlOrderSupport.buildRecordsQuery(activeItemsSpec([:], ["id", "custitem1"]), null, null, "2026-10-28")
-        assertTrue(bare.contains("END AS live, i.custitem1 FROM item i"), bare)
+        assertTrue(bare.contains("AS stock, i.custitem1 FROM item i"), bare)
     }
 
     @Test
     void activeItemsStillRefusesAnUnsafeColumn() {
         assertThrows(IllegalArgumentException) { activeItemsSpec([:], ["id", "custitem1) OR (1=1"]) }
         assertThrows(IllegalArgumentException) { activeItemsSpec([:], ["id", "(SELECT 1 FROM employee)"]) }
+    }
+
+    // Aditi 2026-10-29: "the item must have been used within the last year in NS", on what HotWax sees ("The order you found
+    // is not expected to sync to HW... so the item will never come to HW either": PKG109, a gifting sales order). Proven on
+    // gorjana prod: 3,757 items, four pages, each well inside the 180 s limit.
+    @Test
+    void theUsedItemsAreHotWaxOrderAndTransferOrderLinesOfTheYear() {
+        assertEquals("SELECT DISTINCT tl.item AS item FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
+                "WHERE t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') " +
+                "AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL) OR t.type IN ('TrnfrOrd', 'PurchOrd')) ORDER BY tl.item",
+                NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec(), "2026-10-28"))
+        Map<String, Object> s = activeItemsSpec()
+        s.lookupKeyField = "field1"
+        s.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["43429"], s)
+        assertTrue(NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(s, "2026-10-28").contains("AND tl.item IN ('43429') ORDER BY"))
+    }
+
+    @Test
+    void theStreamMarksAnItemLiveWhenNetSuiteUsedItForHotWax() {
+        Map<String, Object> spec = activeItemsSpec([:], ["id", "itemid", "live"])
+        List<String> asked = []
+        StringWriter out = new StringWriter()
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: spec, asOfDate: "2026-10-28",
+                filterRules: [[sequenceNum: 1, fieldExpression: "field3", operator: "EXCLUDE_IN", filterValues: "N"]]],
+                { String q, int limit, int offset ->
+                    asked << q
+                    return q.startsWith("SELECT DISTINCT tl.item")
+                            ? [items: [[item: "42808"]], hasMore: false]
+                            : [items: [[id: "42808", itemid: "PKG403", created: "2026-07-07"], [id: "10211", itemid: "PKG109", created: "2017-12-26"],
+                                       [id: "43649", itemid: "271-010-185-G", created: "2026-10-27"]], hasMore: false]
+                })
+        Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        // Aditi 2026-10-29: "dont miss out on recent new products in NS... new products in NS didnt make it HC in time and the
+        // PO came first": an item created in the last NEW_ITEM_DAYS is live before anything uses it.
+        assertEquals([[field1: "42808", field2: "PKG403", field3: "Y"], [field1: "43649", field2: "271-010-185-G", field3: "Y"]], doc.records,
+                "PKG109 is not live, so the run's filter drops it")
+        assertTrue(asked[0].startsWith("SELECT DISTINCT tl.item"), "the used items are read first")
     }
 }

@@ -133,6 +133,12 @@ class NsSuiteQlOrderSupport {
      * its item to HotWax. The column is the HotWax integration's own, on every tenant it serves.
      */
     static final String HOTWAX_ORDER_ID_COLUMN = "custbody_hc_order_id"
+    /**
+     * Aditi 2026-10-29: "dont miss out on recent new products in NS... the gap we are looking into is primarily that new
+     * products in NS didnt make it HC in time and the PO came first, causing the PO to fail". An item created in these
+     * days is live before anything uses it; purchase orders count as use, since HotWax receives them.
+     */
+    static final int NEW_ITEM_DAYS = 90
     private static final List<String> ACTIVE_ITEM_COLUMNS = ["id", "itemid", "itemtype", "created", "stock", "live"].asImmutable()
     private static final List<String> QUERY_TEMPLATES =
             [TEMPLATE_RECORDS, TEMPLATE_LINKED_CHILD_ABSENT, TEMPLATE_LINKED_CHILD_PRESENT_ABSENT,
@@ -1234,10 +1240,13 @@ class NsSuiteQlOrderSupport {
         return qualifier && column ==~ /\w+/ ? "${qualifier}.${column}".toString() : column
     }
 
-    /** DAR-BE-157: ACTIVE_ITEMS. No window; the cutoff counts ACTIVE_ITEM_DAYS back from asOfDate (the tenant's today). */
+    /**
+     * DAR-BE-157: ACTIVE_ITEMS, the item read. No window. Its live flag is not computed here: whether NetSuite used an item
+     * for HotWax is read apart (buildActiveItemsUsedQuery) and set by streamOrdersToWriter. As one query, the per-item test
+     * timed out at 180 s a page on gorjana; as two, the used-items read is four pages well inside it.
+     */
     static String buildActiveItemsQuery(Map<String, Object> spec, String asOfDate) {
         requireIsoDate(asOfDate, "asOfDate")
-        String cutoff = java.time.LocalDate.parse(asOfDate).minusDays(ACTIVE_ITEM_DAYS).toString()
         String byKey = spec.get("lookupKeys") ? population(spec, null, null, null, "i") : ""
         StringBuilder extra = new StringBuilder()
         for (Map<String, Object> f : (List<Map<String, Object>>) spec.get("fields")) {
@@ -1248,13 +1257,32 @@ class NsSuiteQlOrderSupport {
             extra.append(", ").append(IDENTIFIER.matcher(c).matches() ? "i." + c : c.replaceFirst(/\(\s*([A-Za-z_]\w*)\s*([,)])/, '(i.$1$2'))
         }
         return ("SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created, " +
-                "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock, " +
-                "CASE WHEN EXISTS (SELECT 1 FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
-                "WHERE tl.item = i.id AND t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') " +
-                "AND ((t.type = 'SalesOrd' AND t.${HOTWAX_ORDER_ID_COLUMN} IS NOT NULL) OR t.type = 'TrnfrOrd')) " +
-                "THEN 'Y' ELSE 'N' END AS live${extra} " +
+                "(SELECT SUM(a.quantityonhand) FROM aggregateItemLocation a WHERE a.item = i.id) AS stock${extra} " +
                 "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN (${ACTIVE_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) " +
                 byKey + "ORDER BY i.id").toString()
+    }
+
+    /**
+     * DAR-BE-157: the items NetSuite used for HotWax in the last ACTIVE_ITEM_DAYS: a line on a sales order HotWax sent (it
+     * carries the HotWax order id), a transfer order or a purchase order (HotWax imports and receives both). Read by key,
+     * narrowed to those items.
+     */
+    static String buildActiveItemsUsedQuery(Map<String, Object> spec, String asOfDate) {
+        requireIsoDate(asOfDate, "asOfDate")
+        String cutoff = java.time.LocalDate.parse(asOfDate).minusDays(ACTIVE_ITEM_DAYS).toString()
+        List<String> keys = (List<String>) spec.get("lookupKeys")
+        String byKey = keys ? "AND tl.item IN (${keys.collect { "'${it}'" }.join(', ')}) ".toString() : ""
+        return ("SELECT DISTINCT tl.item AS item FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
+                "WHERE t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') " +
+                "AND ((t.type = 'SalesOrd' AND t.${HOTWAX_ORDER_ID_COLUMN} IS NOT NULL) OR t.type IN ('TrnfrOrd', 'PurchOrd')) " +
+                byKey + "ORDER BY tl.item").toString()
+    }
+
+    /** Created in the last NEW_ITEM_DAYS: a new item is live before anything uses it (it must reach HotWax first). */
+    static boolean isNewItem(Object created, String asOfDate) {
+        String day = created?.toString()?.trim()
+        if (!(day ==~ /\d{4}-\d{2}-\d{2}/) || !asOfDate) return false
+        return !java.time.LocalDate.parse(day).isBefore(java.time.LocalDate.parse(asOfDate).minusDays(NEW_ITEM_DAYS))
     }
 
     /** The records a query reads: its window, or, read by key, the records whose key column holds one of lookupKeys. */
@@ -1433,6 +1461,20 @@ class NsSuiteQlOrderSupport {
         return s ? s : null
     }
 
+    /** Every item id the used-items query names, paged to its end. */
+    private static Set<String> readUsedItems(Map<String, Object> spec, String asOfDate, int pageSize, Closure pageFetcher) {
+        String used = buildActiveItemsUsedQuery(spec, asOfDate)
+        Set<String> ids = new HashSet<String>()
+        int offset = 0
+        while (true) {
+            Map page = (Map) pageFetcher.call(used, pageSize, offset)
+            List items = (List) (page?.get("items") ?: [])
+            for (Object it : items) ids.add(String.valueOf(((Map) it).get("item")))
+            if (!(page?.get("hasMore") == true) || items.isEmpty()) return ids
+            offset += pageSize
+        }
+    }
+
     /**
      * Streams one window to `writer` as {"records":[...],"metadata":{...}} — records first so pages
      * are appended as they arrive and the counts are written once at the end. That ordering is the
@@ -1471,12 +1513,19 @@ class NsSuiteQlOrderSupport {
         int offset = 0
         boolean hasMore = true
 
+        // DAR-BE-157: ACTIVE_ITEMS reads the items NetSuite used for HotWax first; each item row is then live Y or N.
+        Set<String> usedItems = spec.get("queryTemplate") == TEMPLATE_ACTIVE_ITEMS ? readUsedItems(spec, asOfDate, pageSize, pageFetcher) : null
         writer.write('{"records":[')
         while (hasMore && pageCount < maxPages) {
             Map page = (Map) pageFetcher.call(query, pageSize, offset)
             pageCount++
             List<Map<String, Object>> mapped = ((List) (page?.get("items") ?: [])).collect { Object rawRow ->
-                mapRowToRecord(spec, (Map<String, Object>) rawRow) } as List<Map<String, Object>>
+                Map<String, Object> row = (Map<String, Object>) rawRow
+                if (usedItems != null) {
+                    row = new LinkedHashMap<String, Object>(row)
+                    row.put("live", usedItems.contains(String.valueOf(row.get("id"))) || isNewItem(row.get("created"), asOfDate) ? "Y" : "N")
+                }
+                mapRowToRecord(spec, row) } as List<Map<String, Object>>
             // DAR-BE-111. A page at a time, before the rules, so a rule or a conclusion can read what it adds (the HotWax
             // status). It throws rather than leave records half answered.
             if (pageEnricher != null && mapped) pageEnricher.call(mapped)
