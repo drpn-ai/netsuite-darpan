@@ -1285,12 +1285,16 @@ class NsSuiteQlOrderSupport {
         return !java.time.LocalDate.parse(day).isBefore(java.time.LocalDate.parse(asOfDate).minusDays(NEW_ITEM_DAYS))
     }
 
-    /** The records a query reads: its window, or, read by key, the records whose key column holds one of lookupKeys. */
+    /**
+     * The records a query reads: its window, or, read by key, the records whose key column holds one of lookupKeys. DAR-BE-156:
+     * lookupWithinWindow keeps the window as well (an audit re-check), so the date index bounds the read, not a scan of history.
+     */
     private static String population(Map<String, Object> spec, String dateColumn, String fromDate, String toDate, String qualifier) {
         List<String> keys = (List<String>) spec.get("lookupKeys")
-        if (keys) return "AND ${keyColumn(spec, qualifier)} IN (${keys.collect { "'${it}'" }.join(', ')}) ".toString()
+        String byKey = keys ? "AND ${keyColumn(spec, qualifier)} IN (${keys.collect { "'${it}'" }.join(', ')}) ".toString() : ""
+        if (keys && !(spec.get("lookupWithinWindow") && fromDate && toDate)) return byKey
         String column = qualifier ? "${qualifier}.${dateColumn}" : dateColumn
-        return ("AND ${column} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
+        return (byKey + "AND ${column} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
                 "AND ${column} < TO_DATE('${toDate}', 'YYYY-MM-DD') ").toString()
     }
 

@@ -957,6 +957,28 @@ class NsSuiteQlQueryTemplateTest {
                 .contains("AND REPLACE(custbody_hc_return_id, 'HG-', '') IN ('M259415') AND"))
     }
 
+    /**
+     * DAR-BE-156: an audit re-check reads its older findings' records by key AND within the check's own window, so it reads
+     * what the full read would, restricted to the keys. With the keys alone, gorjana's SALES_LINES matched custbody_hc_order_id
+     * across all of NetSuite's history: 99-121 s a page, and its linked-record columns timed out (3 x 180 s), every morning.
+     */
+    @Test
+    void aReadByKeyWithinTheWindowKeepsTheDateBoundsAsWellAsTheKeys() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "NS_SO_SHIPPED_LINES", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id",
+                joinKeyFieldName: "orderId"],
+                [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                 [recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 2]])
+        s.lookupKeyField = "orderId"
+        s.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(["M1079504", "M1079893"], s)
+        s.lookupWithinWindow = true
+        String sql = NsSuiteQlOrderSupport.buildRecordsQuery(s, "2026-09-28", "2026-10-30")
+        assertTrue(sql.contains("AND t.custbody_hc_order_id IN ('M1079504', 'M1079893') AND t.trandate >= TO_DATE('2026-09-28', 'YYYY-MM-DD') " +
+                "AND t.trandate < TO_DATE('2026-10-30', 'YYYY-MM-DD') "), sql)
+        s.lookupWithinWindow = false
+        assertFalse(NsSuiteQlOrderSupport.buildRecordsQuery(s, null, null).contains("TO_DATE"), "a conclusion lookup keeps no window")
+    }
+
     // DAR-BE-095: "has a value" without reading it as a number. GT 0 on a free-text custom field makes NetSuite convert it,
     // and any scanned row that is not a number fails the whole search (400 "Invalid or unsupported search").
     @Test

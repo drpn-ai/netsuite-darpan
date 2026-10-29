@@ -73,6 +73,10 @@
             <parameter name="lookupKeyField">
                 <description>The record field lookupKeys are values of; one of the query's fields.</description>
             </parameter>
+            <parameter name="lookupWithinWindow" type="Boolean" default-value="false">
+                <description>DAR-BE-156. A read by key that also keeps windowStart/windowEnd: an audit re-check of its older
+                    findings reads what the check's full read would, restricted to the keys, so the date index bounds it.</description>
+            </parameter>
             <parameter name="outputLocation">
                 <description>Optional output directory. Defaults to runtime://datamanager/reconciliation-runs/{automationExecutionId}/{timestamp}/.</description>
             </parameter>

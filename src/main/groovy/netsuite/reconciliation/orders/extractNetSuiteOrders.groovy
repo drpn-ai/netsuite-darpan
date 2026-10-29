@@ -116,7 +116,8 @@ try {
     ).toString()
     // DAR-BE-118 / DAR-BE-119: a read by key names its records, so it has no window. DAR-BE-157: nor does a whole-catalogue
     // template, which reads every item whatever the run's window says.
-    if (!lookupKeys && !unwindowed) {
+    // DAR-BE-156: an audit re-check keeps its window as well (lookupWithinWindow).
+    if ((!lookupKeys || lookupWithinWindow) && !unwindowed) {
         fromDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowStart)
         thruDate = NsSuiteQlOrderSupport.toSuiteQlDate(windowEnd)
     }
@@ -159,6 +160,7 @@ try {
     if (lookupKeys) {
         querySpec.lookupKeyField = lookupKeyField
         querySpec.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(lookupKeys, querySpec)
+        querySpec.lookupWithinWindow = lookupWithinWindow == true
     }
 } catch (IllegalArgumentException e) {
     errors = [e.message]
