@@ -933,12 +933,17 @@ class NsSuiteQlOrderSupport {
                 "tl.quantitybilled AS quantity_billed, ${LINE_STATE_CASE} AS line_state, " +
                 // DAR-BE-093 (gorjana R3, "every store sale carries its store"): the line's location, so a conclusion can
                 // name a completed item NetSuite cannot ship because its line has no location.
-                "tl.location AS line_location "
+                "tl.location AS line_location, " +
+                // DAR-UI-099: the item and amount, so a line with no HotWax line id (a store-credit payment) can be named.
+                "BUILTIN.DF(tl.item) AS item_name, (-1 * tl.netamount) AS line_amount "
         sql << "FROM ${spec.get('fromTable')} t JOIN transactionline tl ON tl.transaction = t.id "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
         sql << population(spec, dateColumn, fromDate, toDate, "t")
         sql << "AND tl.mainline = 'F' "
-        sql << "AND tl.${lineKey} IS NOT NULL AND t.${joinKeyColumn} IS NOT NULL "
+        // DAR-UI-099 (Aditi: "in the case of store credit, a store credit line item is added"): NetSuite's payment lines
+        // ("Store Credit - Redemption") carry no HotWax line id. They are read so an order shows every line, and set aside
+        // by streamOrdersToWriter: never compared, never a finding.
+        sql << "AND (tl.${lineKey} IS NOT NULL OR tl.itemtype = '${UNKEYED_LINE_ITEM_TYPE}') AND t.${joinKeyColumn} IS NOT NULL "
         sql << "ORDER BY t.id, tl.id"
         return sql.toString()
     }
@@ -1161,7 +1166,14 @@ class NsSuiteQlOrderSupport {
             quantity_billed     : "quantityBilled",
             line_state          : "lineState",
             line_location       : "lineLocation",
+            item_name           : "itemName",
+            line_amount         : "lineAmount",
     ].asImmutable()
+
+    /** DAR-UI-099: the one kind of SALES_LINES line read with no HotWax line id, for context only. */
+    static final String UNKEYED_LINE_ITEM_TYPE = "Payment"
+    /** DAR-UI-099: how an unkeyed line is marked in the excluded-records sidecar (no tenant rule set it aside). */
+    static final Map UNKEYED_LINE_RULE = [sequenceNum: 0, fieldExpression: "orderLineId"].asImmutable()
 
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
         if (row == null) return [:]
@@ -1527,6 +1539,7 @@ class NsSuiteQlOrderSupport {
         List<String> warnings = []
         int recordCount = 0
         int excludedCount = 0
+        int unkeyedSetAside = 0
         Map<Integer, Integer> excludedByRuleCounts = [:]
         Map<Integer, Integer> fieldAbsentByRuleCounts = [:]
         // DAR-UI-044: what the rules drop, whole and before projection, for the conclude pass. A caller that passes its
@@ -1553,6 +1566,14 @@ class NsSuiteQlOrderSupport {
             // status). It throws rather than leave records half answered.
             if (pageEnricher != null && mapped) pageEnricher.call(mapped)
             for (Map<String, Object> record : mapped) {
+                // DAR-UI-099: a SALES_LINES line with no HotWax line id (a payment) is context for its order only: set
+                // aside before any rule, so it is neither compared nor counted as a tenant exclusion. SuiteQL leaves a
+                // null column out of the row, so an absent id is the same as a blank one.
+                if (spec.get("queryTemplate") == TEMPLATE_SALES_LINES && !record.get("orderLineId")?.toString()?.trim()) {
+                    unkeyedSetAside++
+                    ExcludedRecordsSidecar.collect(excludedCollector, record, UNKEYED_LINE_RULE)
+                    continue
+                }
                 // Exclusions run client-side because SuiteQL has no knowledge of tenant rules, and
                 // they run AFTER mapping so a rule names the reconciliation field an operator sees
                 // (orderOrigin), not the raw NetSuite column.
@@ -1596,6 +1617,7 @@ class NsSuiteQlOrderSupport {
                 excludedCount: excludedCount,
                 warnings     : warnings,
         ] as Map<String, Object>
+        if (unkeyedSetAside) metadata.unkeyedLinesSetAside = unkeyedSetAside
         // Absent entirely when no rules are configured, matching the OMS and Shopify getters: a
         // block that appeared on every extract would read as "this always applies".
         if (rules) {

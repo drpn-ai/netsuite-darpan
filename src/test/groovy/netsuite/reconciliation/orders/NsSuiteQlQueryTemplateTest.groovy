@@ -1137,13 +1137,13 @@ class NsSuiteQlQueryTemplateTest {
                 "tl.itemtype AS item_type, tl.quantitybilled AS quantity_billed, " +
                 "CASE WHEN tl.quantitybilled <> 0 THEN 'BILLED' WHEN tl.isclosed = 'T' THEN 'CLOSED' " +
                 "WHEN tl.quantityshiprecv <> 0 THEN 'SHIPPED' ELSE 'OPEN' END AS line_state, " +
-                "tl.location AS line_location " +
+                "tl.location AS line_location, BUILTIN.DF(tl.item) AS item_name, (-1 * tl.netamount) AS line_amount " +
                 "FROM transaction t JOIN transactionline tl ON tl.transaction = t.id " +
                 "WHERE t.type = 'SalesOrd' " +
                 "AND t.trandate >= TO_DATE('2026-09-15', 'YYYY-MM-DD') " +
                 "AND t.trandate < TO_DATE('2026-09-18', 'YYYY-MM-DD') " +
                 "AND tl.mainline = 'F' " +
-                "AND tl.custcol_hc_order_line_id IS NOT NULL AND t.custbody_hc_order_id IS NOT NULL " +
+                "AND (tl.custcol_hc_order_line_id IS NOT NULL OR tl.itemtype = 'Payment') AND t.custbody_hc_order_id IS NOT NULL " +
                 "ORDER BY t.id, tl.id", q)
     }
 
@@ -1178,6 +1178,34 @@ class NsSuiteQlQueryTemplateTest {
         assertEquals(1, c.total)
         assertEquals("1", ((Map) ExcludedRecordsSidecar.records(c)[0]).quantityBackordered, "the whole record, not the keepFields projection")
         assertEquals("1:quantityShipped", ((Map) ExcludedRecordsSidecar.records(c)[0])._excludedBy)
+    }
+
+    /**
+     * DAR-UI-099 (gorjana SO7365765 / M1205413): NetSuite adds "Store Credit - Redemption", a Payment line with no HotWax
+     * line id, for the 89.30 paid by store credit. It is read so the order shows every line, and set aside before any rule:
+     * never compared (it has no key), never counted as a tenant exclusion, kept whole in the sidecar. SuiteQL leaves its
+     * null line id out of the row.
+     */
+    @Test
+    void aStoreCreditPaymentLineIsSetAsideNeverCompared() {
+        StringWriter out = new StringWriter()
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
+                [spec: salesLinesSpec(), fromDate: "2026-10-31", toDate: "2026-11-01", pageSize: 10],
+                { String q, int limit, int offset ->
+                    [items: [[custbody_hc_order_id: "M1205413", tranid: "SO7365765", order_line_id: "01", item_type: "InvtPart",
+                              quantity_billed: "-1", line_state: "BILLED", item_name: "2311-104-67-G", line_amount: "82"],
+                             [custbody_hc_order_id: "M1205413", tranid: "SO7365765", item_type: "Payment", line_state: "OPEN",
+                              item_name: "Store Credit - Redemption", line_amount: "-89.3"]], hasMore: false]
+                })
+        List kept = (List) new groovy.json.JsonSlurper().parseText(out.toString()).records
+        assertEquals(["01"], kept*.orderLineId, "only the keyed line is compared")
+        Map c = (Map) result.excludedCollector
+        assertEquals(1, c.total)
+        Map setAside = (Map) ExcludedRecordsSidecar.records(c)[0]
+        assertEquals("Store Credit - Redemption", setAside.itemName)
+        assertEquals("-89.3", setAside.lineAmount)
+        assertEquals("0:orderLineId", setAside._excludedBy)
+        assertEquals(0, result.excludedCount, "not a tenant rule's exclusion")
     }
 
     /** DAR-BE-127: a read that fails mid-stream leaves the caller its collector, so the spill can still be discarded. */
