@@ -498,6 +498,21 @@ class NsSuiteQlOrderSupport {
                         "fields ${normalized.collect { it.get('recordFieldName') }}")
             }
         }
+        // DAR-BE-190. With the field naming the HotWax order ITEM as well, each record gets its item's status
+        // (omsItemStatusId) instead of the order's: an order stays approved while one line waits, so only the item says
+        // whether a shipped line reached HotWax. On SALES_LINES the template's own line key (orderLineId) names it.
+        String omsStatusLineKeyField = query.containsKey("omsStatusLineKeyField") ? text(query.get("omsStatusLineKeyField")) : null
+        if (omsStatusLineKeyField) {
+            if (!omsStatusKeyField) {
+                throw new IllegalArgumentException("omsStatusLineKeyField needs omsStatusKeyField: an item is named within its order")
+            }
+            boolean lineKey = queryTemplate == TEMPLATE_SALES_LINES && omsStatusLineKeyField == "orderLineId"
+            if (!lineKey && !normalized.any { it.get("recordFieldName") == omsStatusLineKeyField }) {
+                throw new IllegalArgumentException("omsStatusLineKeyField ${omsStatusLineKeyField} is not one of the mapped " +
+                        "record fields ${normalized.collect { it.get('recordFieldName') }}" +
+                        (queryTemplate == TEMPLATE_SALES_LINES ? " or the line key orderLineId" : ""))
+            }
+        }
 
         return [
                 stageReach            : stageReach,
@@ -528,6 +543,7 @@ class NsSuiteQlOrderSupport {
                 usedTransactionTypes      : usedTransactionTypes,
                 omsStatusConfigId         : omsStatusConfigId,
                 omsStatusKeyField         : omsStatusKeyField,
+                omsStatusLineKeyField     : omsStatusLineKeyField,
         ] as Map<String, Object>
     }
 

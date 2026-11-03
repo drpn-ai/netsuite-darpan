@@ -364,6 +364,30 @@ class NsSuiteQlOrderSupportTest {
             NsSuiteQlOrderSupport.normalizeSpec(base + [omsStatusConfigId: "rails_prod"], fields) }
     }
 
+    // DAR-BE-190 (gorjana: "if there is a HC order Id the fulfillment should be imported"): a line's HotWax item status
+    // needs the field naming the item as well as the order. On SALES_LINES that is the line key (orderLineId), which the
+    // template maps itself; elsewhere it must be a mapped field. It comes only with the order key.
+    @Test
+    void theOmsStatusLineKeyNamesTheItemAndComesWithTheOrderKey() {
+        Map lines = [nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "lastmodifieddate",
+                     queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id", joinKeyFieldName: "orderId"]
+        List fields = [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1]]
+        Map oms = [omsStatusConfigId: "gorjana_prod", omsStatusKeyField: "orderId"]
+
+        Map spec = NsSuiteQlOrderSupport.normalizeSpec(lines + oms + [omsStatusLineKeyField: "orderLineId"], fields)
+        assertEquals("orderLineId", spec.omsStatusLineKeyField)
+        assertNull(NsSuiteQlOrderSupport.normalizeSpec(lines + oms, fields).omsStatusLineKeyField)
+
+        assertThrows(IllegalArgumentException, {
+            NsSuiteQlOrderSupport.normalizeSpec(lines + [omsStatusLineKeyField: "orderLineId"], fields) }, "no order key, no item key")
+        assertThrows(IllegalArgumentException, {
+            NsSuiteQlOrderSupport.normalizeSpec(lines + oms + [omsStatusLineKeyField: "nope"], fields) }, "not a field of the record")
+        Map headers = [nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate"]
+        assertThrows(IllegalArgumentException, {
+            NsSuiteQlOrderSupport.normalizeSpec(headers + oms + [omsStatusLineKeyField: "orderLineId"], fields) },
+                "orderLineId is only the template's own field on SALES_LINES")
+    }
+
     @Test
     void writesRecordsFirstThenMetadataSoPagesCanBeAppended() {
         StringWriter out = new StringWriter()

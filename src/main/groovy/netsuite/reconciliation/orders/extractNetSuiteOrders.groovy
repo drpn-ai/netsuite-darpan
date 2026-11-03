@@ -157,7 +157,9 @@ try {
              stageReach            : queryRow.isField("stageReach") ? queryRow.get("stageReach") : null,
              // DAR-BE-111. Each record's HotWax status: the OMS config to ask and the field naming the order there.
              omsStatusConfigId     : queryRow.isField("omsStatusConfigId") ? queryRow.get("omsStatusConfigId") : null,
-             omsStatusKeyField     : queryRow.isField("omsStatusKeyField") ? queryRow.get("omsStatusKeyField") : null],
+             omsStatusKeyField     : queryRow.isField("omsStatusKeyField") ? queryRow.get("omsStatusKeyField") : null,
+             // DAR-BE-190. With the field naming the HotWax item too, each record gets its item's status instead.
+             omsStatusLineKeyField : queryRow.isField("omsStatusLineKeyField") ? queryRow.get("omsStatusLineKeyField") : null],
             queryFieldRows)
     if (lookupKeys) {
         querySpec.lookupKeyField = lookupKeyField
@@ -301,16 +303,31 @@ try {
     // statusId as omsStatusId, NOT_IN_OMS when HotWax has no such order. Asked by id, a page at a time, under the query
     // row's own tenant (the trusted run owner); a lookup that fails fails the extract rather than call orders missing.
     Closure omsStatusEnricher = null
+    // DAR-BE-190. With omsStatusLineKeyField, each record names a HotWax ITEM too and gets that item's statusId as
+    // omsItemStatusId: NOT_IN_OMS when HotWax returned no item of the order, NO_SUCH_ITEM when the order has others but
+    // not this one. One items read per page (withItems), in place of the orders read.
     if (querySpec.omsStatusConfigId) {
         String keyField = querySpec.omsStatusKeyField as String
+        String lineKeyField = querySpec.omsStatusLineKeyField as String
         omsStatusEnricher = { List<Map<String, Object>> records ->
             List<String> ids = records.collect { it.get(keyField)?.toString()?.trim() }.findAll { it }.unique()
             if (!ids) return
             Map looked = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
-                    .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: ids,
+                    .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: ids, withItems: lineKeyField as boolean,
                                  companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
             if (!(looked?.ok)) {
                 throw new IllegalStateException("HotWax order status lookup failed: ${(looked?.errors ?: ec.message.errors) as List}")
+            }
+            if (lineKeyField) {
+                Map itemStatusByKey = (Map) looked.itemStatusByKey
+                Set<String> missing = new HashSet<String>((looked.missingIds ?: []) as List<String>)
+                records.each { Map<String, Object> record ->
+                    String id = record.get(keyField)?.toString()?.trim()
+                    String seq = record.get(lineKeyField)?.toString()?.trim()
+                    if (!id || !seq) return
+                    record.put("omsItemStatusId", missing.contains(id) ? "NOT_IN_OMS" : (itemStatusByKey.get("${id}|${seq}".toString()) ?: "NO_SUCH_ITEM"))
+                }
+                return
             }
             Map statusByOrderId = (Map) looked.statusByOrderId
             records.each { Map<String, Object> record ->
