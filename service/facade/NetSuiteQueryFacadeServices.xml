@@ -183,4 +183,70 @@
             <set field="errors" from="ec.message.errors"/>
         </actions>
     </service>
+
+    <service verb="run" noun="NsSuiteQlAgentQuery" allow-remote="true" authenticate="true">
+        <description>DAR-CLI-003. Runs one fresh, read-only SuiteQL query a tenant user's agent wrote, through a NetSuite
+            connection the active tenant stores. One SELECT or WITH statement; 200 rows by default, 2,000 at most; the
+            connection's credentials are never returned. Every call is logged for the tenant.</description>
+        <in-parameters>
+            <parameter name="nsAuthConfigId" required="true"/>
+            <parameter name="sql" required="true"/>
+            <parameter name="limit" type="Integer"/>
+            <parameter name="offset" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="rows" type="List"/>
+            <parameter name="rowCount" type="Integer"/>
+            <parameter name="hasMore" type="Boolean"/>
+            <parameter name="nextOffset" type="Integer"/>
+            <parameter name="truncated" type="Boolean"/>
+            <parameter name="durationMs" type="Long"/>
+            <parameter name="code"/>
+            <parameter name="retryAfterSeconds" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="queryResult" from="netsuite.facade.NsAgentQuerySupport.runAgentQuery(ec, context)"/>
+            <set field="rows" from="queryResult?.rows"/>
+            <set field="rowCount" from="queryResult?.rowCount"/>
+            <set field="hasMore" from="queryResult?.hasMore"/>
+            <set field="nextOffset" from="queryResult?.nextOffset"/>
+            <set field="truncated" from="queryResult?.truncated"/>
+            <set field="durationMs" from="queryResult?.durationMs"/>
+            <set field="code" from="queryResult?.code"/>
+            <set field="retryAfterSeconds" from="queryResult?.retryAfterSeconds"/>
+            <if condition="queryResult?.error">
+                <message error="true">${queryResult.error}</message>
+            </if>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
+
+    <service verb="list" noun="NsAgentConnections" authz-action="view" allow-remote="true" authenticate="true">
+        <description>DAR-CLI-003. The NetSuite connections the active tenant may query from an agent: id, description and
+            sign-in kind only. No username, client id, certificate id, account host, key or token.</description>
+        <out-parameters>
+            <parameter name="ok" type="Boolean"/>
+            <parameter name="errors" type="List"><parameter name="error"/></parameter>
+            <parameter name="connections" type="List">
+                <parameter name="nsAuthConfigId"/>
+                <parameter name="description"/>
+                <parameter name="authType"/>
+            </parameter>
+        </out-parameters>
+        <actions>
+            <set field="connections" from="[]"/>
+            <set field="activeTenantUserGroupId" from="darpan.facade.common.TenantAccessSupport.currentActiveTenantUserGroupId(ec)"/>
+            <if condition="activeTenantUserGroupId">
+                <!-- Owned rows plus rows granted to this tenant, scoped by companyUserGroupId inside the resolver
+                     (same as list#NsAuthConfigs); a turned-off connection is not offered. -->
+                <set field="accessibleRows" from="darpan.facade.common.SharedConfigAccessSupport.listAccessibleConfigRows(ec, 'SCFG_NS_AUTH')"/>
+                <set field="connections" from="accessibleRows.findAll { (it.isActive ?: 'Y').toString() != 'N' }.collect { item -> [nsAuthConfigId: item.nsAuthConfigId, description: item.description, authType: item.authType ?: 'NONE'] }"/>
+            </if>
+            <set field="ok" from="!ec.message.hasError()"/>
+            <set field="errors" from="ec.message.errors"/>
+        </actions>
+    </service>
 </services>

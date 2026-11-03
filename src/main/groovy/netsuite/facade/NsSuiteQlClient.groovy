@@ -45,25 +45,35 @@ class NsSuiteQlClient {
      * caller asked for the first page only (a value list sorted most common first).
      */
     List<Map> query(String sql, boolean firstPageOnly = false) {
-        String token = NsTokenCache.getValidAccessToken(authId, tokenUrl) ?: mintToken()
-        HttpResponse<String> resp = send(token, sql)
-        if (resp.statusCode() == 401) {
-            NsTokenCache.evict(authId)
-            resp = send(mintToken(), sql)
-        }
-        if (resp.statusCode() != 200) {
-            throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: ${resp.body()?.take(300)}")
-        }
-        Map parsed = new JsonSlurper().parseText(resp.body()) as Map
+        Map parsed = fetch(sql, PAGE_LIMIT, 0)
         if (parsed.hasMore == true && !firstPageOnly) throw new IllegalStateException("NetSuite returned more than ${PAGE_LIMIT} rows for a summary query.")
         return (parsed.items ?: []) as List<Map>
     }
 
-    private HttpResponse<String> send(String token, String sql) {
+    /** DAR-CLI-003. One page at a caller-chosen limit and offset: [rows: List<Map>, hasMore: boolean]. */
+    Map queryPage(String sql, int limit, int offset) {
+        Map parsed = fetch(sql, limit, offset)
+        return [rows: (parsed.items ?: []) as List<Map>, hasMore: parsed.hasMore == true]
+    }
+
+    private Map fetch(String sql, int limit, int offset) {
+        String token = NsTokenCache.getValidAccessToken(authId, tokenUrl) ?: mintToken()
+        HttpResponse<String> resp = send(token, sql, limit, offset)
+        if (resp.statusCode() == 401) {
+            NsTokenCache.evict(authId)
+            resp = send(mintToken(), sql, limit, offset)
+        }
+        if (resp.statusCode() != 200) {
+            throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: ${resp.body()?.take(300)}")
+        }
+        return new JsonSlurper().parseText(resp.body()) as Map
+    }
+
+    private HttpResponse<String> send(String token, String sql, int limit, int offset) {
         long startedAt = System.currentTimeMillis()
         Integer status = null
         try {
-            HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${PAGE_LIMIT}&offset=0"))
+            HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${limit}&offset=${offset}"))
                     .timeout(requestTimeout ?: Duration.ofSeconds(120))
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
