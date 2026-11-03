@@ -190,7 +190,8 @@
             connection's credentials are never returned. Every call is logged for the tenant.</description>
         <in-parameters>
             <parameter name="nsAuthConfigId" required="true"/>
-            <parameter name="sql" required="true"/>
+            <!-- Final review B2: SuiteQL uses <, <= and <>; the text is checked and forwarded, never rendered. -->
+            <parameter name="sql" required="true" allow-html="any"/>
             <parameter name="limit" type="Integer"/>
             <parameter name="offset" type="Integer"/>
         </in-parameters>

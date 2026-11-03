@@ -1,6 +1,7 @@
 package netsuite.facade
 
 import darpan.agent.AgentQueryLane
+import darpan.agent.AgentQuerySupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.reconciliation.support.ReconciliationSmokeTestSupport
 import org.junit.jupiter.api.AfterAll
@@ -163,6 +164,50 @@ class NsAgentQuerySmokeTests {
         assertFalse(text.contains("7654321"), text)
         assertFalse(text.contains(CLIENT_ID), text)
         assertTrue(text.contains("[hidden]"), text)
+    }
+
+    @Test
+    void "final review B2: SuiteQL with less-than, less-or-equal and not-equal is sent, not refused as HTML"() {
+        String sql = "SELECT id FROM transaction WHERE foreigntotal < 10 AND trandate <= SYSDATE AND status <> 'X'"
+        Map r = query(TENANT_A, "NSA_A", sql)
+        assertTrue(r.ok as boolean, "${r.errors}")
+        assertEquals(sql, calls[0].sql)
+    }
+
+    @Test
+    void "final review B7: a client that cannot be built refuses without the token URL or host"() {
+        NsAgentQuerySupport.clientFactory = { def auth, Duration t ->
+            throw new IllegalStateException("token URL blocked by outbound policy: ${TOKEN_URL} (${HOST})".toString())
+        }
+        Map r = query(TENANT_A, "NSA_A", "SELECT 7 FROM blocked")
+        assertFalse(r.ok as boolean)
+        assertEquals("REFUSED", r.code)
+        String text = "${r.errors}"
+        assertFalse(text.contains(HOST), text)
+        assertFalse(text.contains("7654321"), text)
+        assertTrue(text.contains("[hidden]"), text)
+    }
+
+    @Test
+    void "final review R25: a NetSuite account another tenant granted is refused for a fresh query, the owner still works"() {
+        ec.entity.makeValue("moqui.basic.EnumerationType").setAll([enumTypeId: "DarpanSharedConfigType",
+                description: "Darpan API source config types"]).createOrUpdate()
+        ec.entity.makeValue("moqui.basic.Enumeration").setAll([enumId: "SCFG_NS_AUTH", enumTypeId: "DarpanSharedConfigType",
+                description: "NetSuite auth config"]).createOrUpdate()
+        ec.entity.makeValue("darpan.auth.ConfigTenantAccess").setAll([configTypeEnumId: "SCFG_NS_AUTH", configId: "NSA_B",
+                tenantUserGroupId: TENANT_A, fromDate: FROM]).createOrUpdate()
+        try {
+            Map r = query(TENANT_A, "NSA_B", "SELECT 1 FROM shared")
+            assertFalse(r.ok as boolean)
+            assertEquals("REFUSED", r.code)
+            assertTrue("${r.errors}".contains(AgentQuerySupport.SHARED_CONNECTION_REFUSAL), "${r.errors}")
+            assertTrue(calls.isEmpty(), "nothing is sent on a granted account")
+            assertEquals(1, logRows("SELECT 1 FROM shared", "REFUSED").size())
+            assertTrue(query(TENANT_B, "NSA_B", "SELECT 2 FROM owner").ok as boolean)
+            assertEquals(1, calls.size())
+        } finally {
+            ec.entity.find("darpan.auth.ConfigTenantAccess").condition("configId", "NSA_B").disableAuthz().deleteAll()
+        }
     }
 
     @Test

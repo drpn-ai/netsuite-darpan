@@ -42,6 +42,12 @@ class NsAgentQuerySupport {
         }
         def auth = NsLifecycleOptionsSupport.accessibleAccount(ec, authId)
         if (auth == null) return null
+        // Final review B7: the secrets are known before anything can refuse, so a refusal's words are stripped too
+        // (AgentQuerySupport.refuse strips with meta.secrets).
+        meta.secrets = secretsOf(auth)
+        // Final review R25: fresh queries run only on the active tenant's own account, never on one another tenant granted.
+        String notOwned = AgentQuerySupport.requireOwnedConnection(ec, auth.get("companyUserGroupId"))
+        if (notOwned) return AgentQuerySupport.refuse(ec, meta, notOwned)
 
         // Everything that needs ec is resolved here: the work closure runs on a worker thread.
         NsSuiteQlClient client
@@ -50,7 +56,6 @@ class NsAgentQuerySupport {
         } catch (Exception e) {
             return AgentQuerySupport.refuse(ec, meta, "NetSuite account '${authId}' cannot be used: ${e.message}".toString())
         }
-        meta.secrets = secretsOf(auth)
         final String query = sql
         final int wanted = limit
         final int start = offset
