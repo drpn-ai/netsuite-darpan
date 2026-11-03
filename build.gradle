@@ -47,7 +47,7 @@ dependencies {
     // retrieveInventoryAdjustmentsByReference.groovy imports Spark SQL at compile time; the runtime
     // copy is supplied by the :darpan component's lib/, so keep it compileOnly here to avoid copying
     // Spark's transitive jars into this component's lib/.
-    compileOnly 'org.apache.spark:spark-sql_2.12:3.5.1'
+    compileOnly 'org.apache.spark:spark-sql_2.13:4.2.1'
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
     testImplementation project(':runtime:component:darpan').sourceSets.test.output
@@ -62,6 +62,12 @@ check.dependsOn.clear()
 
 // Apache Spark requires these JDK module openings on Java 17+/21; integration tests that boot the
 // retrieve service (Spark SQL) need them or Spark throws IllegalAccessError at SparkContext init.
+// The list follows Spark 4.2.1's launcher (JavaModuleOptions, DAR-BE-185), the same list as :darpan.
+// Left out of Spark's list on purpose:
+//   -Dio.netty.handler.ssl.defaultEndpointVerificationAlgorithm=NONE  turns off TLS hostname checks JVM-wide
+//   --sun-misc-unsafe-memory-access=allow                             a JDK 23+ flag; we run JDK 21
+//   --add-modules=jdk.incubator.vector                                optional incubator module, warns on every start
+//   -XX:+IgnoreUnrecognizedVMOptions                                  would hide a mistyped flag
 ext.sparkJava21Opens = [
         '--add-opens=java.base/java.lang=ALL-UNNAMED',
         '--add-opens=java.base/java.lang.invoke=ALL-UNNAMED',
@@ -72,11 +78,14 @@ ext.sparkJava21Opens = [
         '--add-opens=java.base/java.util=ALL-UNNAMED',
         '--add-opens=java.base/java.util.concurrent=ALL-UNNAMED',
         '--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED',
+        '--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED',
         '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED',
         '--add-opens=java.base/sun.nio.cs=ALL-UNNAMED',
         '--add-opens=java.base/sun.security.action=ALL-UNNAMED',
         '--add-opens=java.base/sun.util.calendar=ALL-UNNAMED',
-        '--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED'
+        '--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED',
+        '-Dio.netty.tryReflectionSetAccessible=true',
+        '-Dio.netty.allocator.type=pooled'
 ]
 
 test {
