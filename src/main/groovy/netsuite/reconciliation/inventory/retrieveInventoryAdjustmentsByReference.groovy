@@ -428,6 +428,7 @@ try {
             .master(sparkMasterToUse)
             .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
             .config("spark.sql.adaptive.enabled", "true")
+            .config("spark.ui.enabled", "false") // embedded use: no unauthenticated UI port; the UI's jakarta.servlet is the container's
 
     if (sparkMasterToUse.toLowerCase().startsWith("local")) {
         // Prevent local Spark from binding to an unavailable interface in desktop dev environments.
