@@ -514,6 +514,25 @@ class NsSuiteQlOrderSupport {
             }
         }
 
+        // DAR-BE-245. With the field holding the record's fulfillments by location (LINKED_LOCATIONS), each record (one
+        // per order) gets HotWax's completed ship groups counted against them per location (omsShipGroupCheck): one
+        // NetSuite fulfillment must not become several HotWax ship groups.
+        String omsShipGroupsField = query.containsKey("omsShipGroupsField") ? text(query.get("omsShipGroupsField")) : null
+        if (omsShipGroupsField) {
+            if (!omsStatusKeyField) {
+                throw new IllegalArgumentException("omsShipGroupsField needs omsStatusKeyField: ship groups are asked of an order")
+            }
+            if (omsStatusLineKeyField) {
+                throw new IllegalArgumentException("omsShipGroupsField counts an order's ship groups, so it reads one record per " +
+                        "order; omsStatusLineKeyField reads one per line. Set one of them.")
+            }
+            Map<String, Object> field = normalized.find { it.get("recordFieldName") == omsShipGroupsField }
+            if (!field || !LINKED_LOCATIONS.matcher(((String) field.get("sourceColumn")).trim()).matches()) {
+                throw new IllegalArgumentException("omsShipGroupsField ${omsShipGroupsField} must be a mapped field read with " +
+                        "LINKED_LOCATIONS(ItemShip)")
+            }
+        }
+
         return [
                 stageReach            : stageReach,
                 waiveRules            : waiveRules,
@@ -544,6 +563,7 @@ class NsSuiteQlOrderSupport {
                 omsStatusConfigId         : omsStatusConfigId,
                 omsStatusKeyField         : omsStatusKeyField,
                 omsStatusLineKeyField     : omsStatusLineKeyField,
+                omsShipGroupsField        : omsShipGroupsField,
         ] as Map<String, Object>
     }
 
@@ -629,6 +649,13 @@ class NsSuiteQlOrderSupport {
      * follow THIS line (line link table), e.g. the item fulfillments that shipped it; a record reads [tranId, ...].
      */
     private static final Pattern LINE_LINKED = ~/^LINE_LINKED\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
+    /**
+     * DAR-BE-245. "LINKED_LOCATIONS(ItemShip) AS fulfillments": each record of the type that follows the record (link table),
+     * once done (a fulfillment once Shipped, as on every stage), as "location^number" where location is the internal id
+     * of the location its lines ship from (the largest, should one span two); a record reads ["77^IF387146", ...]. HotWax names the same place by its
+     * facility's externalId, so a sales order's fulfillments can be counted against HotWax's ship groups per location.
+     */
+    static final Pattern LINKED_LOCATIONS = ~/^LINKED_LOCATIONS\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
     private static final String LINE_LINK_TABLE = "nexttransactionlinelink"
 
     /**
@@ -666,6 +693,17 @@ class NsSuiteQlOrderSupport {
                 String types = m.group(1).split(/\s*,\s*/).collect { String type -> "(${lc}.type = '${type}'${stageDone(lc, type)})" }.join(" OR ")
                 return ("CASE WHEN EXISTS (SELECT 1 FROM ${LINK_TABLE} ${lk} JOIN transaction ${lc} ON ${lc}.id = ${lk}.nextdoc " +
                         "WHERE ${lk}.previousdoc = ${outer}.id AND (${types})) THEN 'T' ELSE 'F' END AS ${alias}").toString()
+            }
+            m = LINKED_LOCATIONS.matcher(col)
+            if (m.matches()) {
+                // One entry per record: its location comes from a sub-select, not a join to its lines, because SuiteQL
+                // ignores DISTINCT inside LISTAGG (RAILS 2026-11-12: one fulfillment came back once per line, 60 times).
+                String alias = m.group(2), lk = "lk_${alias}", lr = "lr_${alias}", ll = "ll_${alias}"
+                String entry = "TO_CHAR((SELECT MAX(${ll}.location) FROM transactionline ${ll} WHERE ${ll}.transaction = ${lr}.id " +
+                        "AND ${ll}.mainline = 'F')) || '^' || ${lr}.tranid"
+                return ("(SELECT LISTAGG(${entry}, '|') WITHIN GROUP (ORDER BY ${lr}.id) FROM ${LINK_TABLE} ${lk} " +
+                        "JOIN transaction ${lr} ON ${lr}.id = ${lk}.nextdoc WHERE ${lk}.previousdoc = ${outer}.id " +
+                        "AND ${lr}.type = '${m.group(1)}'${stageDone(lr, m.group(1))}) AS ${alias}").toString()
             }
             m = LINKED_RECORDS.matcher(col)
             if (m.matches()) {
@@ -1199,7 +1237,8 @@ class NsSuiteQlOrderSupport {
             String column = ((String) field.get("sourceColumn")).trim()
             record.put((String) field.get("recordFieldName"), LINE_ITEMS.matcher(column).matches() ? lineItems(value) :
                     LINKED_RECORDS.matcher(column).matches() ? linkedRecords(value) :
-                    LINE_LINKED.matcher(column).matches() ? (text(value)?.split(/\|/)?.toList()?.unique() ?: []) : text(value))
+                    LINE_LINKED.matcher(column).matches() || LINKED_LOCATIONS.matcher(column).matches() ?
+                            (text(value)?.split(/\|/)?.toList()?.unique() ?: []) : text(value))
         }
         // Columns the TEMPLATE adds, as opposed to the ones an operator configured. Without this the
         // query selected `contradiction` and the record dropped it — 57 findings arrived with no

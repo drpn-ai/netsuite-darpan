@@ -388,6 +388,35 @@ class NsSuiteQlOrderSupportTest {
                 "orderLineId is only the template's own field on SALES_LINES")
     }
 
+    // DAR-BE-245 (RAILS: one NetSuite fulfillment became two HotWax ship groups on 23 orders): a sales order's shipped
+    // fulfillments as "location^number", read once per order and counted against HotWax's ship groups per location.
+    @Test
+    void linkedLocationsListsEachShippedFulfillmentWithItsLocationAndOnlyAnOrderRecordCountsShipGroups() {
+        Map base = [nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "lastmodifieddate"]
+        List fields = [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                       [recordFieldName: "fulfillments", sourceColumn: "LINKED_LOCATIONS(ItemShip) AS fulfillments", sequenceNum: 2]]
+        Map oms = [omsStatusConfigId: "rails_prod", omsStatusKeyField: "orderId"]
+        Map spec = NsSuiteQlOrderSupport.normalizeSpec(base + oms + [omsShipGroupsField: "fulfillments"], fields)
+        assertEquals("fulfillments", spec.omsShipGroupsField)
+
+        String sql = NsSuiteQlOrderSupport.selectColumns(spec, "transaction")[1]
+        assertTrue(sql.contains("lr_fulfillments.type = 'ItemShip' AND lr_fulfillments.status = 'C'"), "only a Shipped fulfillment counts: ${sql}")
+        assertTrue(sql.contains("lk_fulfillments.previousdoc = transaction.id"), sql)
+        assertTrue(sql.contains("LISTAGG(TO_CHAR((SELECT MAX(ll_fulfillments.location) FROM transactionline ll_fulfillments " +
+                "WHERE ll_fulfillments.transaction = lr_fulfillments.id AND ll_fulfillments.mainline = 'F')) || '^' || lr_fulfillments.tranid"),
+                "one entry per fulfillment, not per line (SuiteQL ignores LISTAGG DISTINCT): ${sql}")
+        assertTrue(sql.endsWith(" AS fulfillments"), sql)
+        Map record = NsSuiteQlOrderSupport.mapRowToRecord(spec, [custbody_hc_order_id: "150738", fulfillments: "77^IF387146"])
+        assertEquals(["77^IF387146"], record.fulfillments)
+        assertEquals([], NsSuiteQlOrderSupport.mapRowToRecord(spec, [custbody_hc_order_id: "1", fulfillments: null]).fulfillments,
+                "an order with no shipped fulfillment reads an empty list, not null")
+
+        assertThrows(IllegalArgumentException, {
+            NsSuiteQlOrderSupport.normalizeSpec(base + [omsShipGroupsField: "fulfillments"], fields) }, "ship groups are asked of an order")
+        assertThrows(IllegalArgumentException, {
+            NsSuiteQlOrderSupport.normalizeSpec(base + oms + [omsShipGroupsField: "orderId"], fields) }, "must be a LINKED_LOCATIONS field")
+    }
+
     @Test
     void writesRecordsFirstThenMetadataSoPagesCanBeAppended() {
         StringWriter out = new StringWriter()

@@ -8,6 +8,7 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import netsuite.reconciliation.inventory.NsTokenCache
 import netsuite.reconciliation.orders.NsLifecycleSnapshot
+import netsuite.reconciliation.orders.NsShipGroupCountSupport
 import netsuite.reconciliation.orders.NsOAuthTokenMinter
 import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
 import netsuite.reconciliation.orders.NsSuiteQlPageRetry
@@ -159,7 +160,9 @@ try {
              omsStatusConfigId     : queryRow.isField("omsStatusConfigId") ? queryRow.get("omsStatusConfigId") : null,
              omsStatusKeyField     : queryRow.isField("omsStatusKeyField") ? queryRow.get("omsStatusKeyField") : null,
              // DAR-BE-190. With the field naming the HotWax item too, each record gets its item's status instead.
-             omsStatusLineKeyField : queryRow.isField("omsStatusLineKeyField") ? queryRow.get("omsStatusLineKeyField") : null],
+             omsStatusLineKeyField : queryRow.isField("omsStatusLineKeyField") ? queryRow.get("omsStatusLineKeyField") : null,
+             // DAR-BE-245. With the field holding the order's fulfillments by location, its HotWax ship groups are counted.
+             omsShipGroupsField    : queryRow.isField("omsShipGroupsField") ? queryRow.get("omsShipGroupsField") : null],
             queryFieldRows)
     if (lookupKeys) {
         querySpec.lookupKeyField = lookupKeyField
@@ -309,14 +312,46 @@ try {
     if (querySpec.omsStatusConfigId) {
         String keyField = querySpec.omsStatusKeyField as String
         String lineKeyField = querySpec.omsStatusLineKeyField as String
+        String shipGroupsField = querySpec.omsShipGroupsField as String
         omsStatusEnricher = { List<Map<String, Object>> records ->
             List<String> ids = records.collect { it.get(keyField)?.toString()?.trim() }.findAll { it }.unique()
             if (!ids) return
             Map looked = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
-                    .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: ids, withItems: lineKeyField as boolean,
+                    .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: ids,
+                                 withItems: (lineKeyField || shipGroupsField) as boolean,
                                  companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
             if (!(looked?.ok)) {
                 throw new IllegalStateException("HotWax order status lookup failed: ${(looked?.errors ?: ec.message.errors) as List}")
+            }
+            // DAR-BE-245. Each order's completed ship groups against its NetSuite fulfillments; where the groups ship from
+            // is asked only of the orders whose groups outnumber the fulfillments, then compared per location.
+            if (shipGroupsField) {
+                Set<String> missing = new HashSet<String>((looked.missingIds ?: []) as List<String>)
+                Map<String, Set<String>> groupsById = ids.collectEntries { String id ->
+                    [(id): NsShipGroupCountSupport.completedShipGroups(id, (Map) looked.itemStatusByKey, (Map) looked.itemShipGroupByKey)]
+                }
+                List<String> over = records.findAll { Map<String, Object> record ->
+                    String id = record.get(keyField)?.toString()?.trim()
+                    id && !missing.contains(id) && NsShipGroupCountSupport.needsFacilities((List) record.get(shipGroupsField), groupsById[id])
+                }.collect { it.get(keyField).toString().trim() }.unique()
+                Map facilityByKey = [:]
+                if (over) {
+                    Map facilities = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
+                            .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: over, withShipGroupFacilities: true,
+                                         companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
+                    if (!(facilities?.ok)) {
+                        throw new IllegalStateException("HotWax ship group lookup failed: ${(facilities?.errors ?: ec.message.errors) as List}")
+                    }
+                    facilityByKey = (Map) facilities.shipGroupFacilityByKey
+                }
+                records.each { Map<String, Object> record ->
+                    String id = record.get(keyField)?.toString()?.trim()
+                    if (!id) return
+                    Map<String, List> facilityByGroup = groupsById[id]?.collectEntries { String g -> [(g): (List) facilityByKey.get("${id}|${g}".toString())] } ?: [:]
+                    record.putAll(NsShipGroupCountSupport.check((List) record.get(shipGroupsField), groupsById[id] ?: ([] as Set),
+                            facilityByGroup, missing.contains(id)))
+                }
+                return
             }
             if (lineKeyField) {
                 Map itemStatusByKey = (Map) looked.itemStatusByKey
