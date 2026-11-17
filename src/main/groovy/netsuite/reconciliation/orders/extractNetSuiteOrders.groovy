@@ -313,6 +313,17 @@ try {
         String keyField = querySpec.omsStatusKeyField as String
         String lineKeyField = querySpec.omsStatusLineKeyField as String
         String shipGroupsField = querySpec.omsShipGroupsField as String
+        // DAR-BE-245/294: where the asked orders' ship groups ship from, and how; "orderId|group" -> [facilityId, externalId,
+        // shipmentMethodTypeId]. The same tenant pin as the status read (the query row's companyUserGroupId).
+        Closure<Map> shipGroupFacilities = { List<String> orderIds ->
+            Map facilities = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
+                    .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: orderIds, withShipGroupFacilities: true,
+                                 companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
+            if (!(facilities?.ok)) {
+                throw new IllegalStateException("HotWax ship group lookup failed: ${(facilities?.errors ?: ec.message.errors) as List}")
+            }
+            return (Map) facilities.shipGroupFacilityByKey
+        }
         omsStatusEnricher = { List<Map<String, Object>> records ->
             List<String> ids = records.collect { it.get(keyField)?.toString()?.trim() }.findAll { it }.unique()
             if (!ids) return
@@ -334,16 +345,7 @@ try {
                     String id = record.get(keyField)?.toString()?.trim()
                     id && !missing.contains(id) && NsShipGroupCountSupport.needsFacilities((List) record.get(shipGroupsField), groupsById[id])
                 }.collect { it.get(keyField).toString().trim() }.unique()
-                Map facilityByKey = [:]
-                if (over) {
-                    Map facilities = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
-                            .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: over, withShipGroupFacilities: true,
-                                         companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
-                    if (!(facilities?.ok)) {
-                        throw new IllegalStateException("HotWax ship group lookup failed: ${(facilities?.errors ?: ec.message.errors) as List}")
-                    }
-                    facilityByKey = (Map) facilities.shipGroupFacilityByKey
-                }
+                Map facilityByKey = over ? shipGroupFacilities(over) : [:]
                 records.each { Map<String, Object> record ->
                     String id = record.get(keyField)?.toString()?.trim()
                     if (!id) return
@@ -361,6 +363,17 @@ try {
                     String seq = record.get(lineKeyField)?.toString()?.trim()
                     if (!id || !seq) return
                     record.put("omsItemStatusId", missing.contains(id) ? "NOT_IN_OMS" : (itemStatusByKey.get("${id}|${seq}".toString()) ?: "NO_SUCH_ITEM"))
+                }
+                // DAR-BE-294. An approved line is judged by its own ship group: where HotWax holds it (omsItemFacilityId)
+                // and how it ships (omsItemShipmentMethodTypeId). Asked only of the orders with an approved line.
+                List<Map<String, Object>> approved = records.findAll { it.get("omsItemStatusId") == "ITEM_APPROVED" }
+                List<String> approvedIds = approved.collect { it.get(keyField).toString().trim() }.unique()
+                if (approvedIds) {
+                    Map facilityByKey = shipGroupFacilities(approvedIds)
+                    approved.each { Map<String, Object> record ->
+                        record.putAll(NsShipGroupCountSupport.lineShipGroup(record.get(keyField).toString().trim(),
+                                record.get(lineKeyField).toString().trim(), (Map) looked.itemShipGroupByKey, facilityByKey))
+                    }
                 }
                 return
             }

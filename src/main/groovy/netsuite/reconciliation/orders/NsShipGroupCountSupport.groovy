@@ -22,6 +22,19 @@ class NsShipGroupCountSupport {
     static final String NO_FULFILLMENT = "NO_FULFILLMENT"
     static final String COMPLETED = "ITEM_COMPLETED"
 
+    /**
+     * DAR-BE-294. An open line's own HotWax ship group (itemShipGroupByKey "orderId|seq" -> group) and, from
+     * shipGroupFacilityByKey "orderId|group" -> [facilityId, externalId, shipmentMethodTypeId], where HotWax holds it and
+     * how it ships. Blank when HotWax did not say; never another group's.
+     */
+    static Map<String, String> lineShipGroup(String orderId, String seq, Map itemShipGroupByKey, Map shipGroupFacilityByKey) {
+        String group = itemShipGroupByKey?.get("${orderId}|${seq}".toString())?.toString()
+        List facility = group ? (List) shipGroupFacilityByKey?.get("${orderId}|${group}".toString()) : null
+        return [omsItemShipGroupSeqId      : group,
+                omsItemFacilityId          : facility ? facility[0]?.toString() : null,
+                omsItemShipmentMethodTypeId: facility && facility.size() > 2 ? facility[2]?.toString() : null]
+    }
+
     /** The ship groups holding at least one completed item, from "orderId|seq" -> status and -> ship group. */
     static Set<String> completedShipGroups(String orderId, Map itemStatusByKey, Map itemShipGroupByKey) {
         String prefix = orderId + "|"

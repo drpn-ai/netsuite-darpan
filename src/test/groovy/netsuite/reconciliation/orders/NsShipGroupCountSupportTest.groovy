@@ -83,4 +83,22 @@ class NsShipGroupCountSupportTest {
         Map group = ["9|01": "00002", "9|02": "00003", "9|03": "00004", "10|01": "00009"]
         assertEquals(["00002"] as Set, NsShipGroupCountSupport.completedShipGroups("9", status, group))
     }
+
+    // DAR-BE-294. Gorjana R10 judged a line by ANY of its order's ship groups: a line at the warehouse read as parked when
+    // another group of the order sat in parking. The line's own group says where HotWax holds it and how it ships.
+    @Test
+    void anOpenLineIsJudgedByItsOwnShipGroupNotTheOrders() {
+        Map group = ["M1|01": "00006", "M1|02": "00002"]
+        Map facility = ["M1|00006": ["UNF_HOLD_PARKING", null, "STANDARD"], "M1|00002": ["WH", "31", "STANDARD"],
+                        "M2|00001": ["SM_STORE", "12", "STOREPICKUP"]]
+        assertEquals([omsItemShipGroupSeqId: "00002", omsItemFacilityId: "WH", omsItemShipmentMethodTypeId: "STANDARD"],
+                NsShipGroupCountSupport.lineShipGroup("M1", "02", group, facility))
+        assertEquals("UNF_HOLD_PARKING", NsShipGroupCountSupport.lineShipGroup("M1", "01", group, facility).omsItemFacilityId)
+        assertEquals([omsItemShipGroupSeqId: "00001", omsItemFacilityId: "SM_STORE", omsItemShipmentMethodTypeId: "STOREPICKUP"],
+                NsShipGroupCountSupport.lineShipGroup("M2", "01", ["M2|01": "00001"], facility))
+        assertEquals([omsItemShipGroupSeqId: null, omsItemFacilityId: null, omsItemShipmentMethodTypeId: null],
+                NsShipGroupCountSupport.lineShipGroup("M3", "01", group, facility), "an item with no ship group read stays blank, never guessed")
+        assertEquals([omsItemShipGroupSeqId: "00007", omsItemFacilityId: null, omsItemShipmentMethodTypeId: null],
+                NsShipGroupCountSupport.lineShipGroup("M1", "03", ["M1|03": "00007"], facility), "a group HotWax did not return stays blank")
+    }
 }
