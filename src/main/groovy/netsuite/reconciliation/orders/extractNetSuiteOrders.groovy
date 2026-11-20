@@ -161,7 +161,7 @@ try {
              omsStatusKeyField     : queryRow.isField("omsStatusKeyField") ? queryRow.get("omsStatusKeyField") : null,
              // DAR-BE-190. With the field naming the HotWax item too, each record gets its item's status instead.
              omsStatusLineKeyField : queryRow.isField("omsStatusLineKeyField") ? queryRow.get("omsStatusLineKeyField") : null,
-             // DAR-BE-245. With the field holding the order's fulfillments by location, its HotWax ship groups are counted.
+             // DAR-BE-245. With the field holding the order's fulfillments by location, its HotWax shipments are counted (DAR-BE-329).
              omsShipGroupsField    : queryRow.isField("omsShipGroupsField") ? queryRow.get("omsShipGroupsField") : null],
             queryFieldRows)
     if (lookupKeys) {
@@ -313,7 +313,7 @@ try {
         String keyField = querySpec.omsStatusKeyField as String
         String lineKeyField = querySpec.omsStatusLineKeyField as String
         String shipGroupsField = querySpec.omsShipGroupsField as String
-        // DAR-BE-245/294: where the asked orders' ship groups ship from, and how; "orderId|group" -> [facilityId, externalId,
+        // DAR-BE-294: where the asked orders' ship groups ship from, and how; "orderId|group" -> [facilityId, externalId,
         // shipmentMethodTypeId]. The same tenant pin as the status read (the query row's companyUserGroupId).
         Closure<Map> shipGroupFacilities = { List<String> orderIds ->
             Map facilities = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
@@ -329,29 +329,20 @@ try {
             if (!ids) return
             Map looked = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.lookup#HotWaxOmsOrderStatuses")
                     .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, orderIds: ids,
-                                 withItems: (lineKeyField || shipGroupsField) as boolean,
+                                 withItems: lineKeyField as boolean, withShipments: shipGroupsField as boolean,
                                  companyUserGroupId   : queryRow.companyUserGroupId]).disableAuthz().call()
             if (!(looked?.ok)) {
                 throw new IllegalStateException("HotWax order status lookup failed: ${(looked?.errors ?: ec.message.errors) as List}")
             }
-            // DAR-BE-245. Each order's completed ship groups against its NetSuite fulfillments; where the groups ship from
-            // is asked only of the orders whose groups outnumber the fulfillments, then compared per location.
+            // DAR-BE-245/329. Each order's shipped HotWax shipments against its NetSuite fulfillments, per location.
             if (shipGroupsField) {
                 Set<String> missing = new HashSet<String>((looked.missingIds ?: []) as List<String>)
-                Map<String, Set<String>> groupsById = ids.collectEntries { String id ->
-                    [(id): NsShipGroupCountSupport.completedShipGroups(id, (Map) looked.itemStatusByKey, (Map) looked.itemShipGroupByKey)]
-                }
-                List<String> over = records.findAll { Map<String, Object> record ->
-                    String id = record.get(keyField)?.toString()?.trim()
-                    id && !missing.contains(id) && NsShipGroupCountSupport.needsFacilities((List) record.get(shipGroupsField), groupsById[id])
-                }.collect { it.get(keyField).toString().trim() }.unique()
-                Map facilityByKey = over ? shipGroupFacilities(over) : [:]
+                Map shipmentsByOrderId = (Map) looked.shipmentsByOrderId ?: [:]
                 records.each { Map<String, Object> record ->
                     String id = record.get(keyField)?.toString()?.trim()
                     if (!id) return
-                    Map<String, List> facilityByGroup = groupsById[id]?.collectEntries { String g -> [(g): (List) facilityByKey.get("${id}|${g}".toString())] } ?: [:]
-                    record.putAll(NsShipGroupCountSupport.check((List) record.get(shipGroupsField), groupsById[id] ?: ([] as Set),
-                            facilityByGroup, missing.contains(id)))
+                    record.putAll(NsShipGroupCountSupport.check((List) record.get(shipGroupsField), (List) shipmentsByOrderId.get(id),
+                            missing.contains(id)))
                 }
                 return
             }

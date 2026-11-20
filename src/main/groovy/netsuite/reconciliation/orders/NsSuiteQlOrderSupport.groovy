@@ -514,16 +514,16 @@ class NsSuiteQlOrderSupport {
             }
         }
 
-        // DAR-BE-245. With the field holding the record's fulfillments by location (LINKED_LOCATIONS), each record (one
-        // per order) gets HotWax's completed ship groups counted against them per location (omsShipGroupCheck): one
-        // NetSuite fulfillment must not become several HotWax ship groups.
+        // DAR-BE-245/329. With the field holding the record's fulfillments by location (LINKED_LOCATIONS), each record (one
+        // per order) gets HotWax's shipped shipments counted against them per location (omsShipGroupCheck): one NetSuite
+        // fulfillment must not become several HotWax shipments.
         String omsShipGroupsField = query.containsKey("omsShipGroupsField") ? text(query.get("omsShipGroupsField")) : null
         if (omsShipGroupsField) {
             if (!omsStatusKeyField) {
-                throw new IllegalArgumentException("omsShipGroupsField needs omsStatusKeyField: ship groups are asked of an order")
+                throw new IllegalArgumentException("omsShipGroupsField needs omsStatusKeyField: shipments are asked of an order")
             }
             if (omsStatusLineKeyField) {
-                throw new IllegalArgumentException("omsShipGroupsField counts an order's ship groups, so it reads one record per " +
+                throw new IllegalArgumentException("omsShipGroupsField counts an order's shipments, so it reads one record per " +
                         "order; omsStatusLineKeyField reads one per line. Set one of them.")
             }
             Map<String, Object> field = normalized.find { it.get("recordFieldName") == omsShipGroupsField }
@@ -653,7 +653,7 @@ class NsSuiteQlOrderSupport {
      * DAR-BE-245. "LINKED_LOCATIONS(ItemShip) AS fulfillments": each record of the type that follows the record (link table),
      * once done (a fulfillment once Shipped, as on every stage), as "location^number" where location is the internal id
      * of the location its lines ship from (the largest, should one span two); a record reads ["77^IF387146", ...]. HotWax names the same place by its
-     * facility's externalId, so a sales order's fulfillments can be counted against HotWax's ship groups per location.
+     * facility's externalId, so a sales order's fulfillments can be counted against HotWax's shipments per location (DAR-BE-329).
      */
     static final Pattern LINKED_LOCATIONS = ~/^LINKED_LOCATIONS\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
     private static final String LINE_LINK_TABLE = "nexttransactionlinelink"

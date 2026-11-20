@@ -388,8 +388,8 @@ class NsSuiteQlOrderSupportTest {
                 "orderLineId is only the template's own field on SALES_LINES")
     }
 
-    // DAR-BE-245 (RAILS: one NetSuite fulfillment became two HotWax ship groups on 23 orders): a sales order's shipped
-    // fulfillments as "location^number", read once per order and counted against HotWax's ship groups per location.
+    // DAR-BE-245/329 (RAILS: one NetSuite fulfillment became two HotWax shipments on 18 orders): a sales order's shipped
+    // fulfillments as "location^number", read once per order and counted against HotWax's shipments per location.
     @Test
     void linkedLocationsListsEachShippedFulfillmentWithItsLocationAndOnlyAnOrderRecordCountsShipGroups() {
         Map base = [nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "lastmodifieddate"]
@@ -412,7 +412,7 @@ class NsSuiteQlOrderSupportTest {
                 "an order with no shipped fulfillment reads an empty list, not null")
 
         assertThrows(IllegalArgumentException, {
-            NsSuiteQlOrderSupport.normalizeSpec(base + [omsShipGroupsField: "fulfillments"], fields) }, "ship groups are asked of an order")
+            NsSuiteQlOrderSupport.normalizeSpec(base + [omsShipGroupsField: "fulfillments"], fields) }, "shipments are asked of an order")
         assertThrows(IllegalArgumentException, {
             NsSuiteQlOrderSupport.normalizeSpec(base + oms + [omsShipGroupsField: "orderId"], fields) }, "must be a LINKED_LOCATIONS field")
     }
