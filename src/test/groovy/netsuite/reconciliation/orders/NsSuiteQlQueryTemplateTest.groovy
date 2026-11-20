@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test
 import static org.junit.jupiter.api.Assertions.assertEquals
 import static org.junit.jupiter.api.Assertions.assertFalse
 import static org.junit.jupiter.api.Assertions.assertNotNull
+import static org.junit.jupiter.api.Assertions.assertNull
 import static org.junit.jupiter.api.Assertions.assertThrows
 import static org.junit.jupiter.api.Assertions.assertTrue
 
@@ -1460,5 +1461,210 @@ class NsSuiteQlQueryTemplateTest {
         assertEquals([[field1: "42808", field2: "PKG403", field3: "Y"], [field1: "43649", field2: "271-010-185-G", field3: "Y"]], doc.records,
                 "PKG109 is not live, so the run's filter drops it")
         assertTrue(asked[0].startsWith("SELECT DISTINCT tl.item"), "the used items are read first")
+    }
+
+    // ------------------------------------------------- DAR-BE-318 plan 3b-1: a kept copy read by what changed (Task 5)
+
+    /**
+     * The RECORDS query as it shipped for DAR-BE-032/044 (absentTemplateIsRecordsAndTheQueryIsUnchanged pins the same text).
+     * A dataset read changes it only when it says so; a run's read never does.
+     */
+    private static final String RECORDS_SQL = "SELECT tranid FROM transaction WHERE type = 'SalesOrd' " +
+            "AND trandate >= TO_DATE('2026-08-01', 'YYYY-MM-DD') " +
+            "AND trandate < TO_DATE('2026-09-01', 'YYYY-MM-DD') ORDER BY id"
+
+    /** The two stamp columns a dataset read adds (ruling P3b1-12), on the record as `outer` names it. */
+    private static String stampColumns(String outer) {
+        String header = outer == "t" ? "t.lastmodifieddate" : "lastmodifieddate"
+        return "TO_CHAR(${header}, 'YYYY-MM-DD HH24:MI:SS') AS darpan_header_stamp, " +
+                "TO_CHAR((SELECT MAX(sl.linelastmodifieddate) FROM transactionline sl WHERE sl.transaction = ${outer}.id), " +
+                "'YYYY-MM-DD HH24:MI:SS') AS darpan_line_stamp"
+    }
+
+    /** Every template, configured as a run would configure it. */
+    private static Map<String, Map<String, Object>> everyTemplate() {
+        return [RECORDS                    : spec([:]),
+                LINKED_CHILD_ABSENT        : spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"]),
+                LINKED_CHILD_PRESENT       : spec([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip"]),
+                LINKED_CHILD_PRESENT_ABSENT: spec([queryTemplate: "LINKED_CHILD_PRESENT_ABSENT", presentChildRecordType: "ItemShip",
+                                                   absentChildRecordType: "CustInvc"]),
+                LINKED_CHILD_EXCUSED       : spec([queryTemplate: "LINKED_CHILD_EXCUSED", absentChildRecordType: "ItemShip",
+                                                   waiveRules: [[fieldId: "shipmethod", values: ["Store Pickup"]]]]),
+                RECORDS_MATCHING           : spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["WTY-"]]]]),
+                STATE_CONTRADICTION        : stateSpec(),
+                SALES_LINES                : salesLinesSpec(),
+                ACTIVE_ITEMS               : activeItemsSpec()] as Map<String, Map<String, Object>>
+    }
+
+    private static String sql(Map<String, Object> s, String from = "2026-08-01", String thru = "2026-09-01") {
+        return NsSuiteQlOrderSupport.buildRecordsQuery(s, from, thru, "2026-09-02")
+    }
+
+    /**
+     * Review Focus: with windowFieldName absent, or the row's own dateColumn, every query is the one a run sends today, to
+     * the byte: RECORDS (its promise above), every other template, and the lifecycle condition-id query.
+     */
+    @Test
+    void recordsQueryIsByteIdenticalWithoutTheParameter() {
+        assertEquals(RECORDS_SQL, sql(NsSuiteQlOrderSupport.applyReadMode(spec([:]), null, null)))
+        assertEquals(RECORDS_SQL, sql(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "trandate", false)))
+        assertEquals(RECORDS_SQL, sql(NsSuiteQlOrderSupport.applyReadMode(spec([:]), " ", false)))
+        everyTemplate().each { String template, Map<String, Object> s ->
+            String before = sql(s)
+            Map<String, Object> absent = NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(s), null, null)
+            Map<String, Object> ownDate = NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(s), s.dateColumn ?: "trandate", false)
+            assertEquals(s, absent, "${template}: no read-mode keys are added")
+            assertEquals(s, ownDate, "${template}: no read-mode keys are added")
+            assertEquals(before, sql(absent), template)
+            assertEquals(before, sql(ownDate), template)
+        }
+        Map<String, Object> waived = spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
+                                           waiveRules: [[fieldId: "shipmethod", values: ["Store Pickup"]]]])
+        String ids = NsSuiteQlOrderSupport.buildConditionIdQuery(waived, "MISSING", "ItemShip", "2026-08-01", "2026-09-01")
+        assertEquals(ids, NsSuiteQlOrderSupport.buildConditionIdQuery(
+                NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(waived), "trandate", null), "MISSING", "ItemShip", "2026-08-01", "2026-09-01"))
+        // a run's record carries no stamp
+        assertFalse(NsSuiteQlOrderSupport.mapRowToRecord(spec([:]), [tranid: "SO1"]).containsKey("darpanStamp"))
+    }
+
+    /**
+     * Review Focus 4: a line edited while its order's header stamp stays still. The changed-since read asks for the order
+     * whose header moved OR that has any line whose own stamp moved, so the next read picks the line edit up. RECORDS has no
+     * alias, so the line half is an uncorrelated id IN (ruling 3b1-5, the shape the gate ran).
+     */
+    @Test
+    void changedSinceRecordsCatchesALineEditWithAStillHeader() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)
+        String q = NsSuiteQlOrderSupport.buildRecordsQuery(s, "2026-11-18", NsSuiteQlOrderSupport.readThruDate(s, "2026-11-20"))
+        assertEquals("SELECT tranid, ${stampColumns('transaction')} FROM transaction WHERE type = 'SalesOrd' ".toString() +
+                "AND (lastmodifieddate >= TO_DATE('2026-11-18', 'YYYY-MM-DD') " +
+                "OR id IN (SELECT cl.transaction FROM transactionline cl WHERE cl.linelastmodifieddate >= TO_DATE('2026-11-18', 'YYYY-MM-DD'))) " +
+                "ORDER BY id", q)
+        assertFalse(q.contains("trandate"), "a changed-since read is not bounded by the transaction date: ${q}")
+    }
+
+    /** SALES_LINES joins its lines itself; the clause sits on its header t, and every line of a changed order comes back. */
+    @Test
+    void changedSinceSalesLinesUsesTheClauseOnT() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.applyReadMode(salesLinesSpec(), "darpanStamp", true)
+        String q = NsSuiteQlOrderSupport.buildRecordsQuery(s, "2026-11-18", NsSuiteQlOrderSupport.readThruDate(s, "2026-11-20"))
+        assertEquals("SELECT t.custbody_hc_order_id AS custbody_hc_order_id, t.tranid AS tranid, " +
+                "tl.custcol_hc_order_line_id AS order_line_id, tl.quantityshiprecv AS quantity_shipped, " +
+                "tl.quantitybackordered AS quantity_backordered, tl.isclosed AS line_closed, tl.id AS line_id, " +
+                "tl.itemtype AS item_type, tl.quantitybilled AS quantity_billed, " +
+                "CASE WHEN tl.quantitybilled <> 0 THEN 'BILLED' WHEN tl.isclosed = 'T' THEN 'CLOSED' " +
+                "WHEN tl.quantityshiprecv <> 0 THEN 'SHIPPED' ELSE 'OPEN' END AS line_state, " +
+                "tl.location AS line_location, BUILTIN.DF(tl.item) AS item_name, (-1 * tl.netamount) AS line_amount, " +
+                "${stampColumns('t')} ".toString() +
+                "FROM transaction t JOIN transactionline tl ON tl.transaction = t.id " +
+                "WHERE t.type = 'SalesOrd' " +
+                "AND (t.lastmodifieddate >= TO_DATE('2026-11-18', 'YYYY-MM-DD') " +
+                "OR t.id IN (SELECT cl.transaction FROM transactionline cl WHERE cl.linelastmodifieddate >= TO_DATE('2026-11-18', 'YYYY-MM-DD'))) " +
+                "AND tl.mainline = 'F' " +
+                "AND (tl.custcol_hc_order_line_id IS NOT NULL OR tl.itemtype = 'Payment') AND t.custbody_hc_order_id IS NOT NULL " +
+                "ORDER BY t.id, tl.id", q)
+    }
+
+    /**
+     * Ruling 3b1-6: a changed-since read sends no upper bound, so what changed today (after the readThru day's midnight in the
+     * session zone) is read too. The day the dispatcher sent as the end is dropped, and the written file says so.
+     */
+    @Test
+    void changedSinceSendsNoUpperBound() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)
+        assertNull(NsSuiteQlOrderSupport.readThruDate(s, "2026-11-20"))
+        String q = NsSuiteQlOrderSupport.buildRecordsQuery(s, "2026-11-18", null)
+        assertFalse(q.contains(" < "), q)
+        assertFalse(q.contains("2026-11-20"), q)
+        StringWriter out = new StringWriter()
+        List<String> sent = []
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: s, fromDate: "2026-11-18", toDate: null], { String query, int limit, int offset ->
+            sent << query
+            return [items: [[tranid: "SO1", darpan_header_stamp: "2026-11-20 09:15:00"]], hasMore: false]
+        })
+        assertEquals([q], sent)
+        Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        assertNull(doc.metadata.windowThru)
+        assertEquals(true, doc.metadata.changedSince)
+        assertEquals([[tranId: "SO1", darpanStamp: "2026-11-20T17:15:00Z"]], doc.records, "today's change is read, stamped as an instant")
+    }
+
+    /**
+     * Ruling 3b1-6: a dataset's FULL read windows on the transaction date with tomorrow as its end, so today's transactions
+     * are in it; a run's read, sent the same days, keeps its own end.
+     */
+    @Test
+    void aFullReadIncludesToday() {
+        Map<String, Object> full = NsSuiteQlOrderSupport.applyReadMode(spec([:]), "trandate", true)
+        assertEquals("2026-11-21", NsSuiteQlOrderSupport.readThruDate(full, "2026-11-20"))
+        String q = NsSuiteQlOrderSupport.buildRecordsQuery(full, "2026-09-19", NsSuiteQlOrderSupport.readThruDate(full, "2026-11-20"))
+        assertEquals("SELECT tranid, ${stampColumns('transaction')} FROM transaction WHERE type = 'SalesOrd' ".toString() +
+                "AND trandate >= TO_DATE('2026-09-19', 'YYYY-MM-DD') " +
+                "AND trandate < TO_DATE('2026-11-21', 'YYYY-MM-DD') ORDER BY id", q)
+        Map<String, Object> lines = NsSuiteQlOrderSupport.applyReadMode(salesLinesSpec(), "trandate", true)
+        assertTrue(NsSuiteQlOrderSupport.buildRecordsQuery(lines, "2026-09-19", NsSuiteQlOrderSupport.readThruDate(lines, "2026-11-20"))
+                .contains("AND t.trandate < TO_DATE('2026-11-21', 'YYYY-MM-DD') "))
+        // a run's read: the end it was sent
+        Map<String, Object> run = NsSuiteQlOrderSupport.applyReadMode(spec([:]), null, null)
+        assertEquals("2026-11-20", NsSuiteQlOrderSupport.readThruDate(run, "2026-11-20"))
+        assertNull(NsSuiteQlOrderSupport.readThruDate(full, null), "a read with no window keeps none")
+    }
+
+    /**
+     * Ruling P3b1-12: both stamps come back as session-zone wall clock to the second (TO_CHAR; the raw columns are day-only);
+     * darpanStamp is the later one as a UTC instant, so the kept copy compares instants.
+     */
+    @Test
+    void darpanStampIsTheLaterOfHeaderAndNewestLine() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)
+        // the gate's own pair (2026-11-18, Pacific standard time, UTC-8): a line a second after its header
+        assertEquals("2026-11-18T10:01:59Z", NsSuiteQlOrderSupport.mapRowToRecord(s,
+                [tranid: "SO1", darpan_header_stamp: "2026-11-18 02:01:58", darpan_line_stamp: "2026-11-18 02:01:59"]).darpanStamp)
+        // a header edited after its newest line
+        assertEquals("2026-11-19T00:30:00Z", NsSuiteQlOrderSupport.mapRowToRecord(s,
+                [tranid: "SO2", darpan_header_stamp: "2026-11-18 16:30:00", darpan_line_stamp: "2026-11-17 08:00:00"]).darpanStamp)
+        // daylight time (UTC-7), and an order with no lines (SuiteQL leaves a null column out of the row)
+        assertEquals("2026-07-01T19:00:00Z", NsSuiteQlOrderSupport.mapRowToRecord(s,
+                [tranid: "SO3", darpan_header_stamp: "2026-07-01 12:00:00"]).darpanStamp)
+        // the stamp columns themselves are not record fields
+        assertEquals([tranId: "SO1", darpanStamp: "2026-11-18T10:01:59Z"], NsSuiteQlOrderSupport.mapRowToRecord(s,
+                [tranid: "SO1", darpan_header_stamp: "2026-11-18 02:01:58", darpan_line_stamp: "2026-11-18 02:01:59", links: []]))
+        assertEquals("2026-11-18T10:01:59Z", NsSuiteQlOrderSupport.changeStamp("2026-11-18 02:01:58", "2026-11-18 02:01:59"))
+        // a stamp read wrongly would merge a change as older than what the copy holds: the read fails instead
+        assertThrows(IllegalStateException) { NsSuiteQlOrderSupport.changeStamp("11/18/2026", null) }
+        assertThrows(IllegalStateException) { NsSuiteQlOrderSupport.changeStamp(null, null) }
+    }
+
+    /**
+     * Review Focus 5 / ruling P3b1-14: a template whose records depend on other transactions (or that has no window) cannot
+     * be kept by its own stamps. Its dataset read, changed-since or full, is refused with a message naming the two that can.
+     */
+    @Test
+    void linkedChildTemplatesRefuseChangedSince() {
+        everyTemplate().findAll { k, v -> !(k in ["RECORDS", "SALES_LINES"]) }.each { String template, Map<String, Object> s ->
+            [["darpanStamp", true], ["darpanStamp", null], [s.dateColumn ?: "trandate", true]].each { List mode ->
+                IllegalArgumentException e = assertThrows(IllegalArgumentException, {
+                    NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(s), mode[0], mode[1])
+                }, "${template} ${mode}")
+                assertTrue(e.message.contains(template), e.message)
+                assertTrue(e.message.contains("RECORDS") && e.message.contains("SALES_LINES"), e.message)
+            }
+            // the query builder refuses too, however the spec came to be marked
+            assertThrows(IllegalArgumentException, { sql(s + [changedSince: true, stamped: true]) }, template)
+        }
+        // RECORDS on a table with no lines has no line stamp to read
+        Map<String, Object> customers = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "Customer",
+                fromTable: "customer", dateColumn: "datecreated"], [[recordFieldName: "id", sourceColumn: "id", sequenceNum: 1]])
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyReadMode(customers, "darpanStamp", true) }
+    }
+
+    /** Ruling 3b1-4: the window field is the row's dateColumn or the changed-since stamp; any other is refused by name. */
+    @Test
+    void anyOtherWindowFieldIsRefused() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.applyReadMode(spec([:]), "lastmodifieddate", null)
+        }
+        assertTrue(e.message.contains("lastmodifieddate") && e.message.contains("trandate") && e.message.contains("darpanStamp"), e.message)
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyReadMode(spec([:]), "createdAt", true) }
     }
 }

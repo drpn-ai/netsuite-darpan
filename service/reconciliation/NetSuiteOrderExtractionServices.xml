@@ -62,6 +62,21 @@
                     to the next window, so consecutive chunks do not double-count their boundary.
                     Required unless lookupKeys is given.</description>
             </parameter>
+            <parameter name="windowFieldName">
+                <description>DAR-BE-318 plan 3b-1 (ruling 3b1-4). What the window bounds. Blank, or the query row's own dateColumn:
+                    the window applies to that column, exactly as every run read does. darpanStamp: a dataset's daily read, by what
+                    changed (RECORDS and SALES_LINES queries only): the transactions whose header lastmodifieddate or any of whose
+                    lines' linelastmodifieddate is at or after windowStart's day, with no end, so what changed today is read too.
+                    Any other value is refused. No default on purpose: a run side names none, so a kept copy is never cut on a
+                    field this service picked for it.</description>
+            </parameter>
+            <parameter name="datasetRead" type="Boolean" default-value="false">
+                <description>DAR-BE-318 plan 3b-1. True on every read that builds a dataset's kept copy (the NETSUITE_SUITEQL row's
+                    datasetReadParametersJson sends it, data/NetSuiteConnectorSeedData.xml): each record carries darpanStamp, the
+                    later of its header lastmodifieddate and its newest line's linelastmodifieddate as a UTC instant; a read on the
+                    dateColumn ends the day after windowEnd, so today's transactions are in it; and a query on any template but
+                    RECORDS or SALES_LINES is refused, so a dataset on one fails its first read and never builds a copy.</description>
+            </parameter>
             <parameter name="lookupKeys" type="List">
                 <description>DAR-BE-118 / DAR-BE-119. A read by key: only the records whose lookupKeyField holds one of these
                     (at most 1000; letters, digits, # _ . -), with no window, still under the query row's own conditions. A
@@ -125,6 +140,19 @@
             <parameter name="warnings" type="List"/>
             <parameter name="errors" type="List"/>
         </out-parameters>
+    </service>
+
+    <service verb="project" noun="NetSuiteKeptRecords" allow-remote="false" authenticate="true">
+        <description>DAR-BE-318 (rulings P3b1-6, P3b1-9). The NetSuite side of darpan's kept-copy projection: it refuses every
+            side, so a NetSuite run reads live. Served parity is not proven on the real record shape: a copy record carries
+            darpanStamp, which the live record does not; a query's derived columns (linked children, line sums, locations) and
+            HotWax statuses are read at read time and move neither stamp; and SuiteQL compares days in the account's zone.
+            Named by the NETSUITE_SUITEQL row (data/NetSuiteConnectorSeedData.xml), so giving that row a window field can never
+            start serving a copy. Reads nothing.</description>
+        <implements service="dataset.DatasetServices.project#KeptRecords"/>
+        <actions>
+            <set field="servingProblem" value="a NetSuite side reads live: its copy's records carry darpanStamp, and the columns a query derives from other records at read time move neither stamp"/>
+        </actions>
     </service>
 
 </services>

@@ -169,6 +169,11 @@ try {
         querySpec.lookupKeys = NsSuiteQlOrderSupport.lookupKeyList(lookupKeys, querySpec)
         querySpec.lookupWithinWindow = lookupWithinWindow == true
     }
+    // DAR-BE-318 plan 3b-1. A dataset's read: on the query's dateColumn (full, ending the day after the one sent, so today is
+    // in it) or by what changed (darpanStamp, no end), each record stamped. Neither parameter: the spec and the window are
+    // untouched. Another window field, or a template that cannot be kept, is refused here, before any request.
+    NsSuiteQlOrderSupport.applyReadMode(querySpec, windowFieldName, datasetRead)
+    thruDate = NsSuiteQlOrderSupport.readThruDate(querySpec, thruDate)
 } catch (IllegalArgumentException e) {
     errors = [e.message]
     return

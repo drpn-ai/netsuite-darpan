@@ -162,6 +162,27 @@ class NsSuiteQlOrderSupport {
     static final String DEFAULT_DATE_COLUMN = "trandate"
 
     /**
+     * DAR-BE-318 plan 3b-1 (rulings 3b1-4, 3b1-5, P3b1-12, P3b1-14). A dataset (a tenant's kept copy) reads a query in full on
+     * its dateColumn and then daily by what changed: the transactions whose header lastmodifieddate OR any of whose lines'
+     * linelastmodifieddate is at or after the mark. Every record of such a read carries CHANGE_STAMP_FIELD, the later of the
+     * two stamps as a UTC instant, which the copy merges by. Only these templates can be kept that way: every other one
+     * selects a record by other transactions (a linked child, a status against its chain, a written finding over derived
+     * columns) or has no window, and neither stamp of the record moves when those do.
+     */
+    static final String CHANGE_STAMP_FIELD = "darpanStamp"
+    static final List<String> KEPT_COPY_TEMPLATES = [TEMPLATE_RECORDS, TEMPLATE_SALES_LINES].asImmutable()
+    /**
+     * The SuiteQL session's zone: TO_DATE reads a day's midnight in it, and TO_CHAR writes a date column's wall clock in it
+     * (spec 4a; probed read-only on 2026-11-20). The raw date columns come back day-only (MM/DD/YYYY), so the stamps are
+     * read through TO_CHAR to the second and placed in this zone.
+     */
+    static final java.time.ZoneId SESSION_ZONE = java.time.ZoneId.of("America/Los_Angeles")
+    private static final String STAMP_FORMAT = "YYYY-MM-DD HH24:MI:SS"
+    private static final java.time.format.DateTimeFormatter STAMP_PARSER = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+    private static final String HEADER_STAMP_KEY = "darpan_header_stamp"
+    private static final String LINE_STAMP_KEY = "darpan_line_stamp"
+
+    /**
      * THE VALIDATION BELOW IS NEW SURFACE, NOT CEREMONY. The window bounds are interpolated into
      * SuiteQL text rather than bound as parameters (NetSuite's query endpoint takes a string), which
      * is why requireIsoDate has always existed. While the table, record type and columns were compile
@@ -759,18 +780,26 @@ class NsSuiteQlOrderSupport {
      */
     static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate, String asOfDate = null) {
         String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
+        // DAR-BE-318: a kept-copy read of a template that cannot be kept is refused however its spec was marked
+        if (spec.get("stamped") || spec.get("changedSince")) {
+            String problem = keptCopyProblem(spec)
+            if (problem) throw new IllegalArgumentException(problem)
+        }
         if (template == TEMPLATE_ACTIVE_ITEMS) return buildActiveItemsQuery(spec, asOfDate)
         if (!spec.get("lookupKeys")) {
             requireIsoDate(fromDate, "fromDate")
-            requireIsoDate(toDate, "toDate")
+            // a read by what changed has no upper bound (ruling 3b1-6)
+            if (!spec.get("changedSince")) requireIsoDate(toDate, "toDate")
         }
         String dateColumn = (String) spec.get("dateColumn")
 
         // RECORDS stays BYTE-IDENTICAL to what shipped for DAR-BE-032/044, alias and all (there is
         // none). Every stored row predates the template field, so a default that even reformatted this
-        // query would change an extract already proven against gorjana production.
+        // query would change an extract already proven against gorjana production. Only a dataset read
+        // (stamped) adds its two stamp columns.
         if (template == TEMPLATE_RECORDS) {
-            return "SELECT ${selectColumns(spec, (String) spec.get('fromTable')).join(', ')} FROM ${spec.get('fromTable')} " +
+            return "SELECT ${selectColumns(spec, (String) spec.get('fromTable')).join(', ')}" +
+                    "${stampColumns(spec, (String) spec.get('fromTable'), null)} FROM ${spec.get('fromTable')} " +
                     "WHERE type = '${spec.get('recordType')}' " +
                     population(spec, dateColumn, fromDate, toDate, null) +
                     "ORDER BY id"
@@ -989,7 +1018,9 @@ class NsSuiteQlOrderSupport {
                 // name a completed item NetSuite cannot ship because its line has no location.
                 "tl.location AS line_location, " +
                 // DAR-UI-099: the item and amount, so a line with no HotWax line id (a store-credit payment) can be named.
-                "BUILTIN.DF(tl.item) AS item_name, (-1 * tl.netamount) AS line_amount "
+                "BUILTIN.DF(tl.item) AS item_name, (-1 * tl.netamount) AS line_amount" +
+                // DAR-BE-318: a dataset read's two stamp columns, the order's (every line of it carries the same stamp)
+                stampColumns(spec, "t", "t") + " "
         sql << "FROM ${spec.get('fromTable')} t JOIN transactionline tl ON tl.transaction = t.id "
         sql << "WHERE t.type = '${spec.get('recordType')}' "
         sql << population(spec, dateColumn, fromDate, toDate, "t")
@@ -1259,6 +1290,8 @@ class NsSuiteQlOrderSupport {
             record.put(originFieldName,
                     row.get(spec.get("joinKeyRowKey")) != null ? ORIGIN_HOTWAX : ORIGIN_NETSUITE_NATIVE)
         }
+        // DAR-BE-318: a dataset read's record carries the stamp its copy merges by, never the two raw stamp columns
+        if (spec.get("stamped")) record.put(CHANGE_STAMP_FIELD, changeStamp(row.get(HEADER_STAMP_KEY), row.get(LINE_STAMP_KEY)))
         return record
     }
 
@@ -1378,10 +1411,122 @@ class NsSuiteQlOrderSupport {
     private static String population(Map<String, Object> spec, String dateColumn, String fromDate, String toDate, String qualifier) {
         List<String> keys = (List<String>) spec.get("lookupKeys")
         String byKey = keys ? "AND ${keyColumn(spec, qualifier)} IN (${keys.collect { "'${it}'" }.join(', ')}) ".toString() : ""
+        // DAR-BE-318: a read by what changed is bounded below only (ruling 3b1-6)
+        if (spec.get("changedSince")) {
+            if (keys && !(spec.get("lookupWithinWindow") && fromDate)) return byKey
+            return byKey + changedSinceClause(fromDate, qualifier)
+        }
         if (keys && !(spec.get("lookupWithinWindow") && fromDate && toDate)) return byKey
         String column = qualifier ? "${qualifier}.${dateColumn}" : dateColumn
         return (byKey + "AND ${column} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
                 "AND ${column} < TO_DATE('${toDate}', 'YYYY-MM-DD') ").toString()
+    }
+
+    /**
+     * DAR-BE-318 (ruling 3b1-5, Review Focus 4). The transactions changed at or after {@code fromDate}'s midnight in the
+     * session zone: the header's lastmodifieddate moved, OR a line's own linelastmodifieddate did, since a line can be edited
+     * while its header stamp stays still. The line half is an uncorrelated id IN, so it reads the same with or without the
+     * transaction's alias (RECORDS has none). No upper bound: what changed today is read too.
+     */
+    private static String changedSinceClause(String fromDate, String qualifier) {
+        String q = qualifier ? "${qualifier}." : ""
+        String from = "TO_DATE('${fromDate}', 'YYYY-MM-DD')"
+        return ("AND (${q}lastmodifieddate >= ${from} OR ${q}id IN (SELECT cl.transaction FROM transactionline cl " +
+                "WHERE cl.linelastmodifieddate >= ${from})) ").toString()
+    }
+
+    /**
+     * DAR-BE-318 (rulings 3b1-5, P3b1-12). A dataset read's two stamp columns after the configured ones, or "" for any other
+     * read: the header's lastmodifieddate and its newest line's linelastmodifieddate, each as session-zone wall clock to the
+     * second (TO_CHAR; the raw columns come back day-only). {@code outer} names the transaction as the query does ("t", or
+     * the table in RECORDS, which has no alias); {@code qualifier} is what its own columns are prefixed with.
+     */
+    private static String stampColumns(Map<String, Object> spec, String outer, String qualifier) {
+        if (!spec.get("stamped")) return ""
+        String header = qualifier ? "${qualifier}.lastmodifieddate" : "lastmodifieddate"
+        return (", TO_CHAR(${header}, '${STAMP_FORMAT}') AS ${HEADER_STAMP_KEY}, " +
+                "TO_CHAR((SELECT MAX(sl.linelastmodifieddate) FROM transactionline sl WHERE sl.transaction = ${outer}.id), " +
+                "'${STAMP_FORMAT}') AS ${LINE_STAMP_KEY}").toString()
+    }
+
+    /**
+     * DAR-BE-318 plan 3b-1 (rulings 3b1-4, P3b1-14). Reads the extractor's windowFieldName and datasetRead onto the spec, or
+     * refuses them:
+     * <ul>
+     * <li>windowFieldName blank, or the query's own dateColumn: the read windows on that column, as every run read does.
+     *     With datasetRead (a dataset's full read) each record also carries CHANGE_STAMP_FIELD (spec.stamped).</li>
+     * <li>windowFieldName CHANGE_STAMP_FIELD: a dataset's daily read, by what changed since the window start, with no upper
+     *     bound (spec.changedSince, spec.stamped).</li>
+     * <li>any other windowFieldName is refused by name.</li>
+     * </ul>
+     * A stamped read of a template other than KEPT_COPY_TEMPLATES, or of a table with no transaction lines, is refused, so a
+     * dataset on one fails its first read and never builds a copy. With neither parameter the spec is returned untouched:
+     * no key is added, and every query is the one a run sends today.
+     */
+    static Map<String, Object> applyReadMode(Map<String, Object> spec, Object windowFieldName, Object datasetRead) {
+        String field = text(windowFieldName)
+        String dateColumn = (String) spec.get("dateColumn")
+        boolean changedSince = field == CHANGE_STAMP_FIELD
+        if (field && !changedSince && field != dateColumn) {
+            throw new IllegalArgumentException("NetSuite query ${spec.get('nsSuiteQlSourceQueryId')} windows on ${dateColumn} " +
+                    "or, read by what changed, ${CHANGE_STAMP_FIELD}; it cannot window on ${field}")
+        }
+        boolean stamped = changedSince || datasetRead == true || "true".equalsIgnoreCase(text(datasetRead))
+        if (!stamped) return spec
+        String problem = keptCopyProblem(spec)
+        if (problem) throw new IllegalArgumentException(problem)
+        spec.put("stamped", true)
+        if (changedSince) spec.put("changedSince", true)
+        return spec
+    }
+
+    /** Why the spec's query cannot be kept as a copy read by what changed, or null when it can. */
+    private static String keptCopyProblem(Map<String, Object> spec) {
+        String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
+        if (!KEPT_COPY_TEMPLATES.contains(template)) {
+            return ("NetSuite query ${spec.get('nsSuiteQlSourceQueryId')} uses the ${template} template, which cannot be kept as a " +
+                    "copy: its records depend on other transactions or have no window, and neither the header nor the line stamp " +
+                    "moves when those do. Only ${KEPT_COPY_TEMPLATES.join(' and ')} queries can be kept").toString()
+        }
+        if (spec.get("fromTable") != DEFAULT_FROM_TABLE) {
+            return ("NetSuite query ${spec.get('nsSuiteQlSourceQueryId')} reads ${spec.get('fromTable')}, which has no transaction " +
+                    "lines to stamp; only ${KEPT_COPY_TEMPLATES.join(' and ')} queries over ${DEFAULT_FROM_TABLE} can be kept").toString()
+        }
+        return null
+    }
+
+    /**
+     * DAR-BE-318 (ruling 3b1-6). The exclusive end day a read sends SuiteQL, from the day the dispatcher sent: none for a read
+     * by what changed; the day after for a dataset's full read, so today's transactions are in it (the dispatcher sends today,
+     * and SuiteQL's end is exclusive); the day as sent for every other read. Null stays null (a read with no window).
+     */
+    static String readThruDate(Map<String, Object> spec, String thruDate) {
+        if (spec.get("changedSince")) return null
+        if (thruDate == null || !spec.get("stamped")) return thruDate
+        requireIsoDate(thruDate, "toDate")
+        return LocalDate.parse(thruDate).plusDays(1).toString()
+    }
+
+    /**
+     * DAR-BE-318 (ruling P3b1-12). CHANGE_STAMP_FIELD of a row: the later of its header and newest-line stamps, both
+     * session-zone wall clock (yyyy-MM-dd HH:mm:ss), as an ISO-8601 UTC instant. A missing line stamp (an order with no lines)
+     * leaves the header's. Throws when neither is there or one is unreadable: a record stamped wrongly would merge as older
+     * than the copy's and its change would be lost, so the read fails instead.
+     */
+    static String changeStamp(Object headerStamp, Object lineStamp) {
+        Instant header = stampInstant(headerStamp), line = stampInstant(lineStamp)
+        if (header == null && line == null) throw new IllegalStateException("A NetSuite record came back with no lastmodifieddate")
+        return (header == null || (line != null && line.isAfter(header)) ? line : header).toString()
+    }
+
+    private static Instant stampInstant(Object value) {
+        String s = text(value)
+        if (!s) return null
+        try {
+            return LocalDateTime.parse(s, STAMP_PARSER).atZone(SESSION_ZONE).toInstant()
+        } catch (Exception e) {
+            throw new IllegalStateException("A NetSuite stamp came back as '${s}', not as yyyy-MM-dd HH:mm:ss".toString(), e)
+        }
     }
 
     /** A written finding's conditions, stored as JSON [{fieldId, op, values}]; fields and values reach SuiteQL. */
@@ -1673,6 +1818,8 @@ class NsSuiteQlOrderSupport {
                 warnings     : warnings,
         ] as Map<String, Object>
         if (unkeyedSetAside) metadata.unkeyedLinesSetAside = unkeyedSetAside
+        // DAR-BE-318: a dataset's daily read, by what changed since windowFrom, with no end
+        if (spec.get("changedSince")) metadata.changedSince = true
         // Absent entirely when no rules are configured, matching the OMS and Shopify getters: a
         // block that appeared on every extract would read as "this always applies".
         if (rules) {

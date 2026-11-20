@@ -150,6 +150,19 @@ class NsLifecycleSnapshotTest {
         assertFalse(snapshot.covers(spec([:], FIELDS + [[recordFieldName: "memo", sourceColumn: "memo", sequenceNum: 4]])))
     }
 
+    /**
+     * DAR-BE-318 plan 3b-1: a dataset read (stamped, or read by what changed) is never answered from a run's window snapshot,
+     * which holds neither the stamps nor the changed-since population; a run's read of the same spec still is.
+     */
+    @Test
+    void aDatasetReadIsNeverAnsweredFromALifecycleSnapshot() {
+        assertTrue(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), null, null)))
+        assertTrue(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "trandate", false)))
+        assertFalse(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "trandate", true)))
+        assertFalse(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)))
+        assertFalse(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", null)))
+    }
+
     // Snapshots are kept per exactly what was read: another window, record type or account is another snapshot.
     @Test
     void theKeyNamesEverythingTheReadDependsOn() {

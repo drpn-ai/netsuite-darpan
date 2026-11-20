@@ -61,6 +61,8 @@ class NsLifecycleSnapshot {
     /** True when the spec's question can be answered exactly from a snapshot of its window. */
     static boolean canAnswer(Map<String, Object> spec) {
         if (!(spec.get("queryTemplate") in TEMPLATES)) return false
+        // DAR-BE-318: a dataset read carries stamps (and may read by what changed) that a window snapshot does not hold
+        if (spec.get("stamped") || spec.get("changedSince")) return false
         if (spec.get("fromTable") != NsSuiteQlOrderSupport.DEFAULT_FROM_TABLE) return false
         if (spec.get("requireFulfillableOpenLine") || spec.get("requireOverdueShipDate")) return false
         if (spec.get("requireParentRecordType") || spec.get("amountColumn") || spec.get("lineKeyColumn")) return false

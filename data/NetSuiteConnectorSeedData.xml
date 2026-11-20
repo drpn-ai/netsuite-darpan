@@ -5,7 +5,18 @@
 
   excludedRecordsSidecar Y: the SuiteQL extract writes the records its source filters set aside beside its file
   (ExcludedRecordsSidecar.writeBeside). A kept-copy slice writes that side file exactly when this says Y.
+
+  datasetReadParametersJson {"datasetRead":true}: sent on every dataset read of the endpoint (Task 5). The read stamps each
+    record with darpanStamp (the later of its header lastmodifieddate and newest line's linelastmodifieddate), ends a full
+    read on the dateColumn the day after the one sent so today is in it, and refuses any template but RECORDS and SALES_LINES,
+    so a dataset on one fails its first read and never builds a copy (ruling P3b1-14). A run read sends none of it.
+
+  servingProjectionServiceName: project#NetSuiteKeptRecords refuses every side, so a NetSuite run reads live (ruling P3b1-6):
+    served parity is not proven on the real record shape. The row names no windowFieldName either; this keeps a copy from
+    being served even if it is given one. See NetSuiteKeptCopyTests.
 -->
 <entity-facade-xml type="darpan-seed">
-    <darpan.reconciliation.SourceSystemConnector systemEnumId="NETSUITE_SUITEQL" excludedRecordsSidecar="Y"/>
+    <darpan.reconciliation.SourceSystemConnector systemEnumId="NETSUITE_SUITEQL" excludedRecordsSidecar="Y"
+            servingProjectionServiceName="reconciliation.NetSuiteOrderExtractionServices.project#NetSuiteKeptRecords"
+            datasetReadParametersJson='{"datasetRead":true}'/>
 </entity-facade-xml>
