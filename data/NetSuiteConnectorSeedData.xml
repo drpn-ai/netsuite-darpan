@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DAR-BE-318 plan 3b-1 (ruling P3b1-9). What the NetSuite endpoints do that darpan core must know without naming NetSuite: set
+  here, on the core connector row by primary key (the other fields stay core's), never in core.
+
+  excludedRecordsSidecar Y: the SuiteQL extract writes the records its source filters set aside beside its file
+  (ExcludedRecordsSidecar.writeBeside). A kept-copy slice writes that side file exactly when this says Y.
+-->
+<entity-facade-xml type="darpan-seed">
+    <darpan.reconciliation.SourceSystemConnector systemEnumId="NETSUITE_SUITEQL" excludedRecordsSidecar="Y"/>
+</entity-facade-xml>
