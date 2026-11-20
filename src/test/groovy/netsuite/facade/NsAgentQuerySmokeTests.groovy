@@ -3,6 +3,9 @@ package netsuite.facade
 import darpan.agent.AgentQueryLane
 import darpan.agent.AgentQuerySupport
 import darpan.facade.common.TenantAccessSupport
+import darpan.peak.NetSuiteReadGate
+import darpan.peak.PeakReadPolicy
+import darpan.peak.ReadLimits
 import darpan.reconciliation.support.ReconciliationSmokeTestSupport
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
@@ -15,6 +18,8 @@ import org.moqui.context.ExecutionContext
 import java.nio.file.Path
 import java.sql.Timestamp
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 import static org.junit.jupiter.api.Assertions.assertEquals
 import static org.junit.jupiter.api.Assertions.assertFalse
@@ -220,6 +225,39 @@ class NsAgentQuerySmokeTests {
         assertEquals("OAUTH2_M2M_JWT", only.authType)
         assertEquals(["NSA_B"], (list(TENANT_B).connections as List).collect { it.nsAuthConfigId })
         assertFalse(a.toString().contains(CLIENT_ID) || a.toString().contains(HOST))
+    }
+
+    @Test
+    void "DAR-BE-328: in a serial peak period the query waits its turn behind the tenant's other NetSuite read"() {
+        PeakReadPolicy.resetForTests()
+        NetSuiteReadGate.resetForTests()
+        PeakReadPolicy.limitsLoader = { def e, String t -> t == TENANT_A ? new ReadLimits(null, true) : ReadLimits.NONE }
+        long originalTimeout = AgentQuerySupport.timeoutMillis
+        CountDownLatch holding = new CountDownLatch(1)
+        CountDownLatch release = new CountDownLatch(1)
+        Thread extract = Thread.start { NetSuiteReadGate.run(TENANT_A) { -> holding.countDown(); release.await(10, TimeUnit.SECONDS) } }
+        try {
+            assertTrue(holding.await(5, TimeUnit.SECONDS))
+            AgentQuerySupport.timeoutMillis = 700L
+            Map waited = query(TENANT_A, "NSA_A", "SELECT 328 FROM waits")
+            assertEquals("TIMEOUT", waited.code, "${waited}")
+            assertTrue(calls.isEmpty(), "nothing is sent while the tenant's other NetSuite read holds the turn")
+            // another tenant is not held back
+            assertTrue(query(TENANT_B, "NSA_B", "SELECT 328 FROM other").ok as boolean)
+            assertEquals(1, calls.size())
+            release.countDown()
+            extract.join(5_000)
+            AgentQuerySupport.timeoutMillis = originalTimeout
+            assertTrue(query(TENANT_A, "NSA_A", "SELECT 328 FROM turn").ok as boolean)
+            assertEquals(2, calls.size())
+        } finally {
+            release.countDown()
+            extract.join(5_000)
+            AgentQuerySupport.timeoutMillis = originalTimeout
+            AgentQueryLane.reset()
+            PeakReadPolicy.resetForTests()
+            NetSuiteReadGate.resetForTests()
+        }
     }
 
     @Test

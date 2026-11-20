@@ -1,5 +1,8 @@
 package netsuite.reconciliation.orders
 
+import darpan.peak.NetSuiteReadGate
+import darpan.peak.PeakReadPolicy
+import darpan.peak.ReadLimits
 import darpan.reconciliation.automation.SourceSystemConnectorSupport
 import darpan.reconciliation.support.ReconciliationSmokeTestSupport
 import org.junit.jupiter.api.AfterAll
@@ -9,6 +12,8 @@ import org.junit.jupiter.api.TestInstance
 import org.moqui.context.ExecutionContext
 
 import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 import static org.junit.jupiter.api.Assertions.assertEquals
 import static org.junit.jupiter.api.Assertions.assertNotNull
@@ -103,5 +108,63 @@ class NetSuiteOrderExtractionServiceContractTests {
         assertEquals(false, result.dataAvailable)
         assertTrue(((List) result.errors).any { it.toString().contains("NO_SUCH_QUERY") },
                 "the error must name the query that was not usable: ${result.errors}")
+    }
+    /**
+     * DAR-BE-328: whoever calls the extract (an automation side, a read by key, an interactive run, a lookup), a tenant in a
+     * "NetSuite one at a time" peak period reads only in its turn: the extract waits while another of the tenant's NetSuite
+     * reads holds it, and reads once it is let go. The read itself fails here on the missing private key, after the wait and before any request.
+     */
+    @Test
+    void inASerialPeakPeriodTheExtractWaitsForTheTenantsTurn() {
+        String tenant = "NS_PEAK_GATE"
+        ec.artifactExecution.disableAuthz()
+        try {
+            ec.entity.makeValue("moqui.security.UserGroup").setAll([userGroupId: tenant, description: "Peak gate tenant"]).createOrUpdate()
+            ec.entity.makeValue("darpan.reconciliation.NsAuthConfig").setAll([nsAuthConfigId: "NS_PEAK_GATE_AUTH", companyUserGroupId: tenant,
+                    description: "Peak gate account", authType: "OAUTH2_M2M_JWT", tokenUrl: "https://7654321-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token",
+                    clientId: "c" * 64, certId: "k" * 43, isActive: "Y"]).createOrUpdate()
+            ec.entity.makeValue("darpan.reconciliation.NsSuiteQlSourceQuery").setAll([nsSuiteQlSourceQueryId: "NS_PEAK_GATE_Q",
+                    nsAuthConfigId: "NS_PEAK_GATE_AUTH", companyUserGroupId: tenant, description: "Peak gate query",
+                    recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate",
+                    queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", isActive: "Y"]).createOrUpdate()
+            ec.entity.makeValue("darpan.reconciliation.NsSuiteQlSourceQueryField").setAll([nsSuiteQlSourceQueryId: "NS_PEAK_GATE_Q",
+                    recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1]).createOrUpdate()
+        } finally {
+            ec.artifactExecution.enableAuthz()
+        }
+        Closure<Map> extract = { ->
+            (Map) ec.service.sync().name("reconciliation.NetSuiteOrderExtractionServices.extract#NetSuiteOrders")
+                    .parameters([nsSuiteQlSourceQueryId: "NS_PEAK_GATE_Q", companyUserGroupId: tenant,
+                                 windowStart           : "2026-08-01", windowEnd: "2026-09-01"])
+                    .disableAuthz().call()
+        }
+        PeakReadPolicy.resetForTests()
+        NetSuiteReadGate.resetForTests()
+        CountDownLatch holding = new CountDownLatch(1)
+        long releasedAt = 0L
+        Thread holder = null
+        try {
+            extract.call()   // warm: the script compiles outside the timed part
+            ec.message.clearErrors()
+            PeakReadPolicy.limitsLoader = { def e, String t -> t == tenant ? new ReadLimits(null, true) : ReadLimits.NONE }
+            holder = Thread.start {
+                NetSuiteReadGate.run(tenant) { -> holding.countDown(); Thread.sleep(1_500); releasedAt = System.currentTimeMillis() }
+            }
+            assertTrue(holding.await(5, TimeUnit.SECONDS))
+            Map result = extract.call()
+            long finishedAt = System.currentTimeMillis()
+            assertTrue(releasedAt > 0L && finishedAt >= releasedAt,
+                    "the extract must read only after the tenant's other NetSuite read let go (released ${releasedAt}, finished ${finishedAt}): ${result.errors}")
+            // It got past the query and account checks to the read itself, which the fake credential fails.
+            assertEquals(false, result.dataAvailable)
+            List errors = (List) result.errors
+            assertTrue(errors && !errors.any { it.toString().contains("not found") || it.toString().contains("inactive") },
+                    "the extract must fail at the read, not before the gate: ${errors}")
+        } finally {
+            holder?.join(5_000)
+            ec.message.clearErrors()
+            PeakReadPolicy.resetForTests()
+            NetSuiteReadGate.resetForTests()
+        }
     }
 }

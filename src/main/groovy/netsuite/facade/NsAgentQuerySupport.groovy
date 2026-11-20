@@ -2,6 +2,8 @@ package netsuite.facade
 
 import darpan.agent.AgentQuerySupport
 import darpan.facade.common.TenantAccessSupport
+import darpan.peak.NetSuiteReadGate
+import darpan.peak.PeakReadPolicy
 import netsuite.reconciliation.inventory.NsTokenCache
 
 import java.time.Duration
@@ -59,21 +61,28 @@ class NsAgentQuerySupport {
         final String query = sql
         final int wanted = limit
         final int start = offset
+        // DAR-BE-328: in a peak period that says "NetSuite one at a time", the query waits its turn behind the tenant's
+        // other NetSuite reads (on the worker, which holds the turn; the 60 s query limit still applies). The owner's
+        // limits are read here, with ec, so the worker finds them cached.
+        final String tenantId = auth.get("companyUserGroupId")?.toString()
+        PeakReadPolicy.limitsFor(ec, tenantId)
         return AgentQuerySupport.run(ec, meta, {
-            List<Map> rows = []
-            boolean hasMore = false
-            int at = start
-            while (rows.size() < wanted) {
-                if (Thread.currentThread().isInterrupted()) throw new InterruptedException("The query was cancelled.")
-                int ask = Math.min(NS_PAGE_MAX, wanted - rows.size())
-                Map page = client.queryPage(query, ask, at)
-                List<Map> got = (page.rows ?: []) as List<Map>
-                rows.addAll(got)
-                at += got.size()
-                hasMore = page.hasMore == true
-                if (!hasMore || got.isEmpty()) break
+            return NetSuiteReadGate.run(tenantId) { ->
+                List<Map> rows = []
+                boolean hasMore = false
+                int at = start
+                while (rows.size() < wanted) {
+                    if (Thread.currentThread().isInterrupted()) throw new InterruptedException("The query was cancelled.")
+                    int ask = Math.min(NS_PAGE_MAX, wanted - rows.size())
+                    Map page = client.queryPage(query, ask, at)
+                    List<Map> got = (page.rows ?: []) as List<Map>
+                    rows.addAll(got)
+                    at += got.size()
+                    hasMore = page.hasMore == true
+                    if (!hasMore || got.isEmpty()) break
+                }
+                return [rows: rows, hasMore: hasMore, nextOffset: hasMore ? at : null, offset: start] as Map
             }
-            return [rows: rows, hasMore: hasMore, nextOffset: hasMore ? at : null, offset: start] as Map
         } as Closure<Map>)
     }
 

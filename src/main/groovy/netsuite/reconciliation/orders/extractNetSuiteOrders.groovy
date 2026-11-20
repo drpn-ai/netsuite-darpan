@@ -2,6 +2,7 @@ import darpan.facade.common.DataManagerSupport
 import darpan.facade.common.SharedConfigAccessSupport
 import darpan.facade.common.TenantAccessSupport
 import darpan.facade.reconciliation.RunObservability
+import darpan.peak.NetSuiteReadGate
 import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
 import darpan.reconciliation.core.RunSnapshotScope
 import groovy.json.JsonOutput
@@ -279,7 +280,12 @@ Closure livePage = { String query, int limit, int offset ->
 
 // Held out here, not left to the stream, so the finally reaches it however the read ends.
 Map excludedCollector = ExcludedRecordsSidecar.newCollector()
+// DAR-BE-328: in a peak period that says "NetSuite one at a time", this tenant's NetSuite reads take turns (whoever calls
+// this extract: an automation side, a read by key, an interactive run, a lookup, a kept-copy fill). Held for this read
+// only, let go in the finally below; the query row's tenant is the reading tenant.
+NetSuiteReadGate.Turn netsuiteTurn = null
 try {
+    netsuiteTurn = NetSuiteReadGate.enter(ec, queryRow.companyUserGroupId?.toString())
     // DAR-BE-073. Inside a run's walk, a lifecycle question is answered from one read of its window (NsLifecycleSnapshot)
     // when it can be answered exactly; the first such question reads it, the rest only read the ids of the conditions
     // they add. Anything else, and every run outside a walk, reads live.
@@ -443,6 +449,7 @@ try {
     fileLocation = null
     fileName = null
 } finally {
+    netsuiteTurn?.close()
     // The excluded-records spill holds customer records: gone on every path.
     ExcludedRecordsSidecar.discard(excludedCollector)
     // JDK 21 HttpClient holds a selector thread and a connection pool until closed; the inventory
