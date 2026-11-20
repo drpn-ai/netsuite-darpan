@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue
 class NsChainConfigContractTest {
 
     private static String configXml() {
-        Path p = repoRoot().resolve("tools/netsuite-chain-config/gorjana-chain-pairs.xml")
+        Path p = repoRoot().resolve("darpan-config-gorjana/legacy/netsuite-chain-config/gorjana-chain-pairs.xml")
         assertTrue(Files.exists(p), "gorjana config not found at ${p}")
         return Files.readString(p)
     }
@@ -83,7 +83,7 @@ class NsChainConfigContractTest {
     private static Path repoRoot() {
         Path p = Paths.get("").toAbsolutePath()
         while (p != null) {
-            if (Files.exists(p.resolve("tools/netsuite-chain-config"))) return p
+            if (Files.exists(p.resolve("darpan-config-gorjana/legacy/netsuite-chain-config"))) return p
             p = p.parent
         }
         throw new IllegalStateException("no repo root above ${Paths.get('').toAbsolutePath()}")
