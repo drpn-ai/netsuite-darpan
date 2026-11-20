@@ -1438,15 +1438,17 @@ class NsSuiteQlOrderSupport {
     /**
      * DAR-BE-318 (rulings 3b1-5, P3b1-12). A dataset read's two stamp columns after the configured ones, or "" for any other
      * read: the header's lastmodifieddate and its newest line's linelastmodifieddate, each as session-zone wall clock to the
-     * second (TO_CHAR; the raw columns come back day-only). {@code outer} names the transaction as the query does ("t", or
+     * second (TO_CHAR; the raw columns come back day-only), the line's TO_CHAR inside its sub-select. {@code outer} names the transaction as the query does ("t", or
      * the table in RECORDS, which has no alias); {@code qualifier} is what its own columns are prefixed with.
      */
     private static String stampColumns(Map<String, Object> spec, String outer, String qualifier) {
         if (!spec.get("stamped")) return ""
         String header = qualifier ? "${qualifier}.lastmodifieddate" : "lastmodifieddate"
         return (", TO_CHAR(${header}, '${STAMP_FORMAT}') AS ${HEADER_STAMP_KEY}, " +
-                "TO_CHAR((SELECT MAX(sl.linelastmodifieddate) FROM transactionline sl WHERE sl.transaction = ${outer}.id), " +
-                "'${STAMP_FORMAT}') AS ${LINE_STAMP_KEY}").toString()
+                // TO_CHAR inside the sub-select: SuiteQL refuses TO_CHAR around a scalar sub-select (400, "Invariant check for
+                // stage 'INPUT' failed"; probed read-only 2026-11-20, aliased and unaliased)
+                "(SELECT TO_CHAR(MAX(sl.linelastmodifieddate), '${STAMP_FORMAT}') FROM transactionline sl " +
+                "WHERE sl.transaction = ${outer}.id) AS ${LINE_STAMP_KEY}").toString()
     }
 
     /**

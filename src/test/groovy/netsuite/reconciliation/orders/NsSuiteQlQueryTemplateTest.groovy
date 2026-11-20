@@ -1477,8 +1477,26 @@ class NsSuiteQlQueryTemplateTest {
     private static String stampColumns(String outer) {
         String header = outer == "t" ? "t.lastmodifieddate" : "lastmodifieddate"
         return "TO_CHAR(${header}, 'YYYY-MM-DD HH24:MI:SS') AS darpan_header_stamp, " +
-                "TO_CHAR((SELECT MAX(sl.linelastmodifieddate) FROM transactionline sl WHERE sl.transaction = ${outer}.id), " +
-                "'YYYY-MM-DD HH24:MI:SS') AS darpan_line_stamp"
+                "(SELECT TO_CHAR(MAX(sl.linelastmodifieddate), 'YYYY-MM-DD HH24:MI:SS') FROM transactionline sl " +
+                "WHERE sl.transaction = ${outer}.id) AS darpan_line_stamp"
+    }
+
+    /**
+     * The line stamp exactly as SuiteQL accepted it (read-only probe, gorjana, 2026-11-20 19:35): TO_CHAR INSIDE the
+     * sub-select. TO_CHAR wrapped AROUND the sub-select is refused (400 "Invariant check for stage 'INPUT' failed"), aliased
+     * or not, so neither query may ever send that shape.
+     */
+    @Test
+    void theLineStampIsFormattedInsideItsSubSelect() {
+        Map<String, Object> records = NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)
+        String r = NsSuiteQlOrderSupport.buildRecordsQuery(records, "2026-11-18", null)
+        assertTrue(r.contains("(SELECT TO_CHAR(MAX(sl.linelastmodifieddate), 'YYYY-MM-DD HH24:MI:SS') FROM transactionline sl " +
+                "WHERE sl.transaction = transaction.id) AS darpan_line_stamp"), r)
+        Map<String, Object> lines = NsSuiteQlOrderSupport.applyReadMode(salesLinesSpec(), "trandate", true)
+        String l = NsSuiteQlOrderSupport.buildRecordsQuery(lines, "2026-11-18", NsSuiteQlOrderSupport.readThruDate(lines, "2026-11-20"))
+        assertTrue(l.contains("(SELECT TO_CHAR(MAX(sl.linelastmodifieddate), 'YYYY-MM-DD HH24:MI:SS') FROM transactionline sl " +
+                "WHERE sl.transaction = t.id) AS darpan_line_stamp"), l)
+        [r, l].each { String q -> assertFalse(q.contains("TO_CHAR((SELECT"), "TO_CHAR around a sub-select is refused by SuiteQL: ${q}") }
     }
 
     /** Every template, configured as a run would configure it. */
