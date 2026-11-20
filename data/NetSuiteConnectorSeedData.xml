@@ -10,6 +10,10 @@
     record with darpanStamp (the later of its header lastmodifieddate and newest line's linelastmodifieddate), ends a full
     read on the dateColumn the day after the one sent so today is in it, and refuses any template but RECORDS and SALES_LINES,
     so a dataset on one fails its first read and never builds a copy (ruling P3b1-14). A run read sends none of it.
+    A NetSuite dataset is stored with windowField = the query's dateColumn (e.g. trandate, not the record field it maps to)
+    and stampField = darpanStamp. Its idField must name one record: for RECORDS a transaction key (e.g. netsuiteInternalId);
+    for SALES_LINES a header key plus lineId (e.g. tranId,lineId), because lineId is transactionline.id, a line number within
+    its own order (line 1 of every order shares it). Keyed by lineId alone a read fails (ruling P3b1-15).
 
   servingProjectionServiceName: project#NetSuiteKeptRecords refuses every side, so a NetSuite run reads live (ruling P3b1-6):
     served parity is not proven on the real record shape. The row names no windowFieldName either; this keeps a copy from

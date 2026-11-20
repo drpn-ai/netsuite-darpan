@@ -174,7 +174,10 @@ class NsSuiteQlOrderSupport {
     /**
      * The SuiteQL session's zone: TO_DATE reads a day's midnight in it, and TO_CHAR writes a date column's wall clock in it
      * (spec 4a; probed read-only on 2026-11-20). The raw date columns come back day-only (MM/DD/YYYY), so the stamps are
-     * read through TO_CHAR to the second and placed in this zone.
+     * read through TO_CHAR to the second and placed in this zone. Residual: in the hour clocks fall back (first Sunday of
+     * November) a wall-clock time is read with the earlier offset, so an edit in the repeated hour can stamp up to an hour
+     * early and lose to an earlier edit's stamp until the next full read. The real zone is the integration user's NetSuite
+     * preference; a constant serves while one account keeps a copy.
      */
     static final java.time.ZoneId SESSION_ZONE = java.time.ZoneId.of("America/Los_Angeles")
     private static final String STAMP_FORMAT = "YYYY-MM-DD HH24:MI:SS"

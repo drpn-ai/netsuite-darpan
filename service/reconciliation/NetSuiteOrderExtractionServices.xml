@@ -75,7 +75,10 @@
                     datasetReadParametersJson sends it, data/NetSuiteConnectorSeedData.xml): each record carries darpanStamp, the
                     later of its header lastmodifieddate and its newest line's linelastmodifieddate as a UTC instant; a read on the
                     dateColumn ends the day after windowEnd, so today's transactions are in it; and a query on any template but
-                    RECORDS or SALES_LINES is refused, so a dataset on one fails its first read and never builds a copy.</description>
+                    RECORDS or SALES_LINES is refused, so a dataset on one fails its first read and never builds a copy. The
+                    dataset's windowField is the query's dateColumn (e.g. trandate) and its stampField darpanStamp; a SALES_LINES
+                    dataset's idField is a header key plus lineId (e.g. tranId,lineId), since lineId numbers a line within its
+                    own order.</description>
             </parameter>
             <parameter name="lookupKeys" type="List">
                 <description>DAR-BE-118 / DAR-BE-119. A read by key: only the records whose lookupKeyField holds one of these

@@ -82,6 +82,8 @@ class NetSuiteKeptCopyTests {
         query("NS_KC_SERVE", [:])
         query("NS_KC_LINKED", [queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"])
         query("NS_KC_STATE", [queryTemplate: "STATE_CONTRADICTION", statesExpectingShipment: "D,E,F,G"])
+        query("NS_KC_LINES", [queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id", joinKeyFieldName: "tranId"])
+        query("NS_KC_LINES_BAD", [queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id", joinKeyFieldName: "tranId"])
     }
 
     @AfterAll
@@ -180,6 +182,29 @@ class NetSuiteKeptCopyTests {
     }
 
     /**
+     * Review I1: a SALES_LINES record's lineId is transactionline.id, a line number within its own order, so line 1 of every
+     * order shares it. A SALES_LINES dataset keys by its order and its line (tranId,lineId): two orders' line 1 stay two copy
+     * records. Keyed by lineId alone the read fails (ruling P3b1-15: one id, different content) rather than merging them.
+     */
+    @Test
+    void aSalesLinesCopyKeepsEveryOrdersLineOne() {
+        List<Map> lines = [line("SO1", "1", "01", "2026-11-18T10:01:59Z"), line("SO1", "2", "02", "2026-11-18T10:01:59Z"),
+                           line("SO2", "1", "01", "2026-11-19T18:00:00Z")]
+        String id = netSuiteDataset("NS_KC_LINES", "tranId,lineId")
+        Map res = atCopyClock(0) { refresh(id, stub([], lines)) }
+        assertEquals([], res.errors)
+        Map byId = KeptCopyStore.records(DatasetRefreshSupport.datasetDir(ec, A, id)).collectEntries { [(it.id): it.record] }
+        assertEquals(["SO1|1", "SO1|2", "SO2|1"] as Set, byId.keySet())
+        assertEquals("SO2", byId["SO2|1"].tranId)
+        assertEquals("SO1", byId["SO1|1"].tranId, "the other order's line 1 did not replace it")
+
+        String bad = netSuiteDataset("NS_KC_LINES_BAD", "lineId")
+        Map refused = atCopyClock(0) { refresh(bad, stub([], lines)) }
+        assertTrue(refused.errors.toString().contains("repeat a copy id of lineId with different content"), refused.errors.toString())
+        assertNull(KeptCopyStore.manifest(DatasetRefreshSupport.datasetDir(ec, A, bad)), "no merged copy is built")
+    }
+
+    /**
      * Ruling P3b1-6: a NetSuite run side reads live even with a built copy whose records date their day plainly. The run sends
      * no window field (NO_WINDOW_FIELD); and were the connector row given one, this system's serving check still refuses (the
      * copy's records carry darpanStamp, and derived columns and HotWax statuses read at read time are not tracked by its stamps).
@@ -226,15 +251,20 @@ class NetSuiteKeptCopyTests {
                 }
     }
 
-    private String netSuiteDataset(String queryId) {
+    private String netSuiteDataset(String queryId, String idField = "netsuiteInternalId") {
         Map stored = underFacadeGrant("dataset.DatasetServices.store#Dataset", [systemEnumId: SYSTEM, sourceConfigId: queryId,
-                options: [:], idField: "netsuiteInternalId", stampField: NsSuiteQlOrderSupport.CHANGE_STAMP_FIELD, windowField: "trandate"])
+                options: [:], idField: idField, stampField: NsSuiteQlOrderSupport.CHANGE_STAMP_FIELD, windowField: "trandate"])
         assertEquals([], stored.errors)
         return stored.out.datasetId as String
     }
 
     private static Map order(String id, String day, String stamp, String status) {
         return [netsuiteInternalId: id, tranId: "SO${id}".toString(), trandate: day, statusId: status, darpanStamp: stamp]
+    }
+
+    /** One SALES_LINES record as mapRowToRecord writes it (header fields, then the template's line fields, then the stamp). */
+    private static Map line(String tranId, String lineId, String orderLineId, String stamp) {
+        return [tranId: tranId, trandate: "2026-11-18", orderLineId: orderLineId, lineId: lineId, lineState: "OPEN", darpanStamp: stamp]
     }
 
     /** A refresh's extractor: the given records, as the live extract writes them. */
