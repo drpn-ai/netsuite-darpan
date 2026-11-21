@@ -246,18 +246,31 @@ long lastReportedAtMs = 0L
 long cumulative = 0L
 List<String> pageRetryWarnings = []
 List<Long> pageMillis = []
+// DAR-BE-328: in a peak period that says "NetSuite one at a time", this tenant's NetSuite requests take turns. The turn is
+// taken for ONE page (its token, its retries, its one 401 re-mint) and let go before the page is mapped, enriched from
+// HotWax or written, so another of the tenant's NetSuite reads gets in between this read's pages and nothing that is not
+// a NetSuite request holds the turn. Keyed on the NetSuite account's owner (the auth config's tenant), as the agent
+// query keys it, so both gates count one account's reads together whichever tenant's query row reads through it.
+String netsuiteTenant = authConfig.companyUserGroupId?.toString()
 Closure livePage = { String query, int limit, int offset ->
+    HttpResponse<String> resp
+    NetSuiteReadGate.Turn netsuiteTurn = NetSuiteReadGate.enter(ec, netsuiteTenant)
+    // After the turn: a page's time is what the request timeout must cover, not the wait for the turn.
     long pageStartedAt = System.currentTimeMillis()
-    String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
-    HttpResponse<String> resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset) },
-            offset, pageRetryWarnings)
-    if (resp.statusCode() == 401) {
-        // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
-        // then retry ONCE — a second 401 is a real credential problem, not a race.
-        NsTokenCache.evict(authCacheKey)
-        String freshToken = mintToken()
-        resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, freshToken, query, limit, offset) },
+    try {
+        String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
+        resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset) },
                 offset, pageRetryWarnings)
+        if (resp.statusCode() == 401) {
+            // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
+            // then retry ONCE — a second 401 is a real credential problem, not a race.
+            NsTokenCache.evict(authCacheKey)
+            String freshToken = mintToken()
+            resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, freshToken, query, limit, offset) },
+                    offset, pageRetryWarnings)
+        }
+    } finally {
+        netsuiteTurn.close()
     }
     pageMillis.add(System.currentTimeMillis() - pageStartedAt)
     if (resp.statusCode() != 200) {
@@ -280,12 +293,7 @@ Closure livePage = { String query, int limit, int offset ->
 
 // Held out here, not left to the stream, so the finally reaches it however the read ends.
 Map excludedCollector = ExcludedRecordsSidecar.newCollector()
-// DAR-BE-328: in a peak period that says "NetSuite one at a time", this tenant's NetSuite reads take turns (whoever calls
-// this extract: an automation side, a read by key, an interactive run, a lookup, a kept-copy fill). Held for this read
-// only, let go in the finally below; the query row's tenant is the reading tenant.
-NetSuiteReadGate.Turn netsuiteTurn = null
 try {
-    netsuiteTurn = NetSuiteReadGate.enter(ec, queryRow.companyUserGroupId?.toString())
     // DAR-BE-073. Inside a run's walk, a lifecycle question is answered from one read of its window (NsLifecycleSnapshot)
     // when it can be answered exactly; the first such question reads it, the rest only read the ids of the conditions
     // they add. Anything else, and every run outside a walk, reads live.
@@ -449,7 +457,6 @@ try {
     fileLocation = null
     fileName = null
 } finally {
-    netsuiteTurn?.close()
     // The excluded-records spill holds customer records: gone on every path.
     ExcludedRecordsSidecar.discard(excludedCollector)
     // JDK 21 HttpClient holds a selector thread and a connection pool until closed; the inventory

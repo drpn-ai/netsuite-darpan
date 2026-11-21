@@ -35,6 +35,12 @@ class NsSuiteQlPageRetry {
     static final Set<Integer> RETRYABLE_STATUS_CODES = [429, 502, 503, 504].toSet().asImmutable()
 
     private static final Closure DEFAULT_SLEEPER = { long ms -> sleepQuietly(ms) }
+
+    /**
+     * Test seam (DAR-BE-328): offset -> response, standing in for every page request {@link #send} makes, so a service-level
+     * test can page the real extract without a NetSuite account. Null (always, outside tests) sends the real request.
+     */
+    static volatile Closure<HttpResponse<String>> requestForTests = null
     private static final Logger logger = LoggerFactory.getLogger(NsSuiteQlPageRetry.class)
 
     /**
@@ -61,7 +67,8 @@ class NsSuiteQlPageRetry {
         IOException lastError = null
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
-                HttpResponse<String> response = request.call()
+                Closure<HttpResponse<String>> stand = requestForTests
+                HttpResponse<String> response = stand != null ? stand.call(offset) : request.call()
                 if (!RETRYABLE_STATUS_CODES.contains(response.statusCode())) return response
                 lastError = null
                 lastFailure = "returned status ${response.statusCode()}".toString() +
