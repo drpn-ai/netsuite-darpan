@@ -1171,7 +1171,7 @@ class NsSuiteQlOrderSupport {
      * THE TRIAGE GATE, and it is the difference between 97 findings and 5 (measured, gorjana 2026-09-17).
      * An order with no fulfillment is not a defect if no line was ever fulfillable — service and
      * non-inventory orders can never have one — or if its lines were deliberately closed. Both are read
-     * from the line, which is why this cannot be a post-extraction sourceFilters rule: a filter can only
+     * from the line, which is why this cannot be a Keep rule over the extract: a rule can only
      * match a field the extractor already emitted.
      */
     /**
@@ -1207,8 +1207,8 @@ class NsSuiteQlOrderSupport {
      *
      * A row with no join-key value keeps a null there rather than being dropped: those are records
      * keyed in directly in NetSuite, and hiding them here would make the difference count
-     * unexplainable. They are removed by a configured sourceFilters rule instead, so the exclusion is
-     * the operator's decision and shows up in the run's filter reporting.
+     * unexplainable. They are set aside by a Keep rule in Spark (the tenant's, DAR-BE-318), so the
+     * exclusion is the operator's decision and shows up in the run's Keep summary.
      */
     /**
      * Row key -> record field for columns a template contributes itself. They are not in

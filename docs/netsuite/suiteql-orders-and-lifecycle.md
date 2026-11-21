@@ -44,11 +44,11 @@ Inputs that matter:
 - `windowStart` / `windowEnd` (required): reduced to whole dates and applied half-open, `[start, end)`, on
   the query's date column (default `trandate`). `trandate` is date-granular in the account's timezone, so
   give day-aligned windows; a sub-day window does not narrow the result.
-- `sourceFilters`: exclusion rules, applied client-side after mapping (SuiteQL knows nothing about tenant
-  rules). Per-rule counts are reported in `metadata.configuredExclusions`; excluded records are written to a
-  sidecar file beside the extract.
-- `keepRecordFields`: optional projection, applied after exclusions so narrowing the output cannot disable
-  a rule.
+- No `sourceFilters`: the extract filters nothing at the read (DAR-BE-318). Every record is written and Spark
+  Keep (darpan core) applies the run's exclusion rules, counts them in its Keep summary and writes the
+  excluded-records side file.
+- `keepRecordFields`: optional projection. It always keeps the fields Keep's rules need, so narrowing the
+  output cannot disable a rule.
 - `pageSize`: capped at 1000, NetSuite's SuiteQL page ceiling.
 - `companyUserGroupId`: set by automations. When present, access is checked against that tenant; otherwise
   against the session's active tenant.
@@ -168,7 +168,7 @@ keywords are refused. `normalizeSpec` is the single statement of what a valid ro
 
 The join key for the OMS order-presence pair is `custbody_hc_order_id`, which the HotWax integration
 writes on the NetSuite order. Orders keyed directly in NetSuite have no value there; they keep a null join
-key and are removed by a configured exclusion rule rather than dropped silently.
+key and are set aside by a Keep rule in Spark rather than dropped silently.
 
 ## Lifecycle checks
 
