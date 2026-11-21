@@ -1,7 +1,5 @@
 package netsuite.reconciliation.orders
 
-import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
-
 import org.junit.jupiter.api.Test
 
 import static org.junit.jupiter.api.Assertions.assertEquals
@@ -1160,94 +1158,14 @@ class NsSuiteQlQueryTemplateTest {
                       quantityBilled: "1", lineState: "BILLED", lineLocation: "12", orderOrigin: "HOTWAX"], record)
     }
 
-    /**
-     * DAR-UI-044. The rows a rule drops are kept whole for the conclude pass: run C's backorder proof is
-     * exactly the unshipped line this filter removes, and the keepFields projection must not strip the
-     * field that proves it.
-     */
+    /** DAR-BE-318 (plan 3b-2b): every line is written (Keep runs in Spark), paged, and keepFields still projects. */
     @Test
-    void excludedLinesAreCollectedWholeForTheConcludePass() {
-        StringWriter out = new StringWriter()
-        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
-                [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 10,
-                 keepFields: ["orderId", "orderLineId"],
-                 filterRules: [[sequenceNum: 1, fieldExpression: "quantityShipped", operator: "EXCLUDE_IN", filterValues: "0"]]],
-                { String q, int limit, int offset ->
-                    [items: [[custbody_hc_order_id: "M1", tranid: "SO1", order_line_id: "01", quantity_shipped: "0",
-                              quantity_backordered: "1", line_closed: "F", line_id: "1", item_type: "InvtPart"]], hasMore: false]
-                })
-        Map c = (Map) result.excludedCollector
-        assertEquals(1, c.total)
-        assertEquals("1", ((Map) ExcludedRecordsSidecar.records(c)[0]).quantityBackordered, "the whole record, not the keepFields projection")
-        assertEquals("1:quantityShipped", ((Map) ExcludedRecordsSidecar.records(c)[0])._excludedBy)
-    }
-
-    /**
-     * DAR-UI-099 (gorjana SO7365765 / M1205413): NetSuite adds "Store Credit - Redemption", a Payment line with no HotWax
-     * line id, for the 89.30 paid by store credit. It is read so the order shows every line, and set aside before any rule:
-     * never compared (it has no key), never counted as a tenant exclusion, kept whole in the sidecar. SuiteQL leaves its
-     * null line id out of the row.
-     */
-    @Test
-    void aStoreCreditPaymentLineIsSetAsideNeverCompared() {
-        StringWriter out = new StringWriter()
-        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
-                [spec: salesLinesSpec(), fromDate: "2026-10-31", toDate: "2026-11-01", pageSize: 10],
-                { String q, int limit, int offset ->
-                    [items: [[custbody_hc_order_id: "M1205413", tranid: "SO7365765", order_line_id: "01", item_type: "InvtPart",
-                              quantity_billed: "-1", line_state: "BILLED", item_name: "2311-104-67-G", line_amount: "82"],
-                             [custbody_hc_order_id: "M1205413", tranid: "SO7365765", item_type: "Payment", line_state: "OPEN",
-                              item_name: "Store Credit - Redemption", line_amount: "-89.3"]], hasMore: false]
-                })
-        List kept = (List) new groovy.json.JsonSlurper().parseText(out.toString()).records
-        assertEquals(["01"], kept*.orderLineId, "only the keyed line is compared")
-        Map c = (Map) result.excludedCollector
-        assertEquals(1, c.total)
-        Map setAside = (Map) ExcludedRecordsSidecar.records(c)[0]
-        assertEquals("Store Credit - Redemption", setAside.itemName)
-        assertEquals("-89.3", setAside.lineAmount)
-        assertEquals("0:orderLineId", setAside._excludedBy)
-        assertEquals(0, result.excludedCount, "not a tenant rule's exclusion")
-    }
-
-    /** DAR-BE-127: a read that fails mid-stream leaves the caller its collector, so the spill can still be discarded. */
-    @Test
-    void aStreamThatThrowsLeavesTheCallerItsCollector() {
-        Map mine = ExcludedRecordsSidecar.newCollector()
-        int calls = 0
-        assertThrows(IllegalStateException) {
-            NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
-                    [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 1, excludedCollector: mine,
-                     filterRules: [[sequenceNum: 1, fieldExpression: "quantityShipped", operator: "EXCLUDE_IN", filterValues: "0"]]],
-                    { String q, int limit, int offset ->
-                        if (calls++ > 0) throw new IllegalStateException("page 2 failed")
-                        [items: [[custbody_hc_order_id: "M1", tranid: "SO1", order_line_id: "01", quantity_shipped: "0",
-                                  line_closed: "F", line_id: "1", item_type: "InvtPart"]], hasMore: true]
-                    })
-        }
-        File spill = (File) mine.spill
-        assertTrue(spill.exists(), "the excluded line reached the caller's collector before the throw")
-        ExcludedRecordsSidecar.discard(mine)
-        assertFalse(spill.exists())
-    }
-
-    @Test
-    void noRulesCollectNothing() {
-        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
-                [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 10],
-                { String q, int limit, int offset -> [items: [], hasMore: false] })
-        assertEquals(0, ((Map) result.excludedCollector).total)
-    }
-
-    @Test
-    void salesLinesFilterDropsUnshippedLinesAndKeepFieldsStillProjects() {
+    void salesLinesPagesEveryLineAndKeepFieldsStillProjects() {
         StringWriter out = new StringWriter()
         List<Integer> offsets = []
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
                 [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 2,
-                 keepFields: ["orderId", "orderLineId", "quantityShipped"],
-                 filterRules: [[sequenceNum: 1, fieldExpression: "quantityShipped",
-                                operator: "EXCLUDE_IN", filterValues: "0"]]],
+                 keepFields: ["orderId", "orderLineId", "quantityShipped"]],
                 { String q, int limit, int offset ->
                     offsets << offset
                     offset == 0
@@ -1258,10 +1176,10 @@ class NsSuiteQlQueryTemplateTest {
                                hasMore: false]
                 })
         assertEquals([0, 2], offsets)
-        assertEquals(2, result.recordCount)
-        assertEquals(1, result.excludedCount)
+        assertEquals(3, result.recordCount)
         Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
         assertEquals([[orderId: "M1", orderLineId: "01", quantityShipped: "1"],
+                      [orderId: "M1", orderLineId: "02", quantityShipped: "0"],
                       [orderId: "M2", orderLineId: "01", quantityShipped: "2"]], doc.records)
     }
 
@@ -1447,8 +1365,7 @@ class NsSuiteQlQueryTemplateTest {
         Map<String, Object> spec = activeItemsSpec([:], ["id", "itemid", "live"])
         List<String> asked = []
         StringWriter out = new StringWriter()
-        NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: spec, asOfDate: "2026-10-28",
-                filterRules: [[sequenceNum: 1, fieldExpression: "field3", operator: "EXCLUDE_IN", filterValues: "N"]]],
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: spec, asOfDate: "2026-10-28"],
                 { String q, int limit, int offset ->
                     asked << q
                     return q.startsWith("SELECT DISTINCT tl.item")
@@ -1459,8 +1376,9 @@ class NsSuiteQlQueryTemplateTest {
         Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
         // Aditi 2026-10-29: "dont miss out on recent new products in NS... new products in NS didnt make it HC in time and the
         // PO came first": an item created in the last NEW_ITEM_DAYS is live before anything uses it.
-        assertEquals([[field1: "42808", field2: "PKG403", field3: "Y"], [field1: "43649", field2: "271-010-185-G", field3: "Y"]], doc.records,
-                "PKG109 is not live, so the run's filter drops it")
+        assertEquals([[field1: "42808", field2: "PKG403", field3: "Y"], [field1: "10211", field2: "PKG109", field3: "N"],
+                      [field1: "43649", field2: "271-010-185-G", field3: "Y"]], doc.records,
+                "PKG109 is not live; a run's filter on field3 sets it aside in Spark")
         assertTrue(asked[0].startsWith("SELECT DISTINCT tl.item"), "the used items are read first")
     }
 

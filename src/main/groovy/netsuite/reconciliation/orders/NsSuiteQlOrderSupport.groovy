@@ -1,8 +1,6 @@
 package netsuite.reconciliation.orders
 
 import darpan.facade.common.OutboundHttpPolicy
-import darpan.reconciliation.source.SourceFilterSupport
-import darpan.reconciliation.conclusion.ExcludedRecordsSidecar
 import darpan.reconciliation.flowchart.LifecycleStageCompiler
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -1029,8 +1027,10 @@ class NsSuiteQlOrderSupport {
         sql << population(spec, dateColumn, fromDate, toDate, "t")
         sql << "AND tl.mainline = 'F' "
         // DAR-UI-099 (Aditi: "in the case of store credit, a store credit line item is added"): NetSuite's payment lines
-        // ("Store Credit - Redemption") carry no HotWax line id. They are read so an order shows every line, and set aside
-        // by streamOrdersToWriter: never compared, never a finding.
+        // ("Store Credit - Redemption") carry no HotWax line id. They are read so an order shows every line, written with
+        // nsUnkeyedLine "Y", and set aside by the connector's declared Keep line in Spark: never compared, never a finding.
+        // DAR-BE-318 (plan 3b-2b, Task 20): this clause stays a read-side limit, not Keep. It never read the other unkeyed
+        // lines, so nothing was set aside for them; reading them only to set them aside would grow the side file.
         sql << "AND (tl.${lineKey} IS NOT NULL OR tl.itemtype = '${UNKEYED_LINE_ITEM_TYPE}') AND t.${joinKeyColumn} IS NOT NULL "
         sql << "ORDER BY t.id, tl.id"
         return sql.toString()
@@ -1211,31 +1211,6 @@ class NsSuiteQlOrderSupport {
      * the operator's decision and shows up in the run's filter reporting.
      */
     /**
-     * One metadata entry per configured rule, including rules that rejected nothing.
-     *
-     * This connector reported only a flat excludedCount until DAR-BE-054, which made "the rule
-     * matched nothing" and "this build predates the rule" the same observation — the ambiguity that
-     * made a withdrawn Shopify pill undiagnosable for a day. Mirrors the shape the OMS and Shopify
-     * getters emit, so one diagnosis works across all four.
-     */
-    protected static List<Map<String, Object>> buildConfiguredExclusions(
-            List<Map<String, Object>> rules,
-            Map<Integer, Integer> excludedByRuleCounts,
-            Map<Integer, Integer> fieldAbsentByRuleCounts) {
-        return (rules ?: []).collect { Map<String, Object> rule ->
-            Object sequenceNum = rule.get("sequenceNum")
-            return [
-                    sequenceNum     : sequenceNum,
-                    fieldExpression : rule.get("fieldExpression"),
-                    operator        : rule.get("operator"),
-                    values          : new ArrayList<String>((List<String>) rule.get("values")),
-                    excludedCount   : (excludedByRuleCounts?.get(sequenceNum) ?: 0),
-                    fieldAbsentCount: (fieldAbsentByRuleCounts?.get(sequenceNum) ?: 0),
-            ] as Map<String, Object>
-        } as List<Map<String, Object>>
-    }
-
-    /**
      * Row key -> record field for columns a template contributes itself. They are not in
      * NsSuiteQlSourceQueryField because an operator does not choose them: the template emits them or
      * it does not, and a projection that could omit them would let a run report findings with no
@@ -1260,8 +1235,15 @@ class NsSuiteQlOrderSupport {
 
     /** DAR-UI-099: the one kind of SALES_LINES line read with no HotWax line id, for context only. */
     static final String UNKEYED_LINE_ITEM_TYPE = "Payment"
-    /** DAR-UI-099: how an unkeyed line is marked in the excluded-records sidecar (no tenant rule set it aside). */
-    static final Map UNKEYED_LINE_RULE = [sequenceNum: 0, fieldExpression: "orderLineId"].asImmutable()
+    /**
+     * DAR-BE-318 (plan 3b-2b, Ruling 3b2b-12): the field a SALES_LINES line with no HotWax line id is written with ("Y"),
+     * after the projection. The connector's declared Keep line (data/NetSuiteConnectorSeedData.xml, keepLinesJson) sets it
+     * aside in Spark as "0:orderLineId", as the extractor did. It is a field like any other: downloads and the run builder
+     * show it (AutomationFacadeSupport.SUITEQL_TEMPLATE_FIELDS; NsSuiteQlTemplateFieldsSyncTests keeps the two equal).
+     */
+    static final String UNKEYED_LINE_FIELD = "nsUnkeyedLine"
+    /** The fields SALES_LINES derives itself, beside the template's row columns (TEMPLATE_RECORD_COLUMNS). */
+    static final List<String> DERIVED_SALES_LINES_FIELDS = [UNKEYED_LINE_FIELD].asImmutable()
 
     static Map<String, Object> mapRowToRecord(Map<String, Object> spec, Map<String, Object> row) {
         if (row == null) return [:]
@@ -1737,9 +1719,14 @@ class NsSuiteQlOrderSupport {
      * same contract the OMS and Shopify getters write, and it is what lets a large window stream
      * rather than accumulate in memory. Consumers read this document by KEY, never positionally.
      *
-     * `pageFetcher` is injected rather than called directly so the paging, projection and exclusion
-     * logic is testable without a NetSuite account: it receives (query, limit, offset) and returns a
-     * Map with `items` and `hasMore`.
+     * `pageFetcher` is injected rather than called directly so the paging and projection logic is
+     * testable without a NetSuite account: it receives (query, limit, offset) and returns a Map with
+     * `items` and `hasMore`.
+     *
+     * DAR-BE-318 (plan 3b-2b, Task 20): nothing is filtered here. A tenant's source filters and the unkeyed payment lines are
+     * Keep, run once in Spark over this file (KeepPlanSupport, Ruling 3b2b-23): the extract service no longer declares the
+     * connector's filter parameter, and the side file is Spark's. A conclusion lookup (`conclusionLookup` with lookup keys)
+     * still leaves unkeyed lines out, as it always answered: no Keep follows a lookup (Ruling 3b2b-12).
      */
     static Map<String, Object> streamOrdersToWriter(Writer writer, Map<String, Object> options, Closure pageFetcher) {
         Map<String, Object> spec = (Map<String, Object>) options.get("spec")
@@ -1748,7 +1735,6 @@ class NsSuiteQlOrderSupport {
         String toDate = (String) options.get("toDate")
         int pageSize = normalizePageSize((Integer) options.get("pageSize"))
         int maxPages = options.get("maxPages") != null ? ((Number) options.get("maxPages")).intValue() : DEFAULT_MAX_PAGES
-        List<Map<String, Object>> rules = SourceFilterSupport.parseRules(options.get("filterRules"))
         List<String> keepFields = normalizeKeepFields(options.get("keepFields"))
         Closure pageEnricher = (Closure) options.get("pageEnricher")
 
@@ -1759,13 +1745,9 @@ class NsSuiteQlOrderSupport {
         String query = buildRecordsQuery(spec, fromDate, toDate, asOfDate)
         List<String> warnings = []
         int recordCount = 0
-        int excludedCount = 0
-        int unkeyedSetAside = 0
-        Map<Integer, Integer> excludedByRuleCounts = [:]
-        Map<Integer, Integer> fieldAbsentByRuleCounts = [:]
-        // DAR-UI-044: what the rules drop, whole and before projection, for the conclude pass. A caller that passes its
-        // own collector can discard it even when the stream throws.
-        Map excludedCollector = (Map) options.get("excludedCollector") ?: ExcludedRecordsSidecar.newCollector()
+        boolean salesLines = spec.get("queryTemplate") == TEMPLATE_SALES_LINES
+        // A conclusion lookup compares nothing, so no Spark Keep follows it: it answers without the unkeyed lines, as before.
+        boolean leaveOutUnkeyed = salesLines && spec.get("lookupKeys") && options.get("conclusionLookup") == true
         int pageCount = 0
         int offset = 0
         boolean hasMore = true
@@ -1783,37 +1765,17 @@ class NsSuiteQlOrderSupport {
                     row.put("live", usedItems.contains(String.valueOf(row.get("id"))) || isNewItem(row.get("created"), asOfDate) ? "Y" : "N")
                 }
                 mapRowToRecord(spec, row) } as List<Map<String, Object>>
-            // DAR-BE-111. A page at a time, before the rules, so a rule or a conclusion can read what it adds (the HotWax
+            // DAR-BE-111. A page at a time, before writing, so a Keep rule or a conclusion can read what it adds (the HotWax
             // status). It throws rather than leave records half answered.
             if (pageEnricher != null && mapped) pageEnricher.call(mapped)
             for (Map<String, Object> record : mapped) {
-                // DAR-UI-099: a SALES_LINES line with no HotWax line id (a payment) is context for its order only: set
-                // aside before any rule, so it is neither compared nor counted as a tenant exclusion. SuiteQL leaves a
-                // null column out of the row, so an absent id is the same as a blank one.
-                if (spec.get("queryTemplate") == TEMPLATE_SALES_LINES && !record.get("orderLineId")?.toString()?.trim()) {
-                    unkeyedSetAside++
-                    ExcludedRecordsSidecar.collect(excludedCollector, record, UNKEYED_LINE_RULE)
-                    continue
-                }
-                // Exclusions run client-side because SuiteQL has no knowledge of tenant rules, and
-                // they run AFTER mapping so a rule names the reconciliation field an operator sees
-                // (orderOrigin), not the raw NetSuite column.
-                Map<String, Object> verdict = SourceFilterSupport.evaluate(record, rules)
-                if (verdict != null) {
-                    Integer sequenceNum = (Integer) ((Map) verdict.get("rule")).get("sequenceNum")
-                    Map<Integer, Integer> bucket = SourceFilterSupport.REASON_FIELD_ABSENT == verdict.get("reason")
-                            ? fieldAbsentByRuleCounts
-                            : excludedByRuleCounts
-                    bucket.put(sequenceNum, (bucket.get(sequenceNum) ?: 0) + 1)
-                    // The flat total keeps its existing meaning: every record the configured rules
-                    // rejected, for any reason. Callers read it off the returned map.
-                    excludedCount++
-                    ExcludedRecordsSidecar.collect(excludedCollector, record, (Map) verdict.get("rule"))
-                    continue
-                }
-                // Projection runs AFTER exclusion so a rule can filter on a field the caller did not
-                // ask to keep — otherwise narrowing the output would silently disable the rule.
+                // DAR-UI-099: a SALES_LINES line with no HotWax line id (a payment) is context for its order only. SuiteQL
+                // leaves a null column out of the row, so an absent id is the same as a blank one.
+                boolean unkeyed = salesLines && !record.get("orderLineId")?.toString()?.trim()
+                if (unkeyed && leaveOutUnkeyed) continue
                 if (keepFields != null) record = project(record, keepFields)
+                // After the projection, always, so a narrowed read still carries what the Keep line reads.
+                if (unkeyed) record.put(UNKEYED_LINE_FIELD, "Y")
                 if (recordCount > 0) writer.write(',')
                 writer.write(JsonOutput.toJson(record))
                 recordCount++
@@ -1835,29 +1797,19 @@ class NsSuiteQlOrderSupport {
                 pageSize     : pageSize,
                 pageCount    : pageCount,
                 recordCount  : recordCount,
-                excludedCount: excludedCount,
                 warnings     : warnings,
         ] as Map<String, Object>
-        if (unkeyedSetAside) metadata.unkeyedLinesSetAside = unkeyedSetAside
         // DAR-BE-318: a dataset's daily read, by what changed since windowFrom, with no end
         if (spec.get("changedSince")) metadata.changedSince = true
-        // Absent entirely when no rules are configured, matching the OMS and Shopify getters: a
-        // block that appeared on every extract would read as "this always applies".
-        if (rules) {
-            metadata.put("configuredExclusions",
-                    buildConfiguredExclusions(rules, excludedByRuleCounts, fieldAbsentByRuleCounts))
-        }
         writer.write(JsonOutput.toJson(metadata))
         writer.write('}')
         writer.flush()
 
         return [
                 recordCount  : recordCount,
-                excludedCount: excludedCount,
                 pageCount    : pageCount,
                 dataAvailable: recordCount > 0,
                 warnings     : warnings,
-                excludedCollector: excludedCollector,
         ] as Map<String, Object>
     }
 

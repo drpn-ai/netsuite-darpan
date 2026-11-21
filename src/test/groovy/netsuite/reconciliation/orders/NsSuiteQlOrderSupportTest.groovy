@@ -317,10 +317,10 @@ class NsSuiteQlOrderSupportTest {
         assertTrue((boolean) result.dataAvailable)
     }
 
-    // DAR-BE-111: each page's records go to the enricher (the HotWax status lookup) before the rules see them, so a rule
+    // DAR-BE-111: each page's records go to the enricher (the HotWax status lookup) before they are written, so a Keep rule
     // or a conclusion can read what it adds; a failing enricher fails the extract rather than writing half an answer.
     @Test
-    void anEnricherSeesEachPageBeforeTheRulesAndItsFieldsAreWritten() {
+    void anEnricherSeesEachPageBeforeItIsWrittenAndItsFieldsAreWritten() {
         List<Map> pages = [
                 [items: [[id: "1", custbody_hc_order_id: "145059"], [id: "2", custbody_hc_order_id: "155939"]], hasMore: true],
                 [items: [[id: "3", custbody_hc_order_id: null]], hasMore: false],
@@ -329,7 +329,6 @@ class NsSuiteQlOrderSupportTest {
         StringWriter out = new StringWriter()
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
                 [spec: salesOrderSpec(), fromDate: "2026-10-01", toDate: "2026-10-20", pageSize: 2,
-                 filterRules: [[sequenceNum: 1, fieldExpression: "omsStatusId", operator: "EXCLUDE_IN", filterValues: "ORDER_APPROVED"]],
                  pageEnricher: { List<Map<String, Object>> records ->
                      pageSizes << records.size()
                      records.each { if (it.orderId) it.omsStatusId = it.orderId == "145059" ? "ORDER_COMPLETED" : "ORDER_APPROVED" }
@@ -338,9 +337,9 @@ class NsSuiteQlOrderSupportTest {
 
         assertEquals([2, 1], pageSizes)
         List<Map> written = (List<Map>) new groovy.json.JsonSlurper().parseText(out.toString()).records
-        assertEquals(["145059", null], written*.orderId, "the approved order was excluded by a rule reading the enriched field")
-        assertEquals("ORDER_COMPLETED", written[0].omsStatusId)
-        assertEquals(2, result.recordCount)
+        assertEquals(["145059", "155939", null], written*.orderId)
+        assertEquals(["ORDER_COMPLETED", "ORDER_APPROVED", null], written*.omsStatusId, "the enriched field is in the file Keep reads")
+        assertEquals(3, result.recordCount)
 
         assertThrows(IllegalStateException) {
             NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
@@ -448,89 +447,101 @@ class NsSuiteQlOrderSupportTest {
         assertEquals([], parsed.records)
     }
 
+    // ------------------------------------------------------------------ DAR-BE-318 plan 3b-2b: Keep runs in Spark
+
+    /** The SALES_LINES shape: one record per item line, the line key from the HotWax line id column. */
+    private static Map<String, Object> salesLinesSpec() {
+        return NsSuiteQlOrderSupport.normalizeSpec(
+                [nsSuiteQlSourceQueryId: "NS_SALES_LINES", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate",
+                 queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id", joinKeyFieldName: "orderId",
+                 originFieldName: "orderOrigin"],
+                [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                 [recordFieldName: "netsuiteOrderId", sourceColumn: "tranid", sequenceNum: 2]])
+    }
+
+    /** gorjana SO7365765: a keyed line, the store-credit payment line (no line id), and a blank-id gift card line. */
+    private static final List<Map> SO7365765 = [
+            [custbody_hc_order_id: "M1205413", tranid: "SO7365765", order_line_id: "01", item_type: "InvtPart", line_state: "BILLED",
+             item_name: "2311-104-67-G", line_amount: "82"],
+            [custbody_hc_order_id: "M1205413", tranid: "SO7365765", item_type: "Payment", line_state: "OPEN",
+             item_name: "Store Credit - Redemption", line_amount: "-89.3"],
+            [custbody_hc_order_id: "M1205413", tranid: "SO7365765", order_line_id: " ", item_type: "Payment", item_name: "Gift Card"]]
+
+    private static List<Map> streamed(Map options, List<Map> rows) {
+        StringWriter out = new StringWriter()
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out, [fromDate: "2026-10-31", toDate: "2026-11-01", pageSize: 1000] + options,
+                { String q, int limit, int offset -> [items: rows, hasMore: false] })
+        return (List<Map>) new groovy.json.JsonSlurper().parseText(out.toString()).records
+    }
+
+    /**
+     * Ruling 3b2b-12: a SALES_LINES line with no HotWax line id is no longer set aside by the extractor. It is written with
+     * nsUnkeyedLine "Y", after the projection so a narrowed read keeps it, and the connector's declared Keep line sets it aside
+     * in Spark. A keyed line carries no such field.
+     */
     @Test
-    void excludedRecordsAreCountedNotSilentlyDropped() {
-        // The run has to be able to explain its own numbers: an operator seeing 2 records from a
-        // 3-order window needs the third accounted for, not vanished.
+    void anUnkeyedSalesLineIsWrittenWithNsUnkeyedLine() {
+        List<Map> all = streamed([spec: salesLinesSpec()], SO7365765)
+        assertEquals(["01", null, null], all*.orderLineId)
+        assertEquals([null, "Y", "Y"], all*.nsUnkeyedLine)
+        assertFalse(all[0].containsKey("nsUnkeyedLine"))
+        assertEquals("Store Credit - Redemption", all[1].itemName)
+
+        List<Map> narrowed = streamed([spec: salesLinesSpec(), keepFields: ["orderId", "itemName"]], SO7365765)
+        assertEquals([[orderId: "M1205413", itemName: "2311-104-67-G"],
+                      [orderId: "M1205413", itemName: "Store Credit - Redemption", nsUnkeyedLine: "Y"],
+                      [orderId: "M1205413", itemName: "Gift Card", nsUnkeyedLine: "Y"]], narrowed,
+                "the projection cannot drop the field the Keep line reads")
+    }
+
+    /** Only SALES_LINES numbers lines: a RECORDS record has no orderLineId at all and never carries the field. */
+    @Test
+    void aRecordsTemplateRecordNeverCarriesIt() {
+        List<Map> all = streamed([spec: salesOrderSpec()], [[id: "1", custbody_hc_order_id: "A"], [id: "2"]])
+        assertEquals(2, all.size())
+        assertTrue(all.every { !it.containsKey("nsUnkeyedLine") && !it.containsKey("orderLineId") }, "${all}")
+    }
+
+    /**
+     * Keep runs in Spark (Ruling 3b2b-23), so the extract drops nothing for a tenant's filter: a caller that still sends
+     * rules gets every record, and the file reports no exclusion counts (Spark's .keep.json carries them).
+     */
+    @Test
+    void noRecordIsDroppedForATenantFilter() {
         StringWriter out = new StringWriter()
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
                 [spec       : salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000,
-                 filterRules: [[sequenceNum: 1, fieldExpression: "orderOrigin",
-                                operator   : "EXCLUDE_IN", filterValues: "NETSUITE_NATIVE"]]],
+                 filterRules: [[sequenceNum: 1, fieldExpression: "orderOrigin", operator: "EXCLUDE_IN", filterValues: "NETSUITE_NATIVE"],
+                               [sequenceNum: 2, fieldExpression: "statusId", operator: "INCLUDE_IN", filterValues: "A,B,G"]]],
                 { String q, int limit, int offset ->
-                    [items  : [[id: "1", custbody_hc_order_id: "A"], [id: "2"], [id: "3", custbody_hc_order_id: "C"]],
+                    [items: [[id: "1", custbody_hc_order_id: "A", status: "B"], [id: "2", status: "H"], [id: "3", custbody_hc_order_id: "C"]],
                      hasMore: false]
                 })
-
-        assertEquals(2, result.recordCount)
-        assertEquals(1, result.excludedCount)
+        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
+        assertEquals(["1", "2", "3"], ((List<Map>) parsed.records)*.netsuiteInternalId)
+        assertEquals(3, result.recordCount)
+        Map metadata = (Map) parsed.metadata
+        ["configuredExclusions", "excludedCount", "unkeyedLinesSetAside"].each {
+            assertFalse(metadata.containsKey(it), "the read filtered nothing, so it reports no ${it}")
+        }
+        assertFalse(result.containsKey("excludedCount") || result.containsKey("excludedCollector"), "${result.keySet()}")
     }
 
+    /**
+     * Ruling 3b2b-12: a keyed lookup answers exactly as today. A conclusion lookup asks for an order's lines by key and compares
+     * nothing, so no Spark Keep follows it: its unkeyed lines are left out, as they always were. A run's read by the other
+     * side's keys sends no conclusionLookup and is kept in Spark like any run read, so it writes them marked.
+     */
     @Test
-    void anIncludeRuleKeepsOnlyListedStatusesAndCountsAbsentSeparately() {
-        // DAR-BE-054. statusId is a mapped field, so it is genuinely missing on a row NetSuite
-        // returned without one — unlike orderOrigin, which is stamped on every record. That makes
-        // this the realistic shape for the FIELD_ABSENT bucket on this connector.
-        StringWriter out = new StringWriter()
-        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
-                [spec       : salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000,
-                 filterRules: [[sequenceNum: 1, fieldExpression: "statusId",
-                                operator   : "INCLUDE_IN", filterValues: "A,B,G"]]],
-                { String q, int limit, int offset ->
-                    [items  : [[id: "1", custbody_hc_order_id: "A", status: "B"],
-                               [id: "2", custbody_hc_order_id: "B", status: "H"],
-                               [id: "3", custbody_hc_order_id: "C"]],
-                     hasMore: false]
-                })
-
-        assertEquals(1, result.recordCount, "only the status-B order qualifies")
-        // The flat total keeps its meaning: every record the configured rules rejected, any reason.
-        assertEquals(2, result.excludedCount)
-
-        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
-        Map entry = (Map) ((List) ((Map) parsed.metadata).configuredExclusions)[0]
-        assertEquals(1, entry.sequenceNum)
-        assertEquals("statusId", entry.fieldExpression)
-        assertEquals("INCLUDE_IN", entry.operator)
-        assertEquals(["A", "B", "G"], entry.values)
-        assertEquals(1, entry.excludedCount, "status H, dropped on its value")
-        assertEquals(1, entry.fieldAbsentCount, "no status column at all")
-    }
-
-    @Test
-    void metadataNamesARuleThatRejectedNothingRatherThanOmittingIt() {
-        // Until DAR-BE-054 this connector reported one flat excludedCount and no per-rule block, so
-        // "the rule matched nothing" and "this build predates the rule" were the same observation.
-        StringWriter out = new StringWriter()
-        NsSuiteQlOrderSupport.streamOrdersToWriter(out,
-                [spec       : salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000,
-                 filterRules: [[sequenceNum: 1, fieldExpression: "orderOrigin",
-                                operator   : "EXCLUDE_IN", filterValues: "NETSUITE_NATIVE"]]],
-                { String q, int limit, int offset ->
-                    [items: [[id: "1", custbody_hc_order_id: "A"]], hasMore: false]
-                })
-
-        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
-        List configured = (List) ((Map) parsed.metadata).configuredExclusions
-        assertEquals(1, configured.size(), "a rule that rejected nothing must still be reported")
-        assertEquals(0, ((Map) configured[0]).excludedCount)
-        // Structurally zero on an exclude rule, but present, so a reader need not know which keys
-        // apply to which mode.
-        assertEquals(0, ((Map) configured[0]).fieldAbsentCount)
-    }
-
-    @Test
-    void metadataOmitsConfiguredExclusionsEntirelyWhenNoRulesAreConfigured() {
-        StringWriter out = new StringWriter()
-        NsSuiteQlOrderSupport.streamOrdersToWriter(out,
-                [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000],
-                { String q, int limit, int offset ->
-                    [items: [[id: "1", custbody_hc_order_id: "A"]], hasMore: false]
-                })
-
-        Map parsed = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
-        assertFalse(((Map) parsed.metadata).containsKey("configuredExclusions"),
-                "absent entirely, not an empty list — a block on every extract would read as always-applies")
+    void aConclusionLookupLeavesOutUnkeyedLinesAsToday() {
+        Map<String, Object> keyed = salesLinesSpec()
+        keyed.lookupKeyField = "orderId"
+        keyed.lookupKeys = ["M1205413"]
+        assertEquals([["01"], ["01", null, null]], [
+                streamed([spec: keyed, conclusionLookup: true], SO7365765)*.orderLineId,
+                streamed([spec: keyed], SO7365765)*.orderLineId])
+        assertEquals(3, streamed([spec: salesLinesSpec(), conclusionLookup: true], SO7365765).size(),
+                "a window read is never a lookup, whatever it is sent")
     }
 
     @Test

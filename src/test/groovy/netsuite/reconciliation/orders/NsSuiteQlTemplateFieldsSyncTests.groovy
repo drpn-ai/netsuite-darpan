@@ -14,7 +14,9 @@ class NsSuiteQlTemplateFieldsSyncTests {
 
     @Test
     void theRunBuilderOffersExactlyTheFieldsTheTemplatesAdd() {
-        Set<String> added = (NsSuiteQlOrderSupport.TEMPLATE_RECORD_COLUMNS as Map<String, String>).values() as Set<String>
+        // DAR-BE-318 (plan 3b-2b): plus the field SALES_LINES derives itself (nsUnkeyedLine), shown like any other (Aditi).
+        Set<String> added = ((NsSuiteQlOrderSupport.TEMPLATE_RECORD_COLUMNS as Map<String, String>).values() +
+                NsSuiteQlOrderSupport.DERIVED_SALES_LINES_FIELDS) as Set<String>
         Set<String> offered = AutomationFacadeSupport.SUITEQL_TEMPLATE_FIELDS.values().flatten() as Set<String>
         assertEquals(added, offered)
     }

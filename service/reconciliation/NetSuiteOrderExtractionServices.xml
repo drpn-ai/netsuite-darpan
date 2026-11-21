@@ -32,6 +32,15 @@
             originFieldName every record also carries it (HOTWAX or NETSUITE_NATIVE) so those can be
             excluded by a configured rule, because an exclusion rule cannot match an absent field.
 
+            KEEP (DAR-BE-318 plan 3b-2b, rulings 3b2b-12 and 3b2b-23): this read filters nothing. A run's source filters
+            and NetSuite's built-in drop run once, in Spark, over the file this writes, and Spark writes the side file of
+            what they set aside. That is why the service declares no filter parameter (the NETSUITE_SUITEQL row's
+            filterParameterName, sourceFilters, now only says the endpoint takes Keep). The built-in drop: a SALES_LINES
+            line with no HotWax line id (a store-credit payment line) is written with nsUnkeyedLine "Y", after any
+            keepRecordFields projection, and the row's declared Keep line (data/NetSuiteConnectorSeedData.xml,
+            keepLinesJson) sets it aside as "0:orderLineId". Which unkeyed lines are read at all stays a read-side limit in
+            the query (payment lines only).
+
             WINDOW: NetSuite's trandate is DATE-granular and stored in the account's timezone, so the
             window is applied as half-open [windowStart, windowEnd) on whole days. Give day-aligned
             windows; a sub-day window will not narrow the result.</description>
@@ -91,6 +100,12 @@
             <parameter name="lookupKeyField">
                 <description>The record field lookupKeys are values of; one of the query's fields.</description>
             </parameter>
+            <parameter name="conclusionLookup" type="Boolean" default-value="false">
+                <description>DAR-BE-318 (plan 3b-2b, ruling 3b2b-12). Sent by a conclusion lookup (RunConclusionStep), which reads
+                    by key and compares nothing, so no Spark Keep follows it: with lookupKeys, a SALES_LINES read then leaves
+                    out the lines with no HotWax line id, as every read did before Keep moved into Spark. A run's read by
+                    the other side's keys and an audit re-check send none: they are kept in Spark like any run read.</description>
+            </parameter>
             <parameter name="lookupWithinWindow" type="Boolean" default-value="false">
                 <description>DAR-BE-156. A read by key that also keeps windowStart/windowEnd: an audit re-check of its older
                     findings reads what the check's full read would, restricted to the keys, so the date index bounds it.</description>
@@ -109,20 +124,10 @@
             <parameter name="keepRecordFields" type="List">
                 <parameter name="fieldName"/>
                 <description>Optional projection: top-level record fields to keep in the output file.
-                    Applied after exclusion rules so narrowing the output cannot silently disable a rule.
+                    nsUnkeyedLine is written after it, so narrowing the output cannot disable the built-in Keep line.
                     The connector no longer drives this — since DAR-BE-044 the field mapping IS the
                     projection, exactly as the SELECT list is for DATABASE — but a direct caller may
                     still narrow.</description>
-            </parameter>
-            <parameter name="sourceFilters" type="List">
-                <parameter name="filterRule" type="Map">
-                    <parameter name="sequenceNum" type="Integer"/>
-                    <parameter name="fieldExpression"/>
-                    <parameter name="operator"/>
-                    <parameter name="filterValues"/>
-                </parameter>
-                <description>Optional record-exclusion rules, same semantics as the OMS getters. These
-                    run client-side: SuiteQL has no knowledge of tenant exclusion rules.</description>
             </parameter>
             <parameter name="reconciliationRunResultId">
                 <description>Optional observability run id for progress heartbeats. Advisory only.</description>

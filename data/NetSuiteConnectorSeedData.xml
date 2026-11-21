@@ -3,8 +3,13 @@
   DAR-BE-318 plan 3b-1 (ruling P3b1-9). What the NetSuite endpoints do that darpan core must know without naming NetSuite: set
   here, on the core connector row by primary key (the other fields stay core's), never in core.
 
-  excludedRecordsSidecar Y: the SuiteQL extract writes the records its source filters set aside beside its file
-  (ExcludedRecordsSidecar.writeBeside). A kept-copy slice writes that side file exactly when this says Y.
+  excludedRecordsSidecar Y: the records Keep sets aside are written beside the extract (the side file). Since DAR-BE-318
+  plan 3b-2b the extract filters nothing and Spark writes that file (ruling 3b2b-3); a kept-copy slice writes it when this says Y.
+
+  keepLinesJson (ruling 3b2b-12): NetSuite's built-in Keep line, run in Spark before the tenant's own filters. A SALES_LINES
+    line with no HotWax line id (a store-credit payment line) is written with nsUnkeyedLine "Y"; this line sets it aside, and
+    its side-file entry reads _excludedBy "0:orderLineId", as the extractor wrote it before. Never counted as a tenant
+    exclusion. Upgrade-pack row: this value on the NETSUITE_SUITEQL row.
 
   datasetReadParametersJson {"datasetRead":true}: sent on every dataset read of the endpoint (Task 5). The read stamps each
     record with darpanStamp (the later of its header lastmodifieddate and newest line's linelastmodifieddate), ends a full
@@ -22,5 +27,6 @@
 <entity-facade-xml type="darpan-seed">
     <darpan.reconciliation.SourceSystemConnector systemEnumId="NETSUITE_SUITEQL" excludedRecordsSidecar="Y"
             servingProjectionServiceName="reconciliation.NetSuiteOrderExtractionServices.project#NetSuiteKeptRecords"
-            datasetReadParametersJson='{"datasetRead":true}'/>
+            datasetReadParametersJson='{"datasetRead":true}'
+            keepLinesJson='[{"sequenceNum":0,"label":"orderLineId","kinds":{"nsUnkeyedLine":"FVT_TEXT"},"lines":[{"conditionSeqId":"01","conditionTypeId":"RCT_COMPARE","fieldName":"nsUnkeyedLine","operatorEnumId":"ENTCO_EQUALS","compareValue":"Y"}]}]'/>
 </entity-facade-xml>
