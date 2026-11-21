@@ -1464,8 +1464,9 @@ class NsSuiteQlOrderSupport {
      *     bound (spec.changedSince, spec.stamped).</li>
      * <li>any other windowFieldName is refused by name.</li>
      * </ul>
-     * A stamped read of a template other than KEPT_COPY_TEMPLATES, or of a table with no transaction lines, is refused, so a
-     * dataset on one fails its first read and never builds a copy. With neither parameter the spec is returned untouched:
+     * A stamped read of a template other than KEPT_COPY_TEMPLATES, of a table with no transaction lines, or of a spec whose
+     * values move while neither stamp does (a field read off linked transactions, the HotWax status or shipments), is
+     * refused, so a dataset on one fails its first read and never builds a copy. With neither parameter the spec is returned untouched:
      * no key is added, and every query is the one a run sends today.
      */
     static Map<String, Object> applyReadMode(Map<String, Object> spec, Object windowFieldName, Object datasetRead) {
@@ -1496,6 +1497,21 @@ class NsSuiteQlOrderSupport {
         if (spec.get("fromTable") != DEFAULT_FROM_TABLE) {
             return ("NetSuite query ${spec.get('nsSuiteQlSourceQueryId')} reads ${spec.get('fromTable')}, which has no transaction " +
                     "lines to stamp; only ${KEPT_COPY_TEMPLATES.join(' and ')} queries over ${DEFAULT_FROM_TABLE} can be kept").toString()
+        }
+        // DAR-BE-318 I2: values that move while neither stamp does. A changed-since read never re-reads such a record, and the
+        // weekly full read would count every moved value as a miss.
+        List<String> fromOms = ["omsStatusConfigId", "omsShipGroupsField"].findAll { spec.get(it) }
+        if (fromOms) {
+            return ("NetSuite query ${spec.get('nsSuiteQlSourceQueryId')} cannot be kept as a copy: it asks HotWax for each record's " +
+                    "status or shipments (${fromOms.join(', ')}), which change there while neither NetSuite stamp moves").toString()
+        }
+        List<String> linked = ((List<Map<String, Object>>) (spec.get("fields") ?: [])).findAll { Map<String, Object> f ->
+            String col = ((String) f.get("sourceColumn") ?: "").trim()
+            [LINKED, LINKED_RECORDS, LINKED_LOCATIONS, LINE_LINKED, DEPOSIT_WHEN].any { it.matcher(col).matches() }
+        }.collect { "${it.get('recordFieldName')} (${((String) it.get('sourceColumn')).trim()})".toString() }
+        if (linked) {
+            return ("NetSuite query ${spec.get('nsSuiteQlSourceQueryId')} cannot be kept as a copy: ${linked.join(', ')} " +
+                    "read${linked.size() == 1 ? 's' : ''} other transactions, and neither the header nor the line stamp moves when those do").toString()
         }
         return null
     }

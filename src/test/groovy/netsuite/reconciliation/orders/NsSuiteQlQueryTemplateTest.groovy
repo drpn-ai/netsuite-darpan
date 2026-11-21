@@ -26,11 +26,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue
  */
 class NsSuiteQlQueryTemplateTest {
 
-    private static Map<String, Object> spec(Map<String, Object> overrides) {
+    private static Map<String, Object> spec(Map<String, Object> overrides, List<Map<String, Object>> moreFields = []) {
         Map<String, Object> query = [nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
                                      fromTable: "transaction", dateColumn: "trandate"] + overrides
+        int seq = 1
         return NsSuiteQlOrderSupport.normalizeSpec(query,
-                [[recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 1]])
+                [[recordFieldName: "tranId", sourceColumn: "tranid", sequenceNum: 1]] + moreFields.collect { it + [sequenceNum: ++seq] })
     }
 
     private static String query(Map<String, Object> overrides) {
@@ -1674,6 +1675,40 @@ class NsSuiteQlQueryTemplateTest {
         Map<String, Object> customers = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "Customer",
                 fromTable: "customer", dateColumn: "datecreated"], [[recordFieldName: "id", sourceColumn: "id", sequenceNum: 1]])
         assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyReadMode(customers, "darpanStamp", true) }
+    }
+
+    /**
+     * DAR-BE-318 I2: a kept template whose values move while neither stamp does cannot be kept either. A field read off
+     * linked transactions, or the HotWax status or shipments, would never be re-read by a changed-since read, and the weekly
+     * full read would count each moved value as a miss. Its dataset read is refused naming why; a run read is untouched.
+     */
+    @Test
+    void valuesThatMoveWithoutAStampRefuseAKeptCopy() {
+        Map<String, Map<String, Object>> refused = [
+                "LINKED_RECORDS(CustDep)"  : spec([:], [[recordFieldName: "deposits", sourceColumn: "LINKED_RECORDS(CustDep) AS deposits"]]),
+                "LINKED_LOCATIONS(ItemShip)": spec([:], [[recordFieldName: "shipments", sourceColumn: "LINKED_LOCATIONS(ItemShip) AS shipments"]]),
+                "LINKED(ItemShip)"         : spec([:], [[recordFieldName: "shipped", sourceColumn: "LINKED(ItemShip) AS shipped"]]),
+                "DEPOSIT_WHEN(SalesOrd, F, 0)": spec([:], [[recordFieldName: "deposit", sourceColumn: "DEPOSIT_WHEN(SalesOrd, F, 0) AS deposit"]]),
+                "LINE_LINKED(ItemShip)"    : salesLinesSpec([:], [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                                                                  [recordFieldName: "fulfillments", sourceColumn: "LINE_LINKED(ItemShip) AS fulfillments", sequenceNum: 2]]),
+                "omsStatusConfigId"        : spec([omsStatusConfigId: "OMS_X", omsStatusKeyField: "tranId"]),
+                "omsShipGroupsField"       : spec([omsStatusConfigId: "OMS_X", omsStatusKeyField: "tranId", omsShipGroupsField: "shipments"],
+                        [[recordFieldName: "shipments", sourceColumn: "LINKED_LOCATIONS(ItemShip) AS shipments"]]),
+        ]
+        refused.each { String named, Map<String, Object> s ->
+            [["darpanStamp", true], ["darpanStamp", null], ["trandate", true]].each { List mode ->
+                IllegalArgumentException e = assertThrows(IllegalArgumentException, {
+                    NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(s), mode[0], mode[1])
+                }, "${named} ${mode}")
+                assertTrue(e.message.contains(named) && e.message.contains("cannot be kept"), e.message)
+            }
+            assertThrows(IllegalArgumentException, { sql(s + [changedSince: true, stamped: true]) }, named)
+            // a run read sends the same query as before
+            assertFalse(NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(s), "trandate", false).containsKey("stamped"), named)
+        }
+        // a field read from the record's own lines moves the line stamp: kept
+        assertTrue(NsSuiteQlOrderSupport.applyReadMode(spec([:], [[recordFieldName: "backordered",
+                sourceColumn: "LINE_SUM(quantitybackordered) AS backordered"]]), "darpanStamp", true).stamped as boolean)
     }
 
     /** Ruling 3b1-4: the window field is the row's dateColumn or the changed-since stamp; any other is refused by name. */
