@@ -334,10 +334,11 @@ class NsSuiteQlOrderSupport {
             // Expressions are refused rather than rewritten: a named column list carrying
             // BUILTIN.DISPLAY(...) came back as an opaque 400 from gorjana where plain columns worked.
             // DAR-UI-080: LINKED_RECORDS is an exception, a sub-select over the line's order; DAR-UI-081: LINE_LINKED,
-            // one over the line itself.
+            // one over the line itself; DAR-BE-344: LINE_SUM / LINE_ITEMS, over the order's lines (a line held by a
+            // backordered sibling).
             normalized.each { Map<String, Object> f ->
                 String col = ((String) f.get("sourceColumn")).trim()
-                if (!IDENTIFIER.matcher(col).matches() && !LINKED_RECORDS.matcher(col).matches() && !LINE_LINKED.matcher(col).matches()) {
+                if (!IDENTIFIER.matcher(col).matches() && !orderSubSelect(col) && !LINE_LINKED.matcher(col).matches()) {
                     throw new IllegalArgumentException("${TEMPLATE_SALES_LINES} fields must be bare header " +
                             "columns; ${f.get('recordFieldName')} maps to the expression: ${col}")
                 }
@@ -680,6 +681,11 @@ class NsSuiteQlOrderSupport {
     static final Pattern LINKED_LOCATIONS = ~/^LINKED_LOCATIONS\(\s*([A-Za-z]+)\s*\)\s+(?i:AS)\s+([A-Za-z_][A-Za-z0-9_]*)$/
     private static final String LINE_LINK_TABLE = "nexttransactionlinelink"
 
+    /** A SALES_LINES header column that is a sub-select over the line's order: every line of the order reads the same value. */
+    private static boolean orderSubSelect(String col) {
+        return LINKED_RECORDS.matcher(col).matches() || LINE_SUM.matcher(col).matches() || LINE_ITEMS.matcher(col).matches()
+    }
+
     /**
      * The SELECT list. A LINE_SUM or LINE_ITEMS column becomes a sub-select over the record's item lines, DEPOSIT_WHEN
      * one over its links; outer names the record as the query does: "t" where it is aliased, "transaction" in the
@@ -1003,7 +1009,7 @@ class NsSuiteQlOrderSupport {
                         "JOIN transaction ${lr} ON ${lr}.id = ${ll}.nextdoc WHERE ${ll}.previousdoc = t.id AND ${ll}.previousline = tl.id " +
                         "AND ${lr}.type = '${lineLinked.group(1)}') AS ${alias}").toString()
             }
-            LINKED_RECORDS.matcher(col).matches() ? selectColumns([fields: [f]] as Map<String, Object>, "t")[0] :
+            orderSubSelect(col) ? selectColumns([fields: [f]] as Map<String, Object>, "t")[0] :
                     "t.${col} AS ${f.get('rowKey')}".toString()
         }
         String joinKeyColumn = ((List<Map<String, Object>>) spec.get("fields"))

@@ -863,6 +863,28 @@ class NsSuiteQlQueryTemplateTest {
         }
     }
 
+    // DAR-BE-344 (Malbon R4, Aditi: "backordered item in NS.. we should combine them"): every line of a sales order carries
+    // the order's backorder, so a line held by a backordered sibling concludes with it. The sub-select is over the order's
+    // lines (t.id), not this line, and an ordinary header column is still read straight off the order.
+    @Test
+    void salesLinesCarryTheOrdersLineSumsAndItems() {
+        Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q2", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", queryTemplate: "SALES_LINES", lineKeyColumn: "custcol_hc_order_line_id",
+                joinKeyFieldName: "orderId"], [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                                               [recordFieldName: "orderBackordered", sourceColumn: "LINE_SUM(quantitybackordered) AS order_backordered", sequenceNum: 2],
+                                               [recordFieldName: "backorderedItems", sourceColumn: "LINE_ITEMS(quantitybackordered) AS backordered_items", sequenceNum: 3]])
+        String lines = NsSuiteQlOrderSupport.buildRecordsQuery(spec, "2026-11-01", "2026-12-01")
+        assertTrue(lines.startsWith("SELECT t.custbody_hc_order_id AS custbody_hc_order_id, " +
+                "(SELECT SUM(bl.quantitybackordered) FROM transactionline bl WHERE bl.transaction = t.id AND bl.mainline = 'F') AS order_backordered, " +
+                "(SELECT LISTAGG(bi.itemid || ':' || TO_CHAR(bl.quantitybackordered), '|') WITHIN GROUP (ORDER BY bl.id) " +
+                "FROM transactionline bl JOIN item bi ON bi.id = bl.item WHERE bl.transaction = t.id AND bl.mainline = 'F' " +
+                "AND bl.quantitybackordered <> 0) AS backordered_items, tl.custcol_hc_order_line_id"), lines)
+        Map<String, Object> record = NsSuiteQlOrderSupport.mapRowToRecord(spec,
+                [custbody_hc_order_id: "123631", order_backordered: "1", backordered_items: "MW-0359-IVY-S:1"])
+        assertEquals("1", record.orderBackordered)
+        assertEquals([[sku: "MW-0359-IVY-S", quantity: "1"]], record.backorderedItems)
+    }
+
     // DAR-BE-094 R7: a Happiness Guarantee credit memo posts to account 42065.
     @Test
     void accountUsedAsksWhetherAnyLineOfTheRecordPostsToTheAccount() {
