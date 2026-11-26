@@ -556,7 +556,32 @@ class NsSuiteQlOrderSupport {
             }
         }
 
+        // DAR-BE-320. What may move a record of an audit's read by change while no NetSuite stamp does: the HotWax item
+        // statuses whose timeline rows bring an order back (omsChangedStatusIds), and the NetSuite line states read every
+        // morning because their HotWax side can move with no change signal at all (liveLineStates; a facility move).
+        List<String> omsChangedStatusIds = query.containsKey("omsChangedStatusIds") ? csvList(query.get("omsChangedStatusIds")) : []
+        if (omsChangedStatusIds) {
+            if (!omsStatusLineKeyField) {
+                throw new IllegalArgumentException("omsChangedStatusIds names HotWax item statuses, so it needs omsStatusLineKeyField " +
+                        "(each record's item status)")
+            }
+            omsChangedStatusIds.each {
+                if (!(it ==~ /ITEM_[A-Z_]{1,40}/)) throw new IllegalArgumentException("omsChangedStatusIds holds HotWax item statuses (ITEM_...), got: ${it}")
+            }
+        }
+        List<String> liveLineStates = query.containsKey("liveLineStates") ? csvList(query.get("liveLineStates")) : []
+        if (liveLineStates) {
+            if (queryTemplate != TEMPLATE_SALES_LINES) {
+                throw new IllegalArgumentException("liveLineStates names NetSuite line states, so only a ${TEMPLATE_SALES_LINES} query takes it")
+            }
+            liveLineStates.each {
+                if (!LINE_STATES.contains(it)) throw new IllegalArgumentException("liveLineStates holds ${LINE_STATES.join(', ')}, got: ${it}")
+            }
+        }
+
         return [
+                omsChangedStatusIds   : omsChangedStatusIds,
+                liveLineStates        : liveLineStates,
                 stageReach            : stageReach,
                 waiveRules            : waiveRules,
                 matchRules            : matchRules,
@@ -792,6 +817,11 @@ class NsSuiteQlOrderSupport {
             String problem = keptCopyProblem(spec)
             if (problem) throw new IllegalArgumentException(problem)
         }
+        // DAR-BE-320: so is an audit's read by change of a query that cannot be read so
+        if (spec.get("changedFrom")) {
+            String problem = changedReadProblem(spec)
+            if (problem) throw new IllegalArgumentException("${CHANGED_READ_REFUSED}: ${problem}".toString())
+        }
         if (template == TEMPLATE_ACTIVE_ITEMS) return buildActiveItemsQuery(spec, asOfDate)
         if (!spec.get("lookupKeys")) {
             requireIsoDate(fromDate, "fromDate")
@@ -986,6 +1016,9 @@ class NsSuiteQlOrderSupport {
      * orders (SalesOrd 2026-10-01..08), so CLOSED is NetSuite's cancel, not a second kind of done.
      * Quantities are signed on sales order lines, hence <> 0 rather than > 0.
      */
+    /** DAR-BE-320. The line states LINE_STATE_CASE answers. */
+    static final List<String> LINE_STATES = ["OPEN", "SHIPPED", "CLOSED", "BILLED"].asImmutable()
+
     private static final String LINE_STATE_CASE = "CASE WHEN tl.quantitybilled <> 0 THEN 'BILLED' " +
             "WHEN tl.isclosed = 'T' THEN 'CLOSED' WHEN tl.quantityshiprecv <> 0 THEN 'SHIPPED' ELSE 'OPEN' END"
 
@@ -1080,6 +1113,13 @@ class NsSuiteQlOrderSupport {
             }
             return code.toUpperCase()
         }
+    }
+
+    /** DAR-BE-320. A comma list, trimmed, upper-cased, each once; its values are checked by the caller. */
+    private static List<String> csvList(Object raw) {
+        String value = text(raw)
+        if (!value) return []
+        return value.split(",").collect { it.trim().toUpperCase() }.findAll { it }.unique() as List<String>
     }
 
     private static String inList(List<String> codes) {
@@ -1409,16 +1449,125 @@ class NsSuiteQlOrderSupport {
         }
         if (keys && !(spec.get("lookupWithinWindow") && fromDate && toDate)) return byKey
         String column = qualifier ? "${qualifier}.${dateColumn}" : dateColumn
+        // DAR-BE-320: an audit's read of the window's records that changed since changedFrom keeps the window
+        String changed = spec.get("changedFrom") ? changedFromClause(spec, dateColumn, qualifier) : ""
         return (byKey + "AND ${column} >= TO_DATE('${fromDate}', 'YYYY-MM-DD') " +
-                "AND ${column} < TO_DATE('${toDate}', 'YYYY-MM-DD') ").toString()
+                "AND ${column} < TO_DATE('${toDate}', 'YYYY-MM-DD') " + changed).toString()
     }
 
     /**
-     * DAR-BE-318 (ruling 3b1-5, Review Focus 4). The transactions changed at or after {@code fromDate}'s midnight in the
-     * session zone: the header's lastmodifieddate moved, OR a line's own linelastmodifieddate did, since a line can be edited
-     * while its header stamp stays still. The line half is an uncorrelated id IN, so it reads the same with or without the
-     * transaction's alias (RECORDS has none). No upper bound: what changed today is read too.
+     * DAR-BE-320. The extract's changedSince, an audit's daily read: instead of every record of the window, the window's
+     * records (its dateColumn in [windowStart, windowEnd), as a run reads) that could have moved since changedSince's day
+     * (changedFromClause): the header or a line changed, the record is dated from that day on, an order with a line in a
+     * liveLineStates state, or an order HotWax wrote one of omsChangedStatusIds for since (changedOrderIds, which the
+     * extract asks HotWax first). Refused, before any request, with lookupKeys or windowFieldName darpanStamp, and for a query
+     * whose records can move while nothing here says so (changedReadProblem). The caller then reads the whole window.
+     * Absent: the spec is returned untouched.
      */
+    static Map<String, Object> applyChangedSince(Map<String, Object> spec, Object changedSince) {
+        if (changedSince == null || !changedSince.toString().trim()) return spec
+        if (spec.get("lookupKeys")) {
+            throw new IllegalArgumentException("A NetSuite read is by key or by what changed since an instant, not both")
+        }
+        if (spec.get("changedSince")) {
+            throw new IllegalArgumentException("A NetSuite read takes changedSince or windowFieldName ${CHANGE_STAMP_FIELD}, not both")
+        }
+        String problem = changedReadProblem(spec)
+        if (problem) throw new IllegalArgumentException("${CHANGED_READ_REFUSED}: ${problem}".toString())
+        spec.put("changedFrom", toSuiteQlDate(changedSince))
+        return spec
+    }
+
+    /**
+     * DAR-BE-320. How a refusal to read a query by change begins: darpan's AuditRecentReadSupport.CHANGED_READ_REFUSED
+     * matches it to read that check's whole window instead (any other failure fails the read).
+     */
+    static final String CHANGED_READ_REFUSED = "Not read by what changed"
+
+    /** DAR-BE-320. Most HotWax orders an audit's read by change names (one IN list; SuiteQL refuses a longer one). */
+    static final int MAX_CHANGED_ORDER_IDS = MAX_LOOKUP_KEYS
+
+    /**
+     * DAR-BE-320. The HotWax orders whose omsChangedStatusIds rows were written since the read's changedSince: each is read
+     * again whatever NetSuite's stamps say (a line HotWax cancels moves no NetSuite stamp). At most MAX_CHANGED_ORDER_IDS,
+     * each of identifier characters (they reach SuiteQL by interpolation); more is refused, and the audit reads the whole
+     * window that morning.
+     */
+    static Map<String, Object> applyChangedOrderIds(Map<String, Object> spec, Collection<String> orderIds) {
+        List<String> ids = ((orderIds ?: []) as List).collect { text(it) }.findAll { it }.unique() as List<String>
+        if (ids.size() > MAX_CHANGED_ORDER_IDS) {
+            throw new IllegalArgumentException("${CHANGED_READ_REFUSED}: HotWax changed ${ids.size()} orders since then, more than " +
+                    "the ${MAX_CHANGED_ORDER_IDS} one read can name")
+        }
+        ids.each {
+            if (!(it ==~ /[A-Za-z0-9#_.\-]{1,64}/)) throw new IllegalArgumentException("${CHANGED_READ_REFUSED}: HotWax order id ${it} holds characters SuiteQL cannot be sent")
+        }
+        spec.put("changedOrderIds", ids)
+        return spec
+    }
+
+    /**
+     * DAR-BE-320. Why a query cannot be read by what changed, or null. Its records must come from transaction lines with no
+     * value read off other transactions (keptCopyProblem's own tests: those move while neither stamp does), and a value read
+     * off HotWax must be covered: item statuses by omsChangedStatusIds (their timeline brings the order back); shipments
+     * (omsShipGroupsField) have no change signal, so such a query is never read so.
+     */
+    static String changedReadProblem(Map<String, Object> spec) {
+        Map<String, Object> withoutOms = new LinkedHashMap<String, Object>(spec)
+        withoutOms.remove("omsStatusConfigId")
+        withoutOms.remove("omsShipGroupsField")
+        String problem = keptCopyProblem(withoutOms)
+        if (problem) return problem
+        String query = (String) spec.get("nsSuiteQlSourceQueryId")
+        if (spec.get("omsShipGroupsField")) {
+            return "NetSuite query ${query} counts each order's HotWax shipments, which change with no signal to read them by".toString()
+        }
+        if (spec.get("omsStatusConfigId") && !spec.get("omsChangedStatusIds")) {
+            return ("NetSuite query ${query} asks HotWax for each record's status (omsStatusConfigId), which changes there while no NetSuite stamp " +
+                    "moves; set omsChangedStatusIds to the HotWax item statuses that bring an order back").toString()
+        }
+        if (spec.get("omsChangedStatusIds")) {
+            Map field = ((List<Map<String, Object>>) spec.get("fields")).find { it.get("recordFieldName") == spec.get("omsStatusKeyField") }
+            if (!(field?.get("sourceColumn")?.toString()?.trim() ==~ /[A-Za-z_][A-Za-z0-9_]*/)) {
+                return "NetSuite query ${query} names the HotWax order by ${spec.get('omsStatusKeyField')}, not a plain column the orders HotWax changed can be read by".toString()
+            }
+        }
+        return null
+    }
+
+    /**
+     * DAR-BE-320. A read by change's condition (spec.changedFrom, a SuiteQL day), on whole transactions: the header or any
+     * line changed from that day, the record is dated from it (its dateColumn), an order with a keyed line in a
+     * liveLineStates state, or one of changedOrderIds. Whole orders, so an order the read holds holds all its lines: a
+     * re-check by order key asks only for orders the read lacks.
+     */
+    private static String changedFromClause(Map<String, Object> spec, String dateColumn, String qualifier) {
+        String q = qualifier ? "${qualifier}." : ""
+        String from = "TO_DATE('${spec.get('changedFrom')}', 'YYYY-MM-DD')"
+        List<String> terms = ["${q}lastmodifieddate >= ${from}".toString(),
+                              "${q}id IN (SELECT cl.transaction FROM transactionline cl WHERE cl.linelastmodifieddate >= ${from})".toString(),
+                              "${q}${dateColumn} >= ${from}".toString()]
+        List<String> live = (List<String>) (spec.get("liveLineStates") ?: [])
+        if (live) {
+            String lineKey = (String) spec.get("lineKeyColumn")
+            terms << ("${q}id IN (SELECT ll.transaction FROM transactionline ll WHERE ll.mainline = 'F' AND ll.${lineKey} IS NOT NULL " +
+                    "AND ${LINE_STATE_CASE.replace('tl.', 'll.')} IN ${inList(live)})").toString()
+        }
+        List<String> orderIds = (List<String>) (spec.get("changedOrderIds") ?: [])
+        if (orderIds) terms << "${q}${hotwaxOrderColumn(spec)} IN ${inList(orderIds)}".toString()
+        return "AND (${terms.join(' OR ')}) ".toString()
+    }
+
+    /** DAR-BE-320. The column holding the HotWax order id: omsStatusKeyField's own source column, a bare identifier. */
+    private static String hotwaxOrderColumn(Map<String, Object> spec) {
+        Map field = ((List<Map<String, Object>>) spec.get("fields")).find { it.get("recordFieldName") == spec.get("omsStatusKeyField") }
+        String column = field?.get("sourceColumn")?.toString()?.trim()
+        if (!(column ==~ /[A-Za-z_][A-Za-z0-9_]*/)) {
+            throw new IllegalArgumentException("omsStatusKeyField ${spec.get('omsStatusKeyField')} must be a plain column to read changed HotWax orders by")
+        }
+        return column
+    }
+
     private static String changedSinceClause(String fromDate, String qualifier) {
         String q = qualifier ? "${qualifier}." : ""
         String from = "TO_DATE('${fromDate}', 'YYYY-MM-DD')"
@@ -1807,6 +1956,12 @@ class NsSuiteQlOrderSupport {
         ] as Map<String, Object>
         // DAR-BE-318: a dataset's daily read, by what changed since windowFrom, with no end
         if (spec.get("changedSince")) metadata.changedSince = true
+        // DAR-BE-320: an audit's read of the window's records that changed since this day
+        if (spec.get("changedFrom")) {
+            metadata.changedFrom = spec.get("changedFrom")
+            if (spec.get("liveLineStates")) metadata.liveLineStates = spec.get("liveLineStates")
+            if (spec.get("changedOrderIds") != null) metadata.changedOrderCount = ((List) spec.get("changedOrderIds")).size()
+        }
         writer.write(JsonOutput.toJson(metadata))
         writer.write('}')
         writer.flush()

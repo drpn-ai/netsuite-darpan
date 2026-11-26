@@ -107,6 +107,8 @@ List<Map<String, Object>> queryFieldRows = ec.entity.find("darpan.reconciliation
                     sourceColumnAlias: it.sourceColumnAlias, sequenceNum: it.sequenceNum] as Map<String, Object> }
 
 String fromDate, thruDate, suiteQlUrl, asOfDateValue
+// DAR-BE-320: what an audit's read by change asked HotWax (count, calls, statusIds); null on every other read
+Map hotwaxChangedOrders = null
 boolean unwindowed = queryRow.queryTemplate?.toString()?.trim()?.toUpperCase() == NsSuiteQlOrderSupport.TEMPLATE_ACTIVE_ITEMS
 Map<String, Object> querySpec
 try {
@@ -162,7 +164,10 @@ try {
              // DAR-BE-190. With the field naming the HotWax item too, each record gets its item's status instead.
              omsStatusLineKeyField : queryRow.isField("omsStatusLineKeyField") ? queryRow.get("omsStatusLineKeyField") : null,
              // DAR-BE-245. With the field holding the order's fulfillments by location, its HotWax shipments are counted (DAR-BE-329).
-             omsShipGroupsField    : queryRow.isField("omsShipGroupsField") ? queryRow.get("omsShipGroupsField") : null],
+             omsShipGroupsField    : queryRow.isField("omsShipGroupsField") ? queryRow.get("omsShipGroupsField") : null,
+             // DAR-BE-320. What may move a record of an audit's read by change while no NetSuite stamp does.
+             omsChangedStatusIds   : queryRow.isField("omsChangedStatusIds") ? queryRow.get("omsChangedStatusIds") : null,
+             liveLineStates        : queryRow.isField("liveLineStates") ? queryRow.get("liveLineStates") : null],
             queryFieldRows)
     if (lookupKeys) {
         querySpec.lookupKeyField = lookupKeyField
@@ -173,8 +178,26 @@ try {
     // in it) or by what changed (darpanStamp, no end), each record stamped. Neither parameter: the spec and the window are
     // untouched. Another window field, or a template that cannot be kept, is refused here, before any request.
     NsSuiteQlOrderSupport.applyReadMode(querySpec, windowFieldName, datasetRead)
+    // DAR-BE-320. An audit's read of the window's records that changed since its recent read started; refused here, before
+    // any request, for a query whose records can change while neither NetSuite stamp moves.
+    NsSuiteQlOrderSupport.applyChangedSince(querySpec, changedSince)
+    // DAR-BE-320. A read by change of a query enriched with HotWax item statuses also reads the orders HotWax wrote one of
+    // omsChangedStatusIds for since then (a cancel moves no NetSuite stamp), asked of HotWax before the query is built,
+    // under the query row's own tenant like the status read. A failed ask fails the read: never a read that left them out.
+    if (querySpec.changedFrom && querySpec.omsChangedStatusIds) {
+        Map changedIds = ec.service.sync().name("reconciliation.HotWaxOmsExtractionServices.read#HotWaxOmsChangedOrderIds")
+                .parameters([omsRestSourceConfigId: querySpec.omsStatusConfigId, changedSince: changedSince,
+                             statusIds: querySpec.omsChangedStatusIds, companyUserGroupId: queryRow.companyUserGroupId])
+                .disableAuthz().call()
+        if (!(changedIds?.ok)) {
+            throw new IllegalStateException("HotWax changed orders read failed: ${(changedIds?.errors ?: ec.message.errors) as List}")
+        }
+        NsSuiteQlOrderSupport.applyChangedOrderIds(querySpec, (Collection<String>) changedIds.orderIds)
+        hotwaxChangedOrders = [count: ((Collection) changedIds.orderIds ?: []).size(), calls: changedIds.calls,
+                                               statusIds: querySpec.omsChangedStatusIds]
+    }
     thruDate = NsSuiteQlOrderSupport.readThruDate(querySpec, thruDate)
-} catch (IllegalArgumentException e) {
+} catch (IllegalArgumentException | IllegalStateException e) {
     errors = [e.message]
     return
 }
@@ -433,6 +456,7 @@ try {
             requestTimeoutSec: NsSuiteQlPageRetry.REQUEST_TIMEOUT.seconds,
             pageRetries      : pageRetryWarnings.size(),
     ]
+    if (hotwaxChangedOrders != null) requestMetadata.hotwaxChangedOrders = hotwaxChangedOrders
 
     String outputFileName = (fileName ?: "netsuite-orders-${fromDate}-${thruDate}.json").toString()
             .replaceAll("[^A-Za-z0-9._-]", "_")

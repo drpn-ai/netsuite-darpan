@@ -578,4 +578,58 @@ class NetSuiteOrderExtractionServiceContractTests {
             resetPeak()
         }
     }
+
+    /**
+     * DAR-BE-320. An audit's read by change of a HotWax-enriched lines query (gorjana R10/R11/R12): with no
+     * omsChangedStatusIds it is refused in the words darpan reads as "read the whole window"; with them HotWax is asked for
+     * the orders it changed before NetSuite is, and a failed ask fails the read (not a refusal: a whole-window read after it
+     * would ask the same failing HotWax for every order of the month). Neither sends NetSuite a request.
+     */
+    @Test
+    void aReadByChangeAsksHotwaxFirstAndNeitherARefusalNorAFailedAskReadsNetsuite() {
+        String t = "NS_BE320"
+        peakFixtures(t, t, t, [queryTemplate: "SALES_LINES", absentChildRecordType: null, dateColumn: "createddate",
+                               lineKeyColumn: "custcol_hc_order_line_id", joinKeyFieldName: "orderId",
+                               omsStatusConfigId: "NS_BE320_NO_OMS", omsStatusKeyField: "orderId", omsStatusLineKeyField: "orderLineId"])
+        ec.artifactExecution.disableAuthz()
+        try {
+            ec.entity.makeValue("darpan.reconciliation.NsSuiteQlSourceQueryField").setAll([nsSuiteQlSourceQueryId: "${t}_Q".toString(),
+                    recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 2]).createOrUpdate()
+        } finally {
+            ec.artifactExecution.enableAuthz()
+        }
+        resetPeak()
+        int[] requests = [0]
+        NsSuiteQlPageRetry.requestForTests = { int offset -> requests[0]++; suiteQlPage([], false) } as Closure<HttpResponse<String>>
+        Closure<Map> readByChange = { ->
+            (Map) ec.service.sync().name("reconciliation.NetSuiteOrderExtractionServices.extract#NetSuiteOrders")
+                    .parameters([nsSuiteQlSourceQueryId: "${t}_Q".toString(), companyUserGroupId: t, windowStart: "2026-11-01",
+                                 windowEnd: "2026-11-26", changedSince: java.sql.Timestamp.valueOf("2026-11-25 00:00:00")])
+                    .disableAuthz().call()
+        }
+        // an earlier test's message error would stop the service from running at all
+        ec.message.clearErrors()
+        try {
+            Map refused = readByChange()
+            assertTrue(((List) refused.errors)?.any { it.toString().startsWith("Not read by what changed") && it.toString().contains("omsChangedStatusIds") },
+                    "${refused.errors}")
+            ec.message.clearErrors()
+
+            ec.artifactExecution.disableAuthz()
+            try {
+                ec.entity.find("darpan.reconciliation.NsSuiteQlSourceQuery").condition("nsSuiteQlSourceQueryId", "${t}_Q".toString()).one()
+                        .setAll([omsChangedStatusIds: "ITEM_CANCELLED", liveLineStates: "OPEN"]).update()
+            } finally {
+                ec.artifactExecution.enableAuthz()
+            }
+            Map failed = readByChange()
+            List errors = (List) failed.errors
+            assertTrue(errors?.any { it.toString().contains("HotWax changed orders read failed") }, "${errors}")
+            assertTrue(errors.every { !it.toString().startsWith("Not read by what changed") }, "a failed ask is no refusal: ${errors}")
+            assertEquals(0, requests[0], "NetSuite was never asked")
+        } finally {
+            ec.message.clearErrors()
+            resetPeak()
+        }
+    }
 }

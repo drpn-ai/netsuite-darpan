@@ -1660,4 +1660,146 @@ class NsSuiteQlQueryTemplateTest {
         assertTrue(e.message.contains("lastmodifieddate") && e.message.contains("trandate") && e.message.contains("darpanStamp"), e.message)
         assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyReadMode(spec([:]), "createdAt", true) }
     }
+
+    /**
+     * DAR-BE-320 (Aditi 2026-11-26: "no runs pull month to date on a daily run"). After its recent read an audit asks for the
+     * window's records that changed since that read started: the transaction-date window stays (an October order edited
+     * today is no November record) and the changed-since clause is added, so a November 3 order edited today is read.
+     */
+    @Test
+    void anAuditsChangedReadKeepsTheWindowAndAsksWhatChanged() {
+        String changed = "AND (lastmodifieddate >= TO_DATE('2026-11-24', 'YYYY-MM-DD') " +
+                "OR id IN (SELECT cl.transaction FROM transactionline cl WHERE cl.linelastmodifieddate >= TO_DATE('2026-11-24', 'YYYY-MM-DD')) " +
+                "OR trandate >= TO_DATE('2026-11-24', 'YYYY-MM-DD')) "
+        Map<String, Object> records = NsSuiteQlOrderSupport.applyChangedSince(spec([:]), java.sql.Timestamp.valueOf("2026-11-24 00:00:00"))
+        assertEquals("2026-11-24", records.changedFrom)
+        assertFalse(records.containsKey("stamped"), "an audit read carries no dataset stamp")
+        assertEquals("SELECT tranid FROM transaction WHERE type = 'SalesOrd' " +
+                "AND trandate >= TO_DATE('2026-11-01', 'YYYY-MM-DD') AND trandate < TO_DATE('2026-11-27', 'YYYY-MM-DD') " +
+                changed + "ORDER BY id", sql(records, "2026-11-01", "2026-11-27"))
+        String lines = sql(NsSuiteQlOrderSupport.applyChangedSince(salesLinesSpec(), "2026-11-24"), "2026-11-01", "2026-11-27")
+        assertTrue(lines.contains("WHERE t.type = 'SalesOrd' AND t.trandate >= TO_DATE('2026-11-01', 'YYYY-MM-DD') " +
+                "AND t.trandate < TO_DATE('2026-11-27', 'YYYY-MM-DD') AND (t.lastmodifieddate >= TO_DATE('2026-11-24', 'YYYY-MM-DD') " +
+                "OR t.id IN (SELECT cl.transaction FROM transactionline cl WHERE cl.linelastmodifieddate >= TO_DATE('2026-11-24', 'YYYY-MM-DD')) " +
+                "OR t.trandate >= TO_DATE('2026-11-24', 'YYYY-MM-DD')) " +
+                "AND tl.mainline = 'F' "), lines)
+        // none sent: the spec and the query are a run's, to the byte
+        assertEquals(spec([:]), NsSuiteQlOrderSupport.applyChangedSince(spec([:]), null))
+        assertEquals(RECORDS_SQL, sql(NsSuiteQlOrderSupport.applyChangedSince(spec([:]), " ")))
+    }
+
+    /**
+     * DAR-BE-320. A query whose records move while neither NetSuite stamp does is refused by name before any request, so the
+     * audit reads that check's whole window: a line HotWax cancelled today (omsStatusConfigId, gorjana R10/R11) changes no
+     * NetSuite stamp, and a template that reads other transactions or has no window cannot say what changed either.
+     */
+    @Test
+    void anAuditsChangedReadIsRefusedWhereNoStampMoves() {
+        Map<String, Map<String, Object>> refused = [
+                "LINKED_CHILD_ABSENT": spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"]),
+                "RECORDS_MATCHING"   : spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "otherrefnum", op: "STARTS_WITH", values: ["WTY-"]]]]),
+                "ACTIVE_ITEMS"       : activeItemsSpec(),
+                "omsStatusConfigId"  : salesLinesSpec([omsStatusConfigId: "HOTWAX_OMS_REST:x", omsStatusKeyField: "orderId",
+                                                       omsStatusLineKeyField: "orderLineId"]),
+        ]
+        refused.each { String named, Map<String, Object> s ->
+            IllegalArgumentException e = assertThrows(IllegalArgumentException, {
+                NsSuiteQlOrderSupport.applyChangedSince(new LinkedHashMap(s), "2026-11-24")
+            }, named)
+            assertTrue(e.message.startsWith("Not read by what changed: ") && e.message.contains(named), e.message)
+            assertThrows(IllegalArgumentException, { sql(new LinkedHashMap(s) + [changedFrom: "2026-11-24"]) }, "${named}: however the spec was marked")
+        }
+        Map<String, Object> byKey = spec([:]) + [lookupKeys: ["SO1"], lookupKeyField: "tranId"]
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyChangedSince(byKey, "2026-11-24") }
+        Map<String, Object> stamped = NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyChangedSince(stamped, "2026-11-24") }
+    }
+
+    /** gorjana's R10/R11/R12 query shape: SALES_LINES on createddate, each line with its HotWax item's status. */
+    private static Map<String, Object> enrichedLinesSpec(Map<String, Object> overrides = [:], List<Map<String, Object>> fields = null) {
+        return salesLinesSpec([dateColumn: "createddate", omsStatusConfigId: "HOTWAX_OMS_REST:gorjana_oms", omsStatusKeyField: "orderId",
+                               omsStatusLineKeyField: "orderLineId", omsChangedStatusIds: "ITEM_CANCELLED", liveLineStates: "OPEN"] + overrides, fields)
+    }
+
+    /**
+     * DAR-BE-320 (Aditi 2026-11-26: design approved). gorjana R10/R11/R12 read 197k November lines each morning to judge the
+     * ~10k open and ~2k closed ones. Read by change, the query takes whole orders that could have moved since the recent start:
+     * changed in NetSuite, created since, with an open line (an approved line HotWax moved to another facility moves no stamp
+     * anywhere), or one HotWax cancelled a line of (a cancel on a billed line moves no NetSuite stamp).
+     */
+    @Test
+    void aHotwaxEnrichedLinesQueryReadByChangeTakesLiveLinesAndTheOrdersHotwaxChanged() {
+        Map<String, Object> s = NsSuiteQlOrderSupport.applyChangedSince(enrichedLinesSpec(), "2026-11-25")
+        NsSuiteQlOrderSupport.applyChangedOrderIds(s, ["M1214814", "M1231905", "M1214814"])
+        assertEquals(["ITEM_CANCELLED"], s.omsChangedStatusIds)
+        assertEquals(["OPEN"], s.liveLineStates)
+        assertEquals(["M1214814", "M1231905"], s.changedOrderIds, "each order once")
+        String q = sql(s, "2026-11-01", "2026-11-26")
+        String d = "TO_DATE('2026-11-25', 'YYYY-MM-DD')"
+        assertTrue(q.contains("WHERE t.type = 'SalesOrd' AND t.createddate >= TO_DATE('2026-11-01', 'YYYY-MM-DD') " +
+                "AND t.createddate < TO_DATE('2026-11-26', 'YYYY-MM-DD') " +
+                "AND (t.lastmodifieddate >= ${d} " +
+                "OR t.id IN (SELECT cl.transaction FROM transactionline cl WHERE cl.linelastmodifieddate >= ${d}) " +
+                "OR t.createddate >= ${d} " +
+                "OR t.id IN (SELECT ll.transaction FROM transactionline ll WHERE ll.mainline = 'F' AND ll.custcol_hc_order_line_id IS NOT NULL " +
+                "AND CASE WHEN ll.quantitybilled <> 0 THEN 'BILLED' WHEN ll.isclosed = 'T' THEN 'CLOSED' WHEN ll.quantityshiprecv <> 0 " +
+                "THEN 'SHIPPED' ELSE 'OPEN' END IN ('OPEN')) " +
+                "OR t.custbody_hc_order_id IN ('M1214814','M1231905')) AND tl.mainline = 'F' "), q)
+        // no changed orders: the IN term is left out, nothing else moves
+        String none = sql(NsSuiteQlOrderSupport.applyChangedOrderIds(NsSuiteQlOrderSupport.applyChangedSince(enrichedLinesSpec(), "2026-11-25"), []),
+                "2026-11-01", "2026-11-26")
+        assertFalse(none.contains("custbody_hc_order_id IN"), none)
+        // a run's read of the same query is untouched
+        assertFalse(sql(enrichedLinesSpec(), "2026-11-01", "2026-11-26").contains("lastmodifieddate"))
+    }
+
+    /**
+     * DAR-BE-320. A HotWax-enriched query is read by change only when it says what brings an order back; shipments never
+     * (nothing says when they change); every refusal starts with the words darpan reads as "read the whole window".
+     */
+    @Test
+    void aHotwaxEnrichedQueryIsReadByChangeOnlyWhenItNamesWhatMovesIt() {
+        IllegalArgumentException noStatuses = assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.applyChangedSince(enrichedLinesSpec([omsChangedStatusIds: null]), "2026-11-25")
+        }
+        assertTrue(noStatuses.message.startsWith(NsSuiteQlOrderSupport.CHANGED_READ_REFUSED + ": ") &&
+                noStatuses.message.contains("omsChangedStatusIds"), noStatuses.message)
+        assertEquals(darpan.audit.AuditRecentReadSupport.CHANGED_READ_REFUSED, NsSuiteQlOrderSupport.CHANGED_READ_REFUSED,
+                "darpan reads a refusal by these words")
+        Map<String, Object> shipGroups = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "NS_SHIP", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", joinKeyFieldName: "orderId", omsStatusConfigId: "HOTWAX_OMS_REST:x",
+                omsStatusKeyField: "orderId", omsShipGroupsField: "fulfillments"],
+                [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id", sequenceNum: 1],
+                 [recordFieldName: "fulfillments", sourceColumn: "LINKED_LOCATIONS(ItemShip) AS fulfillments", sequenceNum: 2]])
+        IllegalArgumentException shipments = assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyChangedSince(shipGroups, "2026-11-25") }
+        assertTrue(shipments.message.startsWith(NsSuiteQlOrderSupport.CHANGED_READ_REFUSED), shipments.message)
+
+        List<String> many = (1..1001).collect { "M${it}".toString() }
+        IllegalArgumentException tooMany = assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.applyChangedOrderIds(enrichedLinesSpec(), many)
+        }
+        assertTrue(tooMany.message.startsWith(NsSuiteQlOrderSupport.CHANGED_READ_REFUSED) && tooMany.message.contains("1001"), tooMany.message)
+        assertEquals(1000, ((List) NsSuiteQlOrderSupport.applyChangedOrderIds(enrichedLinesSpec(), many.take(1000)).changedOrderIds).size())
+        IllegalArgumentException quote = assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.applyChangedOrderIds(enrichedLinesSpec(), ["M1' OR '1'='1"])
+        }
+        assertTrue(quote.message.startsWith(NsSuiteQlOrderSupport.CHANGED_READ_REFUSED), quote.message)
+        // a lines query never names the HotWax order by an expression: refused as the query is read, before any read by change
+        IllegalArgumentException expression = assertThrows(IllegalArgumentException) {
+            enrichedLinesSpec([:], [[recordFieldName: "orderId", sourceColumn: "BUILTIN.DF(custbody_hc_order_id) AS orderId", sequenceNum: 1]])
+        }
+        assertTrue(expression.message.contains("bare header columns"), expression.message)
+    }
+
+    /** DAR-BE-320. The two declarations are checked when the query is read, before anything reaches SuiteQL. */
+    @Test
+    void theChangeDeclarationsAreCheckedBeforeAnyRead() {
+        assertThrows(IllegalArgumentException, { enrichedLinesSpec([omsStatusLineKeyField: null]) },
+                "item statuses need each record's item")
+        assertThrows(IllegalArgumentException, { enrichedLinesSpec([omsChangedStatusIds: "ORDER_CANCELLED"]) }, "item statuses only")
+        assertThrows(IllegalArgumentException, { enrichedLinesSpec([liveLineStates: "OPEN,PENDING"]) }, "the four line states only")
+        assertThrows(IllegalArgumentException, { spec([liveLineStates: "OPEN"]) }, "line states are a SALES_LINES matter")
+        assertEquals(["ITEM_CANCELLED", "ITEM_COMPLETED"], enrichedLinesSpec([omsChangedStatusIds: " item_cancelled, ITEM_COMPLETED ,"]).omsChangedStatusIds)
+        assertEquals([], salesLinesSpec().liveLineStates, "absent: nothing is read every morning")
+    }
 }

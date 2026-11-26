@@ -106,6 +106,17 @@
                     out the lines with no HotWax line id, as every read did before Keep moved into Spark. A run's read by
                     the other side's keys and an audit re-check send none: they are kept in Spark like any run read.</description>
             </parameter>
+            <parameter name="changedSince" type="Timestamp">
+                <description>DAR-BE-320. An audit's daily read, instead of the whole window: the window's records (the query's
+                    dateColumn in [windowStart, windowEnd), as a run reads) that could have moved since this instant's day, whole
+                    orders: the header or any line changed (lastmodifieddate, linelastmodifieddate), dated from that day on, an
+                    order with a keyed line in one of the query's liveLineStates, or an order HotWax wrote one of the query's
+                    omsChangedStatusIds item statuses for since then (asked of HotWax first, at most 1000). Only a RECORDS or
+                    SALES_LINES query over transaction with nothing read off other transactions can be read so; one asking
+                    HotWax for item statuses only with omsChangedStatusIds; one counting HotWax shipments never. Any other, a
+                    read by key, or windowFieldName darpanStamp is refused before any request, and the audit then reads that
+                    check's whole window. A caller checks this parameter is declared before sending it.</description>
+            </parameter>
             <parameter name="lookupWithinWindow" type="Boolean" default-value="false">
                 <description>DAR-BE-156. A read by key that also keeps windowStart/windowEnd: an audit re-check of its older
                     findings reads what the check's full read would, restricted to the keys, so the date index bounds it.</description>
