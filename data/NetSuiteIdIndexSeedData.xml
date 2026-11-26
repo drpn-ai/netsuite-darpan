@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DAR-BE-374: the ids the ID index takes from what Darpan already reads from NetSuite (run extracts and kept copies; the index
+  never calls NetSuite itself). A NetSuite read is one source query of one record type, so the record kind comes from that
+  query's recordType (kindHintEntity/kindHintField, keyed by the read's connection, the query id). A field the query did not
+  select simply writes nothing. Product rows: a tenant adds its own join keys (custbody fields) in TenantIdIndexField.
+-->
+<entity-facade-xml type="darpan-seed">
+    <darpan.idindex.IdIndexSource systemEnumId="NETSUITE_SUITEQL" systemCode="NETSUITE" idField="id" isActive="Y"
+            recordKindMapJson="{&quot;SalesOrd&quot;:&quot;ORDER&quot;,&quot;ItemShip&quot;:&quot;FULFILLMENT&quot;,&quot;CustInvc&quot;:&quot;INVOICE&quot;,&quot;CashSale&quot;:&quot;INVOICE&quot;,&quot;RtnAuth&quot;:&quot;RETURN_AUTHORIZATION&quot;,&quot;CustCred&quot;:&quot;CREDIT_MEMO&quot;,&quot;CustPymt&quot;:&quot;PAYMENT&quot;,&quot;CustRfnd&quot;:&quot;REFUND&quot;}"
+            kindHintEntity="darpan.reconciliation.NsSuiteQlSourceQuery" kindHintField="recordType"
+            description="NetSuite transactions (kind from the read's query record type)"/>
+    <darpan.idindex.IdIndexField systemEnumId="NETSUITE_SUITEQL" fieldId="NS_ID" fieldPath="id" role="OWN" description="The internal id"/>
+    <darpan.idindex.IdIndexField systemEnumId="NETSUITE_SUITEQL" fieldId="NS_TRANID" fieldPath="tranid" role="OWN" description="The document number"/>
+    <darpan.idindex.IdIndexField systemEnumId="NETSUITE_SUITEQL" fieldId="NS_EXTERNALID" fieldPath="externalid" role="OWN" description="The external id"/>
+    <darpan.idindex.IdIndexField systemEnumId="NETSUITE_SUITEQL" fieldId="NS_OTHERREFNUM" fieldPath="otherrefnum" role="OWN" description="The PO / reference number"/>
+    <darpan.idindex.IdIndexField systemEnumId="NETSUITE_SUITEQL" fieldId="NS_CREATEDFROM" fieldPath="createdfrom" role="REF"
+            description="The transaction this one was created from (a fulfillment's sales order, a credit memo's RMA)"/>
+</entity-facade-xml>
