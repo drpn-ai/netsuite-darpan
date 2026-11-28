@@ -5,7 +5,7 @@ OAuth 2.0 machine-to-machine (M2M) client assertion. First released in `v0.3.0` 
 which ships with darpan 2.0.0: darpan seeds the `NETSUITE_SUITEQL` connector row and defines the
 entities, and this build calls darpan 2.0 classes (`RunSnapshotScope`, `ExcludedRecordsSidecar`,
 `SourceFilterSupport.evaluate`), so neither runs with the other's older tag. `v0.2.0` carried only
-the inventory RESTlet services, which are not live (see [restlet-inventory-bulk.md](restlet-inventory-bulk.md)).
+the inventory RESTlet services, which never went live and were deleted (DAR-OPS-029 S41c, Aditi 2026-11-28).
 
 ## Where things live
 

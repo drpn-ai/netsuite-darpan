@@ -18,7 +18,7 @@ class NsTokenCacheTest {
     private static long nowSec() { (long) (System.currentTimeMillis() / 1000L) }
 
     @BeforeEach
-    void reset() { NsTokenCache.clearAll() }
+    void reset() { NsTokenCache.resetForTests() }
 
     @Test
     void returnsCachedTokenWhenPresentAndUnexpired() {

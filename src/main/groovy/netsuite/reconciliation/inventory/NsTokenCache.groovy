@@ -7,20 +7,18 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Audit H6.1 — JVM-singleton cache for NetSuite OAuth2 M2M JWT access tokens.
  *
- * Previously the cache lived on the @Field of the Groovy script class
- * (fetchNsInventoryAdjustmentsBulk.groovy). Moqui's Groovy executor creates a new script class
- * instance per invocation, so the @Field was effectively reborn each call: every reconciliation
- * batch minted a brand-new JWT and called the NetSuite token endpoint, regardless of whether a
- * still-valid token existed. That meant (a) extra token-endpoint round-trips on every batch,
- * (b) NetSuite-side rate-limit / audit-log noise, and (c) no way to invalidate-and-retry on a 401
- * because the cache was already gone.
+ * A cache on a Groovy service script's @Field is reborn on every call (Moqui's Groovy executor makes a new script
+ * instance per invocation), so every read would mint a brand-new JWT: extra token-endpoint round-trips, NetSuite-side
+ * rate-limit / audit-log noise, and no way to invalidate-and-retry on a 401. Used by the SuiteQL extract
+ * (extractNetSuiteOrders), NsSuiteQlClient and NsAgentQuerySupport; the package name is historical (the inventory RESTlet
+ * path that first held it was deleted, DAR-OPS-029 S41c).
  *
  * This class hoists the cache to a static JVM-wide map keyed by an opaque authCacheKey
  * (typically the linkedAuthConfigId, falling back to nsConfigId). The script remains responsible
  * for minting tokens; the cache only stores access-token + tokenUrl + expiresAtSec.
  *
  * 401 protocol:
- *   evict(authCacheKey) — call when the restlet returns 401 (token revoked / rotated on the
+ *   evict(authCacheKey) — call when NetSuite returns 401 (token revoked / rotated on the
  *   NetSuite side) so the very next get() forces a fresh mint via the script's resolveOauthToken
  *   closure, then retry the restlet once.
  */
@@ -65,8 +63,8 @@ class NsTokenCache {
         return CACHE.size()
     }
 
-    /** Test cleanup helper. */
-    static void clearAll() {
+    /** Test-only: empties the cache (the DAR-OPS-026 seam name). Idempotent. */
+    static void resetForTests() {
         CACHE.clear()
     }
 }

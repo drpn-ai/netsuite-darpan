@@ -4,8 +4,8 @@
  * Mirrors the sibling integration components (darpan-hotwax, shopify-darpan): the Groovy under
  * src/main/groovy is compiled and jarred into lib/ so Moqui's component class loader can pick it up
  * (Moqui only adds <component>/classes and <component>/lib/*.jar to the runtime classpath — it does
- * not compile src/ on its own). Without this, the NsTokenCache helper class referenced by the
- * fetch#NsInventoryAdjustmentsBulk script would never reach the classpath.
+ * not compile src/ on its own). Without this, the classes the service scripts reference (NsSuiteQlOrderSupport,
+ * NsTokenCache, ...) would never reach the classpath.
  */
 
 apply plugin: 'groovy'
@@ -44,10 +44,6 @@ tasks.withType(GroovyCompile) { options.compilerArgs << "-proc:none" }
 dependencies {
     implementation project(':framework')
     implementation project(':runtime:component:darpan')
-    // retrieveInventoryAdjustmentsByReference.groovy imports Spark SQL at compile time; the runtime
-    // copy is supplied by the :darpan component's lib/, so keep it compileOnly here to avoid copying
-    // Spark's transitive jars into this component's lib/.
-    compileOnly 'org.apache.spark:spark-sql_2.13:4.2.1'
 
     testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
     testImplementation project(':runtime:component:darpan').sourceSets.test.output

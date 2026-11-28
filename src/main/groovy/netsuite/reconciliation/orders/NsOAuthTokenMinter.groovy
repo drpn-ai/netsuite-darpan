@@ -16,9 +16,8 @@ import java.security.spec.PSSParameterSpec
 /**
  * Builds the OAuth 2.0 M2M client assertion NetSuite's token endpoint expects (DAR-BE-032).
  *
- * Mirrors the proven behaviour of netsuite-darpan's fetchNsInventoryAdjustmentsBulk.groovy, lifted
- * into a class so the SuiteQL orders path can reuse it and so the parts that are undiagnosable in
- * production can be unit-tested. NetSuite answers every bad assertion with the same opaque
+ * Lifted from the (since deleted, DAR-OPS-029 S41c) inventory RESTlet script's proven behaviour into a class, so the
+ * SuiteQL orders path reuses it and the parts that are undiagnosable in production can be unit-tested. NetSuite answers every bad assertion with the same opaque
  * HTTP 500 {"error":"server_error"}, so a wrong algorithm, a mangled PEM and swapped identifiers all
  * look identical from the outside.
  *
