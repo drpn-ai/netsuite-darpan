@@ -210,14 +210,8 @@ File workFile = outputDirectory != null
         ? File.createTempFile("netsuite-orders-extract-", ".partial", outputDirectory)
         : File.createTempFile("netsuite-orders-extract-", ".partial")
 
-final long PROGRESS_MIN_INTERVAL_MS = 2000L
-String progressRunId = reconciliationRunResultId?.toString()?.trim()
-String progressStage = progressStageCode?.toString()?.trim() ?: RunObservability.STAGE_EXTRACT_FILE2
-Integer progressExpectedTotal = null
-try {
-    progressExpectedTotal = expectedRecordCount != null ? (expectedRecordCount as Integer) : null
-} catch (Exception ignored) { }
-long lastReportedAtMs = 0L
+// DAR-OPS-029 S99-074: the one throttled page heartbeat, shared with the HotWax extracts; null without a run id.
+Closure progressListener = RunObservability.throttledProgressListener(ec, reconciliationRunResultId, progressStageCode, expectedRecordCount)
 
 // One page of SuiteQL, live. DAR-BE-056: a page that times out, drops its connection or meets a gateway 429/5xx is
 // retried on its own (NsSuiteQlPageRetry) instead of aborting the extraction; each retry is a warning, and each
@@ -259,14 +253,9 @@ Closure livePage = { String query, int limit, int offset ->
     }
     Map parsed = new JsonSlurper().parseText(resp.body()) as Map
 
-    if (progressRunId) {
+    if (progressListener != null) {
         cumulative += ((List) (parsed.items ?: [])).size()
-        long nowMs = System.currentTimeMillis()
-        if (nowMs - lastReportedAtMs >= PROGRESS_MIN_INTERVAL_MS) {
-            lastReportedAtMs = nowMs
-            RunObservability.heartbeatStageProgress(ec, progressRunId, progressStage,
-                    cumulative, (progressExpectedTotal ?: null))
-        }
+        progressListener.call(cumulative)
     }
     return [items: (parsed.items ?: []), hasMore: parsed.hasMore == true]
 }
