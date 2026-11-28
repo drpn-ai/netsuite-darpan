@@ -177,5 +177,7 @@ class NsLifecycleSnapshotTest {
     @Test
     void aReadPastThePageCeilingFailsRatherThanTruncate() {
         assertThrows(IllegalStateException) { NsLifecycleSnapshot.read(spec([:]), FROM, TO, dir, fetcher(), 2, 2) }
+        // DAR-OPS-029 S41a: and the half-written rows file goes with the failure, rather than staying in the run's folder.
+        assertEquals([], (dir.list() ?: []).findAll { it.startsWith("ns-lifecycle-") }, "no rows file is left behind")
     }
 }

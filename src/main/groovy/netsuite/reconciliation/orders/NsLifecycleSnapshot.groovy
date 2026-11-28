@@ -91,16 +91,22 @@ class NsLifecycleSnapshot {
         dir.mkdirs()
         File file = File.createTempFile("ns-lifecycle-", ".rows", dir)
         int count = 0
-        file.withWriter(StandardCharsets.UTF_8.name()) { Writer w ->
-            eachRow(NsSuiteQlOrderSupport.buildRecordsQuery(base, fromDate, toDate), pageFetcher, maxPages, pageSize) { Map row ->
-                row.remove("links")
-                // The id leads the line so a question skips the rows it does not admit without parsing them.
-                w.write(String.valueOf(row.get(idKey)))
-                w.write('\t')
-                w.write(JsonOutput.toJson(row))
-                w.write('\n')
-                count++
+        try {
+            file.withWriter(StandardCharsets.UTF_8.name()) { Writer w ->
+                eachRow(NsSuiteQlOrderSupport.buildRecordsQuery(base, fromDate, toDate), pageFetcher, maxPages, pageSize) { Map row ->
+                    row.remove("links")
+                    // The id leads the line so a question skips the rows it does not admit without parsing them.
+                    w.write(String.valueOf(row.get(idKey)))
+                    w.write('\t')
+                    w.write(JsonOutput.toJson(row))
+                    w.write('\n')
+                    count++
+                }
             }
+        } catch (Throwable failure) {
+            // a failed read leaves no half-written rows file in the run's folder (DAR-OPS-029 S41a)
+            file.delete()
+            throw failure
         }
         return new NsLifecycleSnapshot(fromDate, toDate, file, columnsOf(spec), count, System.currentTimeMillis() - started,
                 maxPages, pageSize)

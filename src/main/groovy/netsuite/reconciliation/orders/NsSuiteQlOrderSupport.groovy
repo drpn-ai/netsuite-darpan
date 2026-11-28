@@ -1341,7 +1341,7 @@ class NsSuiteQlOrderSupport {
     /** STARTS_WITH (DAR-BE-095): a reference that begins with a value, e.g. otherrefnum WTY- (a warranty replacement). */
     static final List<String> MATCH_OPS = ["IN", "GT", "NOT_EMPTY", "STARTS_WITH"].asImmutable()
 
-    static String matchColumn(String fieldId) {
+    private static String matchColumn(String fieldId) {
         if (MATCH_COLUMNS.containsKey(fieldId)) return MATCH_COLUMNS[fieldId]
         if (fieldId ==~ /custbody_[a-z0-9_]+/) return "t.${fieldId}".toString()
         throw new IllegalArgumentException("'${fieldId}' is not a field a finding can ask about")
@@ -1392,7 +1392,7 @@ class NsSuiteQlOrderSupport {
      * for HotWax is read apart (buildActiveItemsUsedQuery) and set by streamOrdersToWriter. As one query, the per-item test
      * timed out at 180 s a page on gorjana; as two, the used-items read is four pages well inside it.
      */
-    static String buildActiveItemsQuery(Map<String, Object> spec, String asOfDate) {
+    private static String buildActiveItemsQuery(Map<String, Object> spec, String asOfDate) {
         requireIsoDate(asOfDate, "asOfDate")
         String byKey = spec.get("lookupKeys") ? population(spec, null, null, null, "i") : ""
         StringBuilder extra = new StringBuilder()
@@ -1429,7 +1429,7 @@ class NsSuiteQlOrderSupport {
     }
 
     /** Created in the last NEW_ITEM_DAYS: a new item is live before anything uses it (it must reach HotWax first). */
-    static boolean isNewItem(Object created, String asOfDate) {
+    private static boolean isNewItem(Object created, String asOfDate) {
         String day = created?.toString()?.trim()
         if (!(day ==~ /\d{4}-\d{2}-\d{2}/) || !asOfDate) return false
         return !java.time.LocalDate.parse(day).isBefore(java.time.LocalDate.parse(asOfDate).minusDays(NEW_ITEM_DAYS))
@@ -1512,7 +1512,7 @@ class NsSuiteQlOrderSupport {
      * off HotWax must be covered: item statuses by omsChangedStatusIds (their timeline brings the order back); shipments
      * (omsShipGroupsField) have no change signal, so such a query is never read so.
      */
-    static String changedReadProblem(Map<String, Object> spec) {
+    private static String changedReadProblem(Map<String, Object> spec) {
         Map<String, Object> withoutOms = new LinkedHashMap<String, Object>(spec)
         withoutOms.remove("omsStatusConfigId")
         withoutOms.remove("omsShipGroupsField")
@@ -1688,13 +1688,8 @@ class NsSuiteQlOrderSupport {
     }
 
     /** A written finding's conditions, stored as JSON [{fieldId, op, values}]; fields and values reach SuiteQL. */
-    static List<Map<String, Object>> parseMatchRules(Object raw) {
-        Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
-        if (parsed == null) return []
-        if (!(parsed instanceof List)) throw new IllegalArgumentException("matchRules must be a list, got: ${raw}")
-        return ((List) parsed).collect { Object o ->
-            if (!(o instanceof Map)) throw new IllegalArgumentException("matchRules holds a non-rule: ${o}")
-            Map m = (Map) o
+    private static List<Map<String, Object>> parseMatchRules(Object raw) {
+        return ruleMaps(raw, "matchRules").collect { Map m ->
             String fieldId = text(m.get("fieldId"))
             if (!fieldId) throw new IllegalArgumentException("matchRules needs a field")
             matchColumn(fieldId)
@@ -1727,13 +1722,8 @@ class NsSuiteQlOrderSupport {
      * DAR-UI-050. The stage's exceptions, stored as JSON [{fieldId, values}]. Every field id and value reaches SuiteQL
      * by interpolation, so a field id must be an identifier and a value may not hold a quote.
      */
-    static List<Map<String, Object>> parseWaiveRules(Object raw) {
-        Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
-        if (parsed == null) return []
-        if (!(parsed instanceof List)) throw new IllegalArgumentException("waiveRules must be a list, got: ${raw}")
-        return ((List) parsed).collect { Object o ->
-            if (!(o instanceof Map)) throw new IllegalArgumentException("waiveRules holds a non-rule: ${o}")
-            Map m = (Map) o
+    private static List<Map<String, Object>> parseWaiveRules(Object raw) {
+        return ruleMaps(raw, "waiveRules").collect { Map m ->
             String fieldId = text(m.get("fieldId"))
             if (!fieldId || !(fieldId ==~ /[a-z][a-z0-9_]*/)) throw new IllegalArgumentException("waiveRules field must be a field id, got: ${fieldId}")
             List<String> values = ((m.get("values") ?: []) as List).collect { text(it) }.findAll { it } as List<String>
@@ -1747,6 +1737,17 @@ class NsSuiteQlOrderSupport {
         }
     }
 
+    /** A rule list stored as JSON (or already parsed): its entries, each a Map, or none; anything else is refused by label. */
+    private static List<Map> ruleMaps(Object raw, String label) {
+        Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
+        if (parsed == null) return []
+        if (!(parsed instanceof List)) throw new IllegalArgumentException("${label} must be a list, got: ${raw}")
+        return ((List) parsed).collect { Object o ->
+            if (!(o instanceof Map)) throw new IllegalArgumentException("${label} holds a non-rule: ${o}")
+            (Map) o
+        } as List<Map>
+    }
+
     /**
      * DAR-BE-073. Stages reached by a shared field rather than the link table, stored as JSON
      * [{recordType, startField, stageField}]: a record of recordType whose stageField equals the start record's startField
@@ -1757,7 +1758,7 @@ class NsSuiteQlOrderSupport {
      * alternatives, each a record type from the lifecycle whitelist, linked (no fields), carrying a field, or naming in
      * stageField the internal id of a record reached through via. Answers Settled -> [anyOf: [...]].
      */
-    static Map<String, Map> parseStageReach(Object raw) {
+    private static Map<String, Map> parseStageReach(Object raw) {
         Object parsed = raw instanceof String ? (text(raw) ? new JsonSlurper().parseText((String) raw) : null) : raw
         if (parsed == null) return [:]
         if (!(parsed instanceof List)) throw new IllegalArgumentException("stageReach must be a list, got: ${raw}")
@@ -1854,18 +1855,30 @@ class NsSuiteQlOrderSupport {
         return s ? s : null
     }
 
-    /** Every item id the used-items query names, paged to its end. */
-    private static Set<String> readUsedItems(Map<String, Object> spec, String asOfDate, int pageSize, Closure pageFetcher) {
+    /** Every item id the used-items query names, paged to its end; past maxPages it fails (pageCeiling). */
+    private static Set<String> readUsedItems(Map<String, Object> spec, String asOfDate, int pageSize, int maxPages, Closure pageFetcher) {
         String used = buildActiveItemsUsedQuery(spec, asOfDate)
         Set<String> ids = new HashSet<String>()
-        int offset = 0
+        int offset = 0, pages = 0
         while (true) {
             Map page = (Map) pageFetcher.call(used, pageSize, offset)
+            pages++
             List items = (List) (page?.get("items") ?: [])
             for (Object it : items) ids.add(String.valueOf(((Map) it).get("item")))
             if (!(page?.get("hasMore") == true) || items.isEmpty()) return ids
+            if (pages >= maxPages) throw pageCeiling(maxPages, pageSize)
             offset += pageSize
         }
+    }
+
+    /**
+     * DAR-OPS-029 S41a (OC108). A read that still has more to come at its page ceiling fails: a partial read written as the
+     * window's records would compare as a complete one (no hollow green), as NsLifecycleSnapshot and darpan's DataSourceRunner
+     * (TOO_MANY_PAGES) already answer.
+     */
+    static IllegalStateException pageCeiling(int maxPages, int pageSize) {
+        return new IllegalStateException(("The NetSuite read ran past ${maxPages} pages of ${pageSize} rows with more to come; " +
+                "narrow the window.").toString())
     }
 
     /**
@@ -1908,7 +1921,7 @@ class NsSuiteQlOrderSupport {
         boolean hasMore = true
 
         // DAR-BE-157: ACTIVE_ITEMS reads the items NetSuite used for HotWax first; each item row is then live Y or N.
-        Set<String> usedItems = spec.get("queryTemplate") == TEMPLATE_ACTIVE_ITEMS ? readUsedItems(spec, asOfDate, pageSize, pageFetcher) : null
+        Set<String> usedItems = spec.get("queryTemplate") == TEMPLATE_ACTIVE_ITEMS ? readUsedItems(spec, asOfDate, pageSize, maxPages, pageFetcher) : null
         writer.write('{"records":[')
         while (hasMore && pageCount < maxPages) {
             Map page = (Map) pageFetcher.call(query, pageSize, offset)
@@ -1938,10 +1951,7 @@ class NsSuiteQlOrderSupport {
             hasMore = page?.get("hasMore") == true
             offset += pageSize
         }
-        if (hasMore && pageCount >= maxPages) {
-            warnings.add("Stopped after the ${maxPages} page ceiling with more results reported; ".toString() +
-                    "narrow the window or raise maxPages.")
-        }
+        if (hasMore) throw pageCeiling(maxPages, pageSize)
         writer.write('],"metadata":')
         Map<String, Object> metadata = [
                 source       : "NETSUITE_SUITEQL",

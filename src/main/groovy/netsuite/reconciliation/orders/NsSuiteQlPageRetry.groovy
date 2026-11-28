@@ -41,6 +41,11 @@ class NsSuiteQlPageRetry {
      * test can page the real extract without a NetSuite account. Null (always, outside tests) sends the real request.
      */
     static volatile Closure<HttpResponse<String>> requestForTests = null
+
+    /** Test-only: back to sending real requests. Idempotent. */
+    static void resetForTests() {
+        requestForTests = null
+    }
     private static final Logger logger = LoggerFactory.getLogger(NsSuiteQlPageRetry.class)
 
     /**

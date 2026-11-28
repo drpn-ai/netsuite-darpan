@@ -573,17 +573,39 @@ class NsSuiteQlOrderSupportTest {
     }
 
     @Test
-    void stopsAtAHardPageCeilingRatherThanLoopingForever() {
-        // A source that always answers hasMore=true (a bug, or a window that keeps growing) must
-        // terminate with a warning rather than spin until the run times out.
-        StringWriter out = new StringWriter()
-        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
-                [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000, maxPages: 3],
-                { String q, int limit, int offset -> [items: [[id: offset.toString()]], hasMore: true] })
+    void failsAtTheHardPageCeilingRatherThanTruncating() {
+        // A source that always answers hasMore=true (a bug, or a window that keeps growing) must terminate rather than spin
+        // until the run times out. DAR-OPS-029 S41a: and it fails, as NsLifecycleSnapshot does: a warning beside a partial
+        // record count let a truncated read compare as a complete one (no hollow green).
+        int calls = 0
+        IllegalStateException thrown = assertThrows(IllegalStateException) {
+            NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
+                    [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000, maxPages: 3],
+                    { String q, int limit, int offset -> calls++; [items: [[id: offset.toString()]], hasMore: true] })
+        }
+        assertEquals(3, calls, "it stops at the ceiling")
+        assertTrue(thrown.message.contains("3 pages"), thrown.message)
+    }
 
-        assertEquals(3, result.pageCount)
-        assertTrue(((List) result.warnings).any { it.toString().contains("page") },
-                "hitting the ceiling must warn: ${result.warnings}")
+    @Test
+    void theUsedItemsReadStopsAtThePageCeilingToo() {
+        // DAR-OPS-029 S41a: ACTIVE_ITEMS reads the used items first, and that loop had no ceiling at all. The fetcher's own
+        // guard (50 calls) only stops this test from hanging if the read has none.
+        int seq = 0
+        Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "item", fromTable: "item",
+                queryTemplate: "ACTIVE_ITEMS", joinKeyFieldName: "field1"],
+                ["id", "itemid", "live"].collect { [recordFieldName: "field${++seq}".toString(), sourceColumn: it, sequenceNum: seq] as Map<String, Object> })
+        int calls = 0
+        IllegalStateException thrown = assertThrows(IllegalStateException) {
+            NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
+                    [spec: spec, asOfDate: "2026-10-28", pageSize: 1000, maxPages: 3],
+                    { String q, int limit, int offset ->
+                        if (++calls > 50) throw new IllegalStateException("the used-items read looped past 50 pages with no ceiling")
+                        [items: [[item: offset.toString()]], hasMore: true]
+                    })
+        }
+        assertEquals(3, calls, "the used-items read stops at the ceiling: ${thrown.message}")
+        assertTrue(thrown.message.contains("3 pages"), thrown.message)
     }
 
     @Test
