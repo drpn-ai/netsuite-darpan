@@ -14,25 +14,31 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 
 /**
- * DAR-UI-050. One-page SuiteQL for small aggregate reads (the lifecycle builder's options), on the extractor's
- * own token path: NsOAuthTokenMinter, NsTokenCache, the shipped SuiteQL URL derivation with its SSRF check,
- * `Prefer: transient`, and one retry after a 401. The extract script keeps its own copy, untouched.
+ * DAR-UI-050. One-page SuiteQL for small aggregate reads (the lifecycle builder's options), and the one token path and
+ * the one SuiteQL request every NetSuite read uses, the order extract included (S41b): NsOAuthTokenMinter, NsTokenCache,
+ * the shipped SuiteQL URL derivation with its SSRF check, `Prefer: transient`, and one retry after a 401.
  */
 class NsSuiteQlClient {
 
     static final int PAGE_LIMIT = 1000
+    /**
+     * One HTTP client for every NetSuite call in the JVM (S41b F1). A JDK HttpClient holds a selector thread and a
+     * connection pool until it is closed, so one per call kept a thread per probe, preview and agent query until GC.
+     * It is thread-safe and meant to be shared; each request carries its own timeout.
+     */
+    static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+    static final Duration DEFAULT_QUERY_TIMEOUT = Duration.ofSeconds(120)
+    static final Duration DEFAULT_TOKEN_TIMEOUT = Duration.ofSeconds(60)
 
     private final def authConfig
     private final String authId
     private final String tokenUrl
     private final String suiteQlUrl
     private final Duration requestTimeout
-    private final HttpClient http
 
     /** requestTimeout caps the token and query calls alike; null keeps the extract-sized defaults. */
     NsSuiteQlClient(def authConfig, Duration requestTimeout = null) {
         this.requestTimeout = requestTimeout
-        this.http = HttpClient.newBuilder().connectTimeout(requestTimeout ?: Duration.ofSeconds(30)).build()
         this.authConfig = authConfig
         this.authId = authConfig.get("nsAuthConfigId") as String
         this.tokenUrl = authConfig.get("tokenUrl")?.toString()?.trim()
@@ -57,11 +63,12 @@ class NsSuiteQlClient {
     }
 
     private Map fetch(String sql, int limit, int offset) {
+        Duration timeout = requestTimeout ?: DEFAULT_QUERY_TIMEOUT
         String token = NsTokenCache.getValidAccessToken(authId, tokenUrl) ?: mintToken()
-        HttpResponse<String> resp = send(token, sql, limit, offset)
+        HttpResponse<String> resp = sendQuery(suiteQlUrl, token, sql, limit, offset, timeout)
         if (resp.statusCode() == 401) {
             NsTokenCache.evict(authId)
-            resp = send(mintToken(), sql, limit, offset)
+            resp = sendQuery(suiteQlUrl, mintToken(), sql, limit, offset, timeout)
         }
         if (resp.statusCode() != 200) {
             throw new IllegalStateException("NetSuite SuiteQL returned ${resp.statusCode()}: ${resp.body()?.take(300)}")
@@ -69,12 +76,53 @@ class NsSuiteQlClient {
         return new JsonSlurper().parseText(resp.body()) as Map
     }
 
-    private HttpResponse<String> send(String token, String sql, int limit, int offset) {
+    /** A fresh token, always minted rather than read from the cache — connection diagnostics depend on that. */
+    String mintToken() {
+        return mintToken(authConfig, tokenUrl, requestTimeout ?: DEFAULT_TOKEN_TIMEOUT)
+    }
+
+    /**
+     * A fresh OAuth2 M2M token for this auth config, cached in NsTokenCache under its id (a minute short of its life).
+     * NetSuite answers every client-assertion problem with an opaque 500, so the error names the usual cause; a 200
+     * without an access_token is refused here rather than cached and sent as "Bearer null" (S41b F3).
+     */
+    static String mintToken(def authConfig, String tokenUrl, Duration timeout) {
+        // The token URL passes OutboundHttpPolicy's NetSuite allow-list (OC87) here too, not only where a caller derived
+        // the SuiteQL URL from it, so no caller can send a client assertion to a host it did not vet.
+        NsSuiteQlOrderSupport.suiteQlUrlFromTokenUrl(tokenUrl)
+        String scope = authConfig.get("scope")?.toString()?.trim() ?: "restlets rest_webservices"
+        String assertion = NsOAuthTokenMinter.buildClientAssertion(tokenUrl, authConfig.get("clientId")?.toString()?.trim(),
+                authConfig.get("certId")?.toString()?.trim(), authConfig.get("privateKeyPem")?.toString(), scope)
+        String form = "grant_type=" + enc("client_credentials") +
+                "&client_assertion_type=" + enc("urn:ietf:params:oauth:client-assertion-type:jwt-bearer") +
+                "&client_assertion=" + enc(assertion)
+        long startedAt = System.currentTimeMillis()
+        HttpResponse<String> resp = HTTP.send(HttpRequest.newBuilder(URI.create(tokenUrl))
+                .timeout(timeout)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8)).build(),
+                HttpResponse.BodyHandlers.ofString())
+        NsSuiteQlPageRetry.logCall("token", null, 0, resp.statusCode(), startedAt)
+        if (resp.statusCode() != 200) {
+            throw new IllegalStateException("NetSuite token endpoint returned ${resp.statusCode()}. " +
+                    "Check that clientId holds the integration's Client ID (64 hex) and certId the " +
+                    "Certificate ID (43-char base64url) — entering them swapped fails exactly like this.")
+        }
+        Map parsed = new JsonSlurper().parseText(resp.body()) as Map
+        String token = parsed.access_token?.toString()?.trim()
+        if (!token) throw new IllegalStateException("NetSuite token endpoint returned 200 without an access_token.")
+        long expiresAtSec = (long) (System.currentTimeMillis() / 1000L) + ((parsed.expires_in ?: 3600) as long) - 60L
+        NsTokenCache.put(authConfig.get("nsAuthConfigId") as String, tokenUrl, token, expiresAtSec)
+        return token
+    }
+
+    /** One SuiteQL page. `Prefer: transient` is REQUIRED by NetSuite: without it the request is rejected. */
+    static HttpResponse<String> sendQuery(String suiteQlUrl, String token, String sql, int limit, int offset, Duration timeout) {
         long startedAt = System.currentTimeMillis()
         Integer status = null
         try {
-            HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${limit}&offset=${offset}"))
-                    .timeout(requestTimeout ?: Duration.ofSeconds(120))
+            HttpResponse<String> resp = HTTP.send(HttpRequest.newBuilder(URI.create("${suiteQlUrl}?limit=${limit}&offset=${offset}"))
+                    .timeout(timeout)
                     .header("Content-Type", "application/json")
                     .header("Accept", "application/json")
                     .header("Prefer", "transient")
@@ -84,34 +132,8 @@ class NsSuiteQlClient {
             status = resp.statusCode()
             return resp
         } finally {
-            NsSuiteQlPageRetry.logCall("suiteql", sql, 0, status, startedAt)
+            NsSuiteQlPageRetry.logCall("suiteql", sql, offset, status, startedAt)
         }
-    }
-
-    /** A fresh token, always minted rather than read from the cache — connection diagnostics depend on that. */
-    String mintToken() {
-        String scope = authConfig.get("scope")?.toString()?.trim() ?: "restlets rest_webservices"
-        String assertion = NsOAuthTokenMinter.buildClientAssertion(tokenUrl, authConfig.get("clientId")?.toString()?.trim(),
-                authConfig.get("certId")?.toString()?.trim(), authConfig.get("privateKeyPem")?.toString(), scope)
-        String form = "grant_type=" + enc("client_credentials") +
-                "&client_assertion_type=" + enc("urn:ietf:params:oauth:client-assertion-type:jwt-bearer") +
-                "&client_assertion=" + enc(assertion)
-        long startedAt = System.currentTimeMillis()
-        HttpResponse<String> resp = http.send(HttpRequest.newBuilder(URI.create(tokenUrl))
-                .timeout(requestTimeout ?: Duration.ofSeconds(60))
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8)).build(),
-                HttpResponse.BodyHandlers.ofString())
-        NsSuiteQlPageRetry.logCall("token", null, 0, resp.statusCode(), startedAt)
-        if (resp.statusCode() != 200) {
-            throw new IllegalStateException("NetSuite token endpoint returned ${resp.statusCode()}. Check that the account's " +
-                    "Client ID (64 hex) and Certificate ID (43-char base64url) are not swapped.")
-        }
-        Map parsed = new JsonSlurper().parseText(resp.body()) as Map
-        String token = parsed.access_token?.toString()
-        long expiresAtSec = (long) (System.currentTimeMillis() / 1000L) + ((parsed.expires_in ?: 3600) as long) - 60L
-        NsTokenCache.put(authId, tokenUrl, token, expiresAtSec)
-        return token
     }
 
     private static String enc(String v) { URLEncoder.encode(v, StandardCharsets.UTF_8) }

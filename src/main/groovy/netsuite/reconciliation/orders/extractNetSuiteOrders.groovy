@@ -4,28 +4,23 @@ import darpan.facade.common.TenantAccessSupport
 import darpan.facade.reconciliation.RunObservability
 import darpan.peak.NetSuiteReadGate
 import darpan.reconciliation.core.RunSnapshotScope
-import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
+import netsuite.facade.NsSuiteQlClient
 import netsuite.reconciliation.inventory.NsTokenCache
 import netsuite.reconciliation.orders.NsLifecycleSnapshot
 import netsuite.reconciliation.orders.NsShipGroupCountSupport
-import netsuite.reconciliation.orders.NsOAuthTokenMinter
 import netsuite.reconciliation.orders.NsSuiteQlOrderSupport
 import netsuite.reconciliation.orders.NsSuiteQlPageRetry
 
-import java.net.http.HttpClient
-import java.net.http.HttpRequest
 import java.net.http.HttpResponse
-import java.nio.charset.StandardCharsets
-import java.time.Duration
 
 // Service edge for extract#NetSuiteOrders (DAR-BE-032).
 //
 // Deliberately mirrors extractOmsReconciliationOrders.groovy step for step — same tenant gate, same
 // output location, same atomic .partial move, same progress heartbeat — so the automation edge and
 // the on-disk {records, metadata} contract stay identical across connectors. Everything that varies
-// lives in NsSuiteQlOrderSupport (query, mapping, paging) and NsOAuthTokenMinter (credential), not
-// here, and both are unit-tested without a NetSuite account.
+// lives in NsSuiteQlOrderSupport (query, mapping, paging) and NsSuiteQlClient (token and request, on
+// NsOAuthTokenMinter), not here, and both are unit-tested without a NetSuite account.
 
 String queryIdValue = nsSuiteQlSourceQueryId?.toString()?.trim()
 String companyUserGroupIdValue = companyUserGroupId?.toString()?.trim()
@@ -203,47 +198,9 @@ try {
 }
 
 String tokenUrl = authConfig.tokenUrl?.toString()?.trim()
-String scope = authConfig.scope?.toString()?.trim() ?: "restlets rest_webservices"
 String authCacheKey = authConfigIdValue
-
-// Declared BEFORE mintToken: a Groovy closure captures the variable, and a local declared later is
-// simply not in scope when the closure body runs.
-HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
-
-Closure<String> mintToken = {
-    String assertionJwt = NsOAuthTokenMinter.buildClientAssertion(tokenUrl,
-            authConfig.clientId?.toString()?.trim(),
-            authConfig.certId?.toString()?.trim(),
-            authConfig.privateKeyPem?.toString(),
-            scope)
-    String form = "grant_type=" + URLEncoder.encode("client_credentials", StandardCharsets.UTF_8) +
-            "&client_assertion_type=" + URLEncoder.encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer", StandardCharsets.UTF_8) +
-            "&client_assertion=" + URLEncoder.encode(assertionJwt, StandardCharsets.UTF_8)
-
-    long tokenStartedAt = System.currentTimeMillis()
-    HttpResponse<String> resp = httpClient.send(
-            HttpRequest.newBuilder(URI.create(tokenUrl))
-                    .timeout(Duration.ofSeconds(60))
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8))
-                    .build(),
-            HttpResponse.BodyHandlers.ofString())
-    NsSuiteQlPageRetry.logCall("token", null, 0, resp.statusCode(), tokenStartedAt)
-    if (resp.statusCode() != 200) {
-        // NetSuite answers every client-assertion problem with an opaque 500 {"error":"server_error"} —
-        // a wrong scope, a wrong certificate id and swapped iss/kid are indistinguishable here. Name
-        // the likely causes in the error so the operator is not left with the bare status.
-        throw new IllegalStateException("NetSuite token endpoint returned ${resp.statusCode()}. " +
-                "Check that clientId holds the integration's Client ID (64 hex) and certId the " +
-                "Certificate ID (43-char base64url) — entering them swapped fails exactly like this.")
-    }
-    Map parsed = new JsonSlurper().parseText(resp.body()) as Map
-    String token = parsed.access_token?.toString()
-    long expiresAtSec = (long) (System.currentTimeMillis() / 1000L) +
-            ((parsed.expires_in ?: 3600) as long) - 60L   // refresh a minute early
-    NsTokenCache.put(authCacheKey, tokenUrl, token, expiresAtSec)
-    return token
-}
+// The shared token path (NsSuiteQlClient): mints, caches under the auth config's id, and names the usual cause of a refusal.
+Closure<String> mintToken = { -> NsSuiteQlClient.mintToken(authConfig, tokenUrl, NsSuiteQlClient.DEFAULT_TOKEN_TIMEOUT) }
 
 String timestamp = DataManagerSupport.formatRunTimestamp(ec)
 String outputBaseLocation = outputLocation ?: DataManagerSupport.resolveReconciliationRunLocation(
@@ -282,14 +239,14 @@ Closure livePage = { String query, int limit, int offset ->
     try {
         String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
         // DAR-OPS-029 S41a (OC109): the query names the page (keyset paging; offset is always 0)
-        resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset) },
+        resp = NsSuiteQlPageRetry.send({ -> NsSuiteQlClient.sendQuery(suiteQlUrl, token, query, limit, offset, NsSuiteQlPageRetry.REQUEST_TIMEOUT) },
                 query, pageRetryWarnings)
         if (resp.statusCode() == 401) {
             // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
             // then retry ONCE — a second 401 is a real credential problem, not a race.
             NsTokenCache.evict(authCacheKey)
             String freshToken = mintToken()
-            resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, freshToken, query, limit, offset) },
+            resp = NsSuiteQlPageRetry.send({ -> NsSuiteQlClient.sendQuery(suiteQlUrl, freshToken, query, limit, offset, NsSuiteQlPageRetry.REQUEST_TIMEOUT) },
                     query, pageRetryWarnings)
         }
     } finally {
@@ -473,31 +430,6 @@ try {
     fileLocation = null
     fileName = null
 } finally {
-    // JDK 21 HttpClient holds a selector thread and a connection pool until closed; the inventory
-    // path leaked one per call before 0d713bd.
-    try { httpClient.close() } catch (Exception ignored) { }
+    // The HTTP client is NsSuiteQlClient's one JVM-wide client (S41b F1), so nothing is closed here.
     if (workFile?.exists()) { try { workFile.delete() } catch (Exception ignored) { } }
-}
-
-static HttpResponse<String> sendSuiteQl(HttpClient client, String url, String token,
-                                        String query, int limit, int offset) {
-    // `Prefer: transient` is REQUIRED by NetSuite: without it the SuiteQL request is rejected.
-    long startedAt = System.currentTimeMillis()
-    Integer status = null
-    try {
-        HttpResponse<String> resp = client.send(
-                HttpRequest.newBuilder(URI.create("${url}?limit=${limit}&offset=${offset}"))
-                        .timeout(NsSuiteQlPageRetry.REQUEST_TIMEOUT)
-                        .header("Content-Type", "application/json")
-                        .header("Accept", "application/json")
-                        .header("Prefer", "transient")
-                        .header("Authorization", "Bearer ${token}")
-                        .POST(HttpRequest.BodyPublishers.ofString(JsonOutput.toJson([q: query]), StandardCharsets.UTF_8))
-                        .build(),
-                HttpResponse.BodyHandlers.ofString())
-        status = resp.statusCode()
-        return resp
-    } finally {
-        NsSuiteQlPageRetry.logCall("suiteql", query, offset, status, startedAt)
-    }
 }

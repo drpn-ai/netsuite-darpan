@@ -135,7 +135,11 @@ class NsSuiteQlPageRetryTest {
         assertEquals(180L, NsSuiteQlPageRetry.REQUEST_TIMEOUT.seconds, "the probe's proven month-scale value")
         String script = Files.readString(componentRoot().resolve("src/main/groovy/netsuite/reconciliation/orders/extractNetSuiteOrders.groovy"))
         assertEquals(2, script.count("NsSuiteQlPageRetry.send("), "the first send and the send after a 401")
-        assertTrue(script.contains(".timeout(NsSuiteQlPageRetry.REQUEST_TIMEOUT)"))
+        // S41b: the request lives in NsSuiteQlClient.sendQuery, which takes its timeout; both page sends hand it this one.
+        assertEquals(2, script.count("NsSuiteQlClient.sendQuery("), "each page is sent by the shared SuiteQL request")
+        assertEquals(2, script.count("NsSuiteQlPageRetry.REQUEST_TIMEOUT)"), "and each with the retry's longer timeout")
+        String client = Files.readString(componentRoot().resolve("src/main/groovy/netsuite/facade/NsSuiteQlClient.groovy"))
+        assertTrue(client.contains(".timeout(timeout)"), "sendQuery applies the timeout it is given")
         assertFalse(script.contains("Duration.ofSeconds(120)"), "no second timeout value")
         assertTrue(script.contains("+ pageRetryWarnings"), "retry warnings reach the extract's warnings")
     }
