@@ -1106,6 +1106,30 @@ class NsSuiteQlQueryTemplateTest {
         stateSpec([overdueExcludedShipMethods: "Store Pickup"])   // the pending (overdue) branch reads it
     }
 
+    // OC221 (Aditi 2026-11-28): a write keyword inside a quoted string literal is text, not SQL. "Drop Ship" is a ship
+    // method a stage exception or a written finding names; DROP outside quotes is still refused.
+    @Test
+    void aKeywordInsideAQuotedValueIsText() {
+        Map<String, Object> waived = spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
+                waiveRules: [[fieldId: "shipmethod", values: ["Drop Ship", "Will Call"]]]])
+        assertTrue(NsSuiteQlOrderSupport.buildRecordsQuery(waived, "2026-10-12", "2026-10-15").contains("('Drop Ship', 'Will Call')"))
+        spec([queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "shipmethod", op: "IN", values: ["Drop Ship"]]]])
+    }
+
+    @Test
+    void theKeywordCheckReadsOutsideQuotedLiteralsOnly() {
+        Closure check = { String fragment -> NsSuiteQlOrderSupport.requireSafeFragment(fragment, "fragment") }
+        check("'Drop Ship'")
+        check("TO_CHAR(trandate, 'it''s') AS x")          // an escaped quote stays inside its literal
+        check("'it''s a drop' AS x")
+        IllegalArgumentException outside = assertThrows(IllegalArgumentException) { check("x = 'a' DROP y") }
+        assertTrue(outside.message.contains("SQL keyword"), outside.message)
+        assertThrows(IllegalArgumentException) { check("'it''s") }            // unterminated after an escape
+        assertThrows(IllegalArgumentException) { check("x = 'a") }            // unterminated
+        assertThrows(IllegalArgumentException) { check("x -- 'drop'") }       // a comment start is refused anywhere
+        assertThrows(IllegalArgumentException) { check("'a'; DELETE x") }      // so is a statement break
+    }
+
     // ---------------------------------------------------------------- the fences that must survive
 
     @Test

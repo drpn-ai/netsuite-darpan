@@ -669,17 +669,48 @@ class NsSuiteQlOrderSupport {
         }
     }
 
+    /**
+     * A statement break or comment start is refused anywhere, quoted or not (so a quote inside a comment is refused with the
+     * comment). OC221 (Aditi 2026-11-28): the keyword check reads only the text OUTSIDE quoted string literals, so a value
+     * such as 'Drop Ship' is text while DROP outside quotes is still refused; an unterminated literal is refused.
+     */
     private static void requireSafeFragment(String value, String label) {
         String raw = value == null ? "" : value
         for (String bad : FORBIDDEN_SEQUENCES) {
             if (raw.contains(bad)) throw new IllegalArgumentException("${label} may not contain '${bad}': ${raw}")
         }
-        if (FORBIDDEN_KEYWORDS.matcher(raw).matches()) {
-            throw new IllegalArgumentException("${label} may not contain a SQL keyword: ${raw}")
-        }
-        if (raw.count("'") % 2 != 0) {
+        String outside = outsideQuotedLiterals(raw)
+        if (outside == null) {
             throw new IllegalArgumentException("${label} has an unbalanced quote: ${raw}")
         }
+        if (FORBIDDEN_KEYWORDS.matcher(outside).matches()) {
+            throw new IllegalArgumentException("${label} may not contain a SQL keyword: ${raw}")
+        }
+    }
+
+    /**
+     * The text outside the fragment's single-quoted string literals, each literal read as one space ('' inside a literal is
+     * an escaped quote, as SQL reads it); null when a literal is never closed.
+     */
+    private static String outsideQuotedLiterals(String raw) {
+        StringBuilder out = new StringBuilder()
+        boolean inLiteral = false
+        int i = 0
+        while (i < raw.length()) {
+            char c = raw.charAt(i)
+            if (c == (char) '\'') {
+                if (inLiteral && i + 1 < raw.length() && raw.charAt(i + 1) == (char) '\'') {
+                    i += 2
+                    continue
+                }
+                inLiteral = !inLiteral
+                if (!inLiteral) out.append(' ')
+            } else if (!inLiteral) {
+                out.append(c)
+            }
+            i++
+        }
+        return inLiteral ? null : out.toString()
     }
 
     /** The SELECT list is exactly the mapped columns — see NsSuiteQlSourceQueryField's description. */
@@ -1746,7 +1777,7 @@ class NsSuiteQlOrderSupport {
             }
             values.each { String v ->
                 if (v.contains("'") || v.length() > 100) throw new IllegalArgumentException("matchRules values may not contain a quote: ${v}")
-                requireSafeFragment(v, "matchRules")
+                requireSafeFragment("'${v}'".toString(), "matchRules")   // as the quoted literal it becomes (OC221)
             }
             [fieldId: (Object) fieldId, op: (Object) op, values: (Object) values] as Map<String, Object>
         }
@@ -1765,7 +1796,7 @@ class NsSuiteQlOrderSupport {
             values.each { String v ->
                 // Values reach SuiteQL as quoted literals, so a quote is refused rather than escaped.
                 if (v.contains("'") || v.length() > 100) throw new IllegalArgumentException("waiveRules values may not contain a quote: ${v}")
-                requireSafeFragment(v, "waiveRules")
+                requireSafeFragment("'${v}'".toString(), "waiveRules")   // as the quoted literal it becomes (OC221)
             }
             [fieldId: (Object) fieldId, values: (Object) values] as Map<String, Object>
         }
