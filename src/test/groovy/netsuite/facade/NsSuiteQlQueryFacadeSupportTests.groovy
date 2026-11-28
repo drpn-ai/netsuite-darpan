@@ -48,6 +48,8 @@ class NsSuiteQlQueryFacadeSupportTests {
         auth.set("description", "facade test auth")
         auth.set("authType", "NONE")
         auth.set("isActive", "Y")
+        // OC179: a check saves only against an account the active tenant may use; this one is the tenant's own.
+        auth.set("companyUserGroupId", "KREWE")
         auth.createOrUpdate()
     }
 
@@ -241,7 +243,38 @@ class NsSuiteQlQueryFacadeSupportTests {
             assertNull(preview)
             assertTrue(ec.message.errorsString.contains("is turned off"), ec.message.errorsString)
         } finally {
-            auth.set("companyUserGroupId", null); auth.set("isActive", "Y"); auth.update()
+            auth.set("isActive", "Y"); auth.update()
+        }
+    }
+
+    /** OC179: a check is saved only against an account the tenant may read through, so a saved check is one that runs. */
+    @Test
+    void aCheckOnAnAccountTheTenantCannotUseIsRefusedAndNotSaved() {
+        ec.entity.makeValue("moqui.security.UserGroup").setAll([userGroupId: "GORJANA", description: "Gorjana"]).createOrUpdate()
+        def other = ec.entity.makeValue("darpan.reconciliation.NsAuthConfig").setAll([nsAuthConfigId: "OTHER_TENANT_NS_AUTH",
+                companyUserGroupId: "GORJANA", description: "other tenant's account", authType: "NONE", isActive: "Y"])
+        other.createOrUpdate()
+        def auth = ec.entity.find("darpan.reconciliation.NsAuthConfig").condition("nsAuthConfigId", AUTH_ID)
+                .disableAuthz().useCache(false).one()
+        try {
+            save(ctx([nsAuthConfigId: "OTHER_TENANT_NS_AUTH"]))
+            assertTrue(ec.message.errorsString.contains("NetSuite account 'OTHER_TENANT_NS_AUTH' was not found."), ec.message.errorsString)
+            assertFalse(rowExists(), "a check on another tenant's account must not be saved")
+
+            ec.message.clearErrors()
+            save(ctx([nsAuthConfigId: "NO_SUCH_NS_AUTH"]))
+            assertTrue(ec.message.errorsString.contains("was not found"), ec.message.errorsString)
+            assertFalse(rowExists())
+
+            ec.message.clearErrors()
+            auth.set("isActive", "N"); auth.update()
+            save(ctx([:]))
+            assertTrue(ec.message.errorsString.contains("is turned off"), ec.message.errorsString)
+            assertFalse(rowExists(), "a check on a turned-off account must not be saved")
+        } finally {
+            auth.set("isActive", "Y"); auth.update()
+            resetState()   // a row a broken gate saved would hold the other account by FK
+            other.delete()
         }
     }
 

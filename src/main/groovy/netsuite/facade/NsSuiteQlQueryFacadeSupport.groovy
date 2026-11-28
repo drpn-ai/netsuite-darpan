@@ -129,6 +129,9 @@ class NsSuiteQlQueryFacadeSupport {
                 ec, "Your active tenant only has view access for NetSuite checks.")) {
             return null
         }
+        // OC179: only on an account this tenant may read through (its own or granted, and not turned off), the same gate
+        // as the preview and every NetSuite read; otherwise the check saves and is refused at every run.
+        if (NsLifecycleOptionsSupport.accessibleAccount(ec, text(context.get("nsAuthConfigId"))) == null) return null
 
         // DAR-BE-135: a named id only updates this tenant's own check; another tenant's reads the same
         // as a missing one. A new check gets a minted id, so no tenant can squat or probe an id.

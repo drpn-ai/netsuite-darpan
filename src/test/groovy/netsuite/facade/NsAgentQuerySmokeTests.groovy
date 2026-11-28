@@ -53,7 +53,6 @@ class NsAgentQuerySmokeTests {
     private ExecutionContext ec
     private final List<Map> calls = []
     private Closure answer = { String sql, int limit, int offset -> [rows: [[id: 1]], hasMore: false] }
-    private Closure originalFactory
 
     @BeforeAll
     void setup() {
@@ -69,7 +68,6 @@ class NsAgentQuerySmokeTests {
         seedAuth("NSA_A_OFF", TENANT_A, "Krewe old", "N")
         seedAuth("NSA_B", TENANT_B, "Gorjana NetSuite", "Y")
         seedAuth("NSA_V", TENANT_VIEW, "Dolls Kill NetSuite", "Y")
-        originalFactory = NsAgentQuerySupport.clientFactory
     }
 
     @AfterAll
@@ -85,7 +83,7 @@ class NsAgentQuerySmokeTests {
     }
 
     @AfterEach
-    void restore() { NsAgentQuerySupport.clientFactory = originalFactory }
+    void restore() { NsAgentQuerySupport.resetForTests() }
 
     @Test
     void "returns rows, hasMore and nextOffset"() {
@@ -225,6 +223,25 @@ class NsAgentQuerySmokeTests {
         assertEquals("OAUTH2_M2M_JWT", only.authType)
         assertEquals(["NSA_B"], (list(TENANT_B).connections as List).collect { it.nsAuthConfigId })
         assertFalse(a.toString().contains(CLIENT_ID) || a.toString().contains(HOST))
+    }
+
+    /** OC180: an account another tenant granted is not listed: a fresh query on it is refused (R25), so it is not offered. */
+    @Test
+    void "list agent connections leaves out an account another tenant granted"() {
+        ec.entity.makeValue("moqui.basic.EnumerationType").setAll([enumTypeId: "DarpanSharedConfigType",
+                description: "Darpan API source config types"]).createOrUpdate()
+        ec.entity.makeValue("moqui.basic.Enumeration").setAll([enumId: "SCFG_NS_AUTH", enumTypeId: "DarpanSharedConfigType",
+                description: "NetSuite auth config"]).createOrUpdate()
+        ec.entity.makeValue("darpan.auth.ConfigTenantAccess").setAll([configTypeEnumId: "SCFG_NS_AUTH", configId: "NSA_B",
+                tenantUserGroupId: TENANT_A, fromDate: FROM]).createOrUpdate()
+        try {
+            Map a = list(TENANT_A)
+            assertTrue(a.ok as boolean, "${a.errors}")
+            assertEquals(["NSA_A"], (a.connections as List).collect { it.nsAuthConfigId }, "the granted NSA_B is not offered")
+            assertEquals(["NSA_B"], (list(TENANT_B).connections as List).collect { it.nsAuthConfigId }, "its owner still sees it")
+        } finally {
+            ec.entity.find("darpan.auth.ConfigTenantAccess").condition("configId", "NSA_B").disableAuthz().deleteAll()
+        }
     }
 
     @Test

@@ -241,10 +241,10 @@
             <set field="connections" from="[]"/>
             <set field="activeTenantUserGroupId" from="darpan.facade.common.TenantAccessSupport.currentActiveTenantUserGroupId(ec)"/>
             <if condition="activeTenantUserGroupId">
-                <!-- Owned rows plus rows granted to this tenant, scoped by companyUserGroupId inside the resolver
-                     (same as list#NsAuthConfigs); a turned-off connection is not offered. -->
-                <set field="accessibleRows" from="darpan.facade.common.SharedConfigAccessSupport.listAccessibleConfigRows(ec, 'SCFG_NS_AUTH')"/>
-                <set field="connections" from="accessibleRows.findAll { (it.isActive ?: 'Y').toString() != 'N' }.collect { item -> [nsAuthConfigId: item.nsAuthConfigId, description: item.description, authType: item.authType ?: 'NONE'] }"/>
+                <!-- The tenant-scoped resolver (same as list#NsAuthConfigs), narrowed to the tenant's own, turned-on rows: a
+                     granted account is refused by run#NsSuiteQlAgentQuery (final review R25), so it is not offered (OC180). -->
+                <set field="accessibleRows" from="darpan.facade.common.SharedConfigAccessSupport.listAccessibleConfigRows(ec, darpan.facade.common.SharedConfigAccessSupport.CONFIG_TYPE_NS_AUTH)"/>
+                <set field="connections" from="accessibleRows.findAll { it.companyUserGroupId == activeTenantUserGroupId &amp;&amp; (it.isActive ?: 'Y').toString() != 'N' }.collect { item -> [nsAuthConfigId: item.nsAuthConfigId, description: item.description, authType: item.authType ?: 'NONE'] }"/>
             </if>
             <set field="ok" from="!ec.message.hasError()"/>
             <set field="errors" from="ec.message.errors"/>
