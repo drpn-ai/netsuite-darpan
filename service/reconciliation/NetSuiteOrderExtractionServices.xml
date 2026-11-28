@@ -44,6 +44,7 @@
             WINDOW: NetSuite's trandate is DATE-granular and stored in the account's timezone, so the
             window is applied as half-open [windowStart, windowEnd) on whole days. Give day-aligned
             windows; a sub-day window will not narrow the result.</description>
+        <implements service="reconciliation.SourceConnectorContractServices.define#SourceExtractOutputs"/>
         <in-parameters>
             <parameter name="nsSuiteQlSourceQueryId" required="true">
                 <description>Tenant-owned NsSuiteQlSourceQuery identifier. Says which NetSuite
@@ -150,15 +151,6 @@
                 <description>Optional expected total, which adds a progress percent alongside the count.</description>
             </parameter>
         </in-parameters>
-        <out-parameters>
-            <parameter name="dataAvailable" type="Boolean"/>
-            <parameter name="fileLocation"/>
-            <parameter name="fileName"/>
-            <parameter name="recordCount" type="Integer"/>
-            <parameter name="requestMetadata" type="Map"/>
-            <parameter name="warnings" type="List"/>
-            <parameter name="errors" type="List"/>
-        </out-parameters>
     </service>
 
     <service verb="project" noun="NetSuiteKeptRecords" allow-remote="false" authenticate="true">
