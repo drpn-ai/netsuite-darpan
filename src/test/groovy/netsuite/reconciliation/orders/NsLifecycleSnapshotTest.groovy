@@ -70,10 +70,10 @@ class NsLifecycleSnapshotTest {
         answers[NsSuiteQlOrderSupport.buildConditionIdQuery(waived, "WAIVED", null, FROM, TO)] = ids { k, v -> v[1] == "Store Pickup" }.collect { [id: it] as Map }
         return { String query, int limit, int offset ->
             sent << query
-            List<Map> rows = answers[query]
+            // DAR-OPS-029 S41a (OC109): pages are keyset; the rows are found by the query as built, then paged after its key
+            List<Map> rows = answers[SuiteQlKeysetFake.baseQuery(query)]
             if (rows == null) throw new AssertionError("unexpected query: ${query}")
-            List<Map> page = rows.drop(offset).take(limit)
-            return [items: page, hasMore: offset + page.size() < rows.size()]
+            return SuiteQlKeysetFake.page(rows, query, limit, { Map r -> [r.id as Long] })
         }
     }
 
@@ -128,7 +128,8 @@ class NsLifecycleSnapshotTest {
         }
         // missing Fulfillment: 4 ids, 2 pages; Store Pickup: 1 page; missing Invoice: 3 ids, 2 pages.
         assertEquals(5, sent.size(), sent.join("\n"))
-        assertEquals(3, sent.unique(false).size())
+        // keyset pages (OC109): each page's text names its own key, so the three conditions are counted by the query as built
+        assertEquals(3, sent.collect { SuiteQlKeysetFake.baseQuery(it) }.unique().size())
         assertEquals([("MISSING|ItemShip|"): 4, ("WAIVED|" + groovy.json.JsonOutput.toJson(WAIVE)): 1, ("MISSING|CustInvc|"): 3],
                 snapshot.conditionCounts)
     }

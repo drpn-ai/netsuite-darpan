@@ -299,32 +299,111 @@ class NsSuiteQlOrderSupportTest {
 
     // ------------------------------------------------------------------ paging + envelope
 
+    private static final Closure<List<Long>> BY_ID = { Map row -> [row.id as Long] }
+
+    private static List<String> writtenIds(StringWriter out) {
+        return ((List<Map>) new groovy.json.JsonSlurper().parseText(out.toString()).records)*.netsuiteInternalId
+    }
+
+    /**
+     * DAR-OPS-029 S41a (OC109): pages are keyset, not offset. Each page is the same query with the page key selected and, after the
+     * first, "AND id > last" before its ORDER BY, always at offset 0; the metadata keeps the query as built.
+     */
     @Test
     void streamsEveryPageUntilHasMoreIsFalse() {
-        List<Map> pages = [
-                [items: [[id: "1", custbody_hc_order_id: "A"], [id: "2", custbody_hc_order_id: "B"]], hasMore: true],
-                [items: [[id: "3", custbody_hc_order_id: "C"]], hasMore: false],
-        ]
+        List<Map> rows = [[id: "1", custbody_hc_order_id: "A"], [id: "2", custbody_hc_order_id: "B"], [id: "3", custbody_hc_order_id: "C"]]
+        List<String> sent = []
         List<Integer> offsetsSeen = []
         StringWriter out = new StringWriter()
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
                 [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 2],
-                { String q, int limit, int offset -> offsetsSeen << offset; return pages.remove(0) })
+                { String q, int limit, int offset -> sent << q; offsetsSeen << offset; SuiteQlKeysetFake.page(rows, q, limit, BY_ID) })
 
         assertEquals(3, result.recordCount)
         assertEquals(2, result.pageCount)
-        assertEquals([0, 2], offsetsSeen, "offset must advance by the page size")
+        assertEquals([0, 0], offsetsSeen, "keyset pages never move the offset")
+        assertEquals(["1", "2", "3"], writtenIds(out))
+        String built = NsSuiteQlOrderSupport.buildRecordsQuery(salesOrderSpec(), "2026-08-01", "2026-09-01")
+        assertEquals([built, built], sent.collect { SuiteQlKeysetFake.baseQuery(it) })
+        assertTrue(sent[0].startsWith("SELECT id AS darpan_page_key, "), sent[0])
+        assertEquals(null, SuiteQlKeysetFake.after(sent[0]))
+        assertEquals([2L], SuiteQlKeysetFake.after(sent[1]))
         assertTrue((boolean) result.dataAvailable)
+        assertEquals(built, new groovy.json.JsonSlurper().parseText(out.toString()).metadata.query, "the metadata names the query as built")
+    }
+
+    /**
+     * Conservation under a live NetSuite (OC109). With offset paging a record that left the window between two pages (deleted,
+     * or edited out of it) shifted every later row back one, and the row at the page boundary was never read. Keyset paging
+     * asks for the rows after the last one read, so nothing is skipped.
+     */
+    @Test
+    void aRowLeavingTheWindowMidReadMakesNoOtherRowSkipped() {
+        List<Map> rows = (1..5).collect { [id: it.toString(), custbody_hc_order_id: "O${it}".toString()] as Map }
+        int calls = 0
+        StringWriter out = new StringWriter()
+        NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 2],
+                { String q, int limit, int offset ->
+                    if (calls++ == 1) rows.removeAll { it.id == "2" }   // record 2, already read, leaves the window
+                    SuiteQlKeysetFake.page(rows, q, limit, BY_ID)
+                })
+        assertEquals(["1", "2", "3", "4", "5"], writtenIds(out), "record 3 was the one offset paging skipped")
+    }
+
+    /** OC109: a record edited INTO the window with a lower id shifted rows forward under offset paging and one was read twice. */
+    @Test
+    void aLowIdJoiningTheWindowMidReadMakesNoRowReadTwice() {
+        List<Map> rows = [2, 4, 6, 8].collect { [id: it.toString(), custbody_hc_order_id: "O${it}".toString()] as Map }
+        int calls = 0
+        StringWriter out = new StringWriter()
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 2],
+                { String q, int limit, int offset ->
+                    if (calls++ == 1) rows.add(0, [id: "1", custbody_hc_order_id: "O1"])
+                    SuiteQlKeysetFake.page(rows, q, limit, BY_ID)
+                })
+        List<String> ids = writtenIds(out)
+        assertEquals(ids.unique(false), ids, "no record twice")
+        assertEquals(["2", "4", "6", "8"], ids, "a record that joined behind the read is the next read's")
+        assertEquals(4, result.recordCount)
+    }
+
+    /** OC109: NetSuite answering more to come with an empty page would leave no key to continue from: the read fails. */
+    @Test
+    void anEmptyPageThatSaysMoreFails() {
+        IllegalStateException thrown = assertThrows(IllegalStateException) {
+            NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(), [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01"],
+                    { String q, int limit, int offset -> [items: [], hasMore: true] })
+        }
+        assertTrue(thrown.message.contains("empty page"), thrown.message)
+    }
+
+    /** OC109: SALES_LINES fans an order out into lines, so its key is (order id, line id): lines of one order across a page break. */
+    @Test
+    void salesLinesPageByOrderAndLineSoAnOrderSplitAcrossPagesKeepsEveryLine() {
+        int seq = 0
+        Map<String, Object> spec = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "NS_LINES", recordType: "SalesOrd",
+                fromTable: "transaction", dateColumn: "trandate", joinKeyFieldName: "orderId", queryTemplate: "SALES_LINES",
+                lineKeyColumn: "custcol_hc_order_line_id"],
+                [[recordFieldName: "orderId", sourceColumn: "custbody_hc_order_id"], [recordFieldName: "netsuiteOrderId", sourceColumn: "tranid"]]
+                        .collect { it + [sequenceNum: ++seq] as Map<String, Object> })
+        List<Map> rows = [[10, 101], [10, 102], [10, 103], [11, 111]].collect { List<Integer> k ->
+            [order: k[0], line: k[1], custbody_hc_order_id: "M${k[0]}".toString(), order_line_id: "L${k[1]}".toString()] as Map
+        }
+        List<String> sent = []
+        StringWriter out = new StringWriter()
+        Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out, [spec: spec, fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 2],
+                { String q, int limit, int offset -> sent << q; SuiteQlKeysetFake.page(rows, q, limit, { Map r -> [r.order as Long, r.line as Long] }) })
+        assertEquals(["L101", "L102", "L103", "L111"], ((List<Map>) new groovy.json.JsonSlurper().parseText(out.toString()).records)*.orderLineId)
+        assertEquals(4, result.recordCount)
+        assertTrue(sent[0].startsWith("SELECT t.id AS darpan_page_key, tl.id AS darpan_page_key2, "), sent[0])
+        assertEquals([10L, 102L], SuiteQlKeysetFake.after(sent[1]), "the second page starts after order 10's line 102")
     }
 
     // DAR-BE-111: each page's records go to the enricher (the HotWax status lookup) before they are written, so a Keep rule
     // or a conclusion can read what it adds; a failing enricher fails the extract rather than writing half an answer.
     @Test
     void anEnricherSeesEachPageBeforeItIsWrittenAndItsFieldsAreWritten() {
-        List<Map> pages = [
-                [items: [[id: "1", custbody_hc_order_id: "145059"], [id: "2", custbody_hc_order_id: "155939"]], hasMore: true],
-                [items: [[id: "3", custbody_hc_order_id: null]], hasMore: false],
-        ]
+        List<Map> rows = [[id: "1", custbody_hc_order_id: "145059"], [id: "2", custbody_hc_order_id: "155939"], [id: "3", custbody_hc_order_id: null]]
         List<Integer> pageSizes = []
         StringWriter out = new StringWriter()
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
@@ -333,7 +412,7 @@ class NsSuiteQlOrderSupportTest {
                      pageSizes << records.size()
                      records.each { if (it.orderId) it.omsStatusId = it.orderId == "145059" ? "ORDER_COMPLETED" : "ORDER_APPROVED" }
                  }],
-                { String q, int limit, int offset -> pages.remove(0) })
+                { String q, int limit, int offset -> SuiteQlKeysetFake.page(rows, q, limit, BY_ID) })
 
         assertEquals([2, 1], pageSizes)
         List<Map> written = (List<Map>) new groovy.json.JsonSlurper().parseText(out.toString()).records
@@ -581,7 +660,7 @@ class NsSuiteQlOrderSupportTest {
         IllegalStateException thrown = assertThrows(IllegalStateException) {
             NsSuiteQlOrderSupport.streamOrdersToWriter(new StringWriter(),
                     [spec: salesOrderSpec(), fromDate: "2026-08-01", toDate: "2026-09-01", pageSize: 1000, maxPages: 3],
-                    { String q, int limit, int offset -> calls++; [items: [[id: offset.toString()]], hasMore: true] })
+                    { String q, int limit, int offset -> calls++; SuiteQlKeysetFake.page((1..100).collect { [id: it.toString()] as Map }, q, 1, BY_ID) })
         }
         assertEquals(3, calls, "it stops at the ceiling")
         assertTrue(thrown.message.contains("3 pages"), thrown.message)
@@ -601,7 +680,7 @@ class NsSuiteQlOrderSupportTest {
                     [spec: spec, asOfDate: "2026-10-28", pageSize: 1000, maxPages: 3],
                     { String q, int limit, int offset ->
                         if (++calls > 50) throw new IllegalStateException("the used-items read looped past 50 pages with no ceiling")
-                        [items: [[item: offset.toString()]], hasMore: true]
+                        SuiteQlKeysetFake.page((1..100).collect { [item: it.toString()] as Map }, q, 1, { Map r -> [r.item as Long] })
                     })
         }
         assertEquals(3, calls, "the used-items read stops at the ceiling: ${thrown.message}")

@@ -37,15 +37,30 @@ class NsSuiteQlPageRetryTest {
         }
     }
 
+    /** A keyset page's query (OC109): the page after id 2000, as NsSuiteQlOrderSupport.pagedQuery builds it. */
+    private static final String AFTER_2000 = "SELECT id AS darpan_page_key, tranid FROM transaction WHERE type = 'SalesOrd' AND id > 2000 ORDER BY id"
+    private static final String FIRST = "SELECT id AS darpan_page_key, tranid FROM transaction WHERE type = 'SalesOrd' ORDER BY id"
+    private static final String LINES_AFTER = "SELECT t.id AS darpan_page_key, tl.id AS darpan_page_key2, t.tranid FROM transaction t " +
+            "JOIN transactionline tl ON tl.transaction = t.id WHERE t.type = 'SalesOrd' AND (t.id > 10 OR (t.id = 10 AND tl.id > 102)) ORDER BY t.id, tl.id"
+
+    @Test
+    void aPageIsNamedByItsKeyNotAnOffset() {
+        assertEquals("first page", NsSuiteQlPageRetry.pageName(FIRST))
+        assertEquals("page after id 2000", NsSuiteQlPageRetry.pageName(AFTER_2000))
+        assertEquals("page after t.id 10, tl.id 102", NsSuiteQlPageRetry.pageName(LINES_AFTER))
+        // a key condition inside a sub-select is not the page's
+        assertEquals("first page", NsSuiteQlPageRetry.pageName("SELECT id AS darpan_page_key FROM transaction WHERE EXISTS (SELECT 1 FROM x WHERE x.n > 3) ORDER BY id"))
+    }
+
     @Test
     void aTimedOutPageIsRetriedAndTheExtractCarriesOn() {
         List<Integer> calls = []
         List<String> warnings = []
         HttpResponse<String> out = NsSuiteQlPageRetry.send(server([new HttpTimeoutException("request timed out"), 200], calls),
-                2000, warnings, sleeper)
+                AFTER_2000, warnings, sleeper)
         assertEquals(200, out.statusCode())
         assertEquals(2, calls.size())
-        assertEquals(["NetSuite SuiteQL page at offset 2000 timed out after 180s; retrying (attempt 2 of 3)."], warnings)
+        assertEquals(["NetSuite SuiteQL page after id 2000 timed out after 180s; retrying (attempt 2 of 3)."], warnings)
         assertEquals([5000L], slept)
     }
 
@@ -54,7 +69,7 @@ class NsSuiteQlPageRetryTest {
         List<Integer> calls = []
         List<String> warnings = []
         HttpResponse<String> out = NsSuiteQlPageRetry.send(server([new IOException("Connection reset"), new IOException("Connection reset"), 200], calls),
-                0, warnings, sleeper)
+                FIRST, warnings, sleeper)
         assertEquals(200, out.statusCode())
         assertEquals([5000L, 10000L], slept, "linear backoff")
         assertEquals(2, warnings.size())
@@ -66,9 +81,9 @@ class NsSuiteQlPageRetryTest {
         List<Integer> calls = []
         List<String> warnings = []
         IllegalStateException e = assertThrows(IllegalStateException) {
-            NsSuiteQlPageRetry.send(server([504, 504, 504], calls), 4000, warnings, sleeper)
+            NsSuiteQlPageRetry.send(server([504, 504, 504], calls), LINES_AFTER, warnings, sleeper)
         }
-        assertEquals("NetSuite SuiteQL page at offset 4000 failed after 3 attempts; the last returned status 504: gateway timeout.", e.message)
+        assertEquals("NetSuite SuiteQL page after t.id 10, tl.id 102 failed after 3 attempts; the last returned status 504: gateway timeout.", e.message)
         assertEquals(3, calls.size())
         assertEquals([5000L, 10000L], slept, "no wait after the last attempt")
         assertEquals(2, warnings.size())
@@ -78,9 +93,9 @@ class NsSuiteQlPageRetryTest {
     void threeTimeoutsFailWithTheTimeoutAsTheCause() {
         HttpTimeoutException timeout = new HttpTimeoutException("request timed out")
         IllegalStateException e = assertThrows(IllegalStateException) {
-            NsSuiteQlPageRetry.send(server([timeout, timeout, timeout], []), 0, [], sleeper)
+            NsSuiteQlPageRetry.send(server([timeout, timeout, timeout], []), FIRST, [], sleeper)
         }
-        assertEquals("NetSuite SuiteQL page at offset 0 failed after 3 attempts; the last timed out after 180s.", e.message)
+        assertEquals("NetSuite SuiteQL first page failed after 3 attempts; the last timed out after 180s.", e.message)
         assertSame(timeout, e.cause)
     }
 
@@ -88,14 +103,14 @@ class NsSuiteQlPageRetryTest {
     void retryableStatusesAreRetriedAndOthersGoStraightBack() {
         [429, 502, 503, 504].each { int status ->
             List<Integer> calls = []
-            assertEquals(200, NsSuiteQlPageRetry.send(server([status, 200], calls), 0, [], sleeper).statusCode(), "${status}")
+            assertEquals(200, NsSuiteQlPageRetry.send(server([status, 200], calls), FIRST, [], sleeper).statusCode(), "${status}")
             assertEquals(2, calls.size(), "${status} is retried")
         }
         slept.clear()
         [200, 400, 401, 500].each { int status ->
             List<Integer> calls = []
             List<String> warnings = []
-            assertEquals(status, NsSuiteQlPageRetry.send(server([status], calls), 0, warnings, sleeper).statusCode())
+            assertEquals(status, NsSuiteQlPageRetry.send(server([status], calls), FIRST, warnings, sleeper).statusCode())
             assertEquals([1, 0], [calls.size(), warnings.size()], "${status} goes back to the caller as it is")
         }
         assertEquals([], slept)
@@ -106,7 +121,7 @@ class NsSuiteQlPageRetryTest {
         List<Integer> calls = []
         try {
             IllegalStateException e = assertThrows(IllegalStateException) {
-                NsSuiteQlPageRetry.send(server([504, 200], calls), 1000, [], { long ms -> Thread.currentThread().interrupt() })
+                NsSuiteQlPageRetry.send(server([504, 200], calls), AFTER_2000, [], { long ms -> Thread.currentThread().interrupt() })
             }
             assertTrue(e.message.contains("interrupted"), e.message)
             assertEquals(1, calls.size(), "no request after the interrupt")

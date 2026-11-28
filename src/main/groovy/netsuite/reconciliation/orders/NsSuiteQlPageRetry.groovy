@@ -37,8 +37,9 @@ class NsSuiteQlPageRetry {
     private static final Closure DEFAULT_SLEEPER = { long ms -> sleepQuietly(ms) }
 
     /**
-     * Test seam (DAR-BE-328): offset -> response, standing in for every page request {@link #send} makes, so a service-level
-     * test can page the real extract without a NetSuite account. Null (always, outside tests) sends the real request.
+     * Test seam (DAR-BE-328): query -> response, standing in for every page request {@link #send} makes, so a service-level
+     * test can page the real extract without a NetSuite account. The query is the page's (keyset, OC109: it names the rows
+     * after the last one read). Null (always, outside tests) sends the real request.
      */
     static volatile Closure<HttpResponse<String>> requestForTests = null
 
@@ -54,26 +55,40 @@ class NsSuiteQlPageRetry {
      */
     static void logCall(String op, String sql, int offset, Integer status, long startedMillis) {
         def table = sql ? (sql =~ /(?i)\bfrom\s+(\w+)/) : null
-        logger.info("netsuite call op={} from={} offset={} status={} ms={}", op, table?.find() ? table.group(1) : null,
-                offset, status, System.currentTimeMillis() - startedMillis)
+        logger.info("netsuite call op={} from={} offset={} page={} status={} ms={}", op, table?.find() ? table.group(1) : null,
+                offset, sql ? pageName(sql) : null, status, System.currentTimeMillis() - startedMillis)
+    }
+
+    /**
+     * DAR-OPS-029 S41a (OC109). Which page a keyset query asks for, for warnings and the call log: "first page", or "page after
+     * id 2000" ("page after t.id 10, tl.id 102" for a two-column key), read off the condition NsSuiteQlOrderSupport.pagedQuery
+     * puts before its final ORDER BY. Only column names and digits, never a value of a record.
+     */
+    static String pageName(String query) {
+        def pair = query =~ /AND \((\S+) > (-?\d+) OR \(\S+ = -?\d+ AND (\S+) > (-?\d+)\)\) ORDER BY [^()]*$/
+        if (pair.find()) return "page after ${pair.group(1)} ${pair.group(2)}, ${pair.group(3)} ${pair.group(4)}".toString()
+        def one = query =~ /AND (\S+) > (-?\d+) ORDER BY [^()]*$/
+        return one.find() ? "page after ${one.group(1)} ${one.group(2)}".toString() : "first page"
     }
 
     /**
      * Sends one page through {@code request}, retrying as above. Returns the first response that is not retryable
-     * (2xx, 401, 500, other 4xx) for the caller to judge. Throws IllegalStateException naming the page offset and the
+     * (2xx, 401, 500, other 4xx) for the caller to judge. Throws IllegalStateException naming the page (pageName) and the
      * attempts spent when every attempt failed retryably. Each retry adds one line to {@code warnings}.
      *
      * @param request one HTTP request for the page; called once per attempt
+     * @param query the page's query (keyset paging: it names the page)
      * @param sleeper test seam: millis -> void
      */
-    static HttpResponse<String> send(Closure<HttpResponse<String>> request, int offset, List<String> warnings,
+    static HttpResponse<String> send(Closure<HttpResponse<String>> request, String query, List<String> warnings,
                                      Closure sleeper = DEFAULT_SLEEPER) {
+        String page = pageName(query ?: "")
         String lastFailure = null
         IOException lastError = null
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 Closure<HttpResponse<String>> stand = requestForTests
-                HttpResponse<String> response = stand != null ? stand.call(offset) : request.call()
+                HttpResponse<String> response = stand != null ? stand.call(query) : request.call()
                 if (!RETRYABLE_STATUS_CODES.contains(response.statusCode())) return response
                 lastError = null
                 lastFailure = "returned status ${response.statusCode()}".toString() +
@@ -86,13 +101,13 @@ class NsSuiteQlPageRetry {
                 lastFailure = "failed: ${e.message ?: e.class.simpleName}".toString()
             }
             if (attempt == MAX_ATTEMPTS) break
-            warnings?.add("NetSuite SuiteQL page at offset ${offset} ${lastFailure}; retrying (attempt ${attempt + 1} of ${MAX_ATTEMPTS}).".toString())
+            warnings?.add("NetSuite SuiteQL ${page} ${lastFailure}; retrying (attempt ${attempt + 1} of ${MAX_ATTEMPTS}).".toString())
             sleeper.call(BACKOFF_STEP_MILLIS * attempt)
             if (Thread.currentThread().isInterrupted()) {
-                throw new IllegalStateException("NetSuite SuiteQL page at offset ${offset}: interrupted while waiting to retry.")
+                throw new IllegalStateException("NetSuite SuiteQL ${page}: interrupted while waiting to retry.")
             }
         }
-        throw new IllegalStateException("NetSuite SuiteQL page at offset ${offset} failed after ${MAX_ATTEMPTS} attempts; the last ${lastFailure}.", lastError)
+        throw new IllegalStateException("NetSuite SuiteQL ${page} failed after ${MAX_ATTEMPTS} attempts; the last ${lastFailure}.", lastError)
     }
 
     /** Restores the interrupt flag rather than swallowing it, so a cancel mid-backoff stays visible. */

@@ -44,8 +44,15 @@ class NsSuiteQlOrderSupport {
     static final String ORIGIN_HOTWAX = "HOTWAX"
     static final String ORIGIN_NETSUITE_NATIVE = "NETSUITE_NATIVE"
 
-    /** Safety ceiling on offset paging so a source stuck on hasMore=true cannot spin forever. */
+    /** Safety ceiling on paging so a source stuck on hasMore=true cannot spin forever. */
     static final int DEFAULT_MAX_PAGES = 2000
+
+    /**
+     * DAR-OPS-029 S41a (OC109). The row keys a paged query selects its page key under (the query's ORDER BY columns), so the next
+     * page can ask for the rows after the last one read. A query ordered by two columns (SALES_LINES: t.id, tl.id) uses both.
+     */
+    static final String PAGE_KEY = "darpan_page_key"
+    static final String PAGE_KEY_2 = "darpan_page_key2"
 
     /** Same allow-list the inventory path enforces; SuiteQL lives on the suitetalk host. */
     static final List<String> NETSUITE_HOST_SUFFIXES = [".suitetalk.api.netsuite.com", ".app.netsuite.com"]
@@ -60,7 +67,7 @@ class NsSuiteQlOrderSupport {
      * WHY NOT A QUERY COLUMN. Every within-NetSuite chain check is an anti-join across the transaction
      * LINK TABLE, which the assembled-parts model had no slot for. But DAR-BE-044 refused raw query text
      * for two reasons that still hold: the window bounds are interpolated as TEXT rather than bound as
-     * parameters, and `ORDER BY id` is what makes offset paging safe. A free-form SELECT would put both
+     * parameters, and `ORDER BY id` is the page key every read pages by (eachPage). A free-form SELECT would put both
      * in operator hands. Templates keep every interpolated fragment identifier-checked and keep the
      * ordering out of configuration, at the cost of only ever expressing shapes that were shipped.
      */
@@ -805,10 +812,9 @@ class NsSuiteQlOrderSupport {
      * NOTE trandate is DATE-granular and expressed in the NetSuite account's timezone, so windows
      * should be day-aligned; a sub-day window will not narrow the result.
      *
-     * ORDER BY id is what makes offset paging safe — without a total order NetSuite may repeat or
-     * skip rows across pages. It stays hardcoded on purpose: `id` is the internal key on every
-     * SuiteQL table, and letting a config choose a non-unique sort would reintroduce exactly the
-     * page-skew this prevents.
+     * ORDER BY id is the page key: eachPage asks for the rows after the last id read (keyset paging, OC109), so it must be
+     * a total order. It stays hardcoded on purpose: `id` is the internal key on every SuiteQL table, and letting a config
+     * choose a non-unique sort would let a page boundary fall inside a run of equal keys.
      */
     static String buildRecordsQuery(Map<String, Object> spec, String fromDate, String toDate, String asOfDate = null) {
         String template = (String) (spec.get("queryTemplate") ?: TEMPLATE_RECORDS)
@@ -1027,8 +1033,8 @@ class NsSuiteQlOrderSupport {
      * rows come back keyed exactly as mapRowToRecord reads them; the line columns take the aliases
      * TEMPLATE_RECORD_COLUMNS maps.
      *
-     * ORDER BY t.id, tl.id: t.id alone is no longer a total order once a header fans out into lines,
-     * and offset paging over a partial order can repeat or skip rows across pages.
+     * ORDER BY t.id, tl.id: t.id alone is no longer a total order once a header fans out into lines, so the page key is the
+     * pair (eachPage asks for the rows after (order, line), an order's lines may fall either side of a page break).
      */
     private static String buildSalesLinesQuery(Map<String, Object> spec, String fromDate, String toDate,
                                                String dateColumn) {
@@ -1857,18 +1863,76 @@ class NsSuiteQlOrderSupport {
 
     /** Every item id the used-items query names, paged to its end; past maxPages it fails (pageCeiling). */
     private static Set<String> readUsedItems(Map<String, Object> spec, String asOfDate, int pageSize, int maxPages, Closure pageFetcher) {
-        String used = buildActiveItemsUsedQuery(spec, asOfDate)
         Set<String> ids = new HashSet<String>()
-        int offset = 0, pages = 0
+        eachPage(buildActiveItemsUsedQuery(spec, asOfDate), pageSize, maxPages, pageFetcher) { List items ->
+            for (Object it : items) ids.add(String.valueOf(((Map) it).get("item")))
+        }
+        return ids
+    }
+
+    /**
+     * DAR-OPS-029 S41a (OC109). Every SuiteQL read pages by KEY, not offset. NetSuite is a live system: with offset paging over
+     * ORDER BY id, a record that left the result between two pages (deleted, or edited out of the window or a changed-since
+     * filter) shifted every later row back one, so a row was never read; one edited into the window behind the read shifted
+     * them forward, so a row was read twice. Here each page is the same query with its ORDER BY columns selected as PAGE_KEY
+     * (and PAGE_KEY_2) and, after the first page, only the rows after the last one read, always at offset 0, so a page boundary
+     * never moves under the read. A record that joins behind the read is the next read's. Calls onPage(items) for each page and
+     * answers how many pages were read. Fails, rather than return part of the result, at maxPages with more to come
+     * (pageCeiling) and on an empty page that says more is coming (there is no row to continue after).
+     */
+    static int eachPage(String query, int pageSize, int maxPages, Closure pageFetcher, Closure onPage) {
+        List<String> keys = pageKeys(query)
+        List<String> last = null
+        int pages = 0
         while (true) {
-            Map page = (Map) pageFetcher.call(used, pageSize, offset)
+            Map page = (Map) pageFetcher.call(pagedQuery(query, keys, last), pageSize, 0)
             pages++
             List items = (List) (page?.get("items") ?: [])
-            for (Object it : items) ids.add(String.valueOf(((Map) it).get("item")))
-            if (!(page?.get("hasMore") == true) || items.isEmpty()) return ids
+            onPage.call(items)
+            if (page?.get("hasMore") != true) return pages
+            if (items.isEmpty()) {
+                throw new IllegalStateException("NetSuite answered an empty page and said more is coming, so the read has no row to continue after.")
+            }
             if (pages >= maxPages) throw pageCeiling(maxPages, pageSize)
-            offset += pageSize
+            last = pageKeyOf((Map) items.get(items.size() - 1), keys.size())
         }
+    }
+
+    /** The columns a query is paged by: its final ORDER BY, one column or two, each a column or alias.column. */
+    static List<String> pageKeys(String query) {
+        int at = query.lastIndexOf("ORDER BY ")
+        List<String> keys = at < 0 ? [] as List<String> : query.substring(at + "ORDER BY ".length()).split(",").collect { it.trim() } as List<String>
+        if (!(keys.size() in [1, 2]) || keys.any { !(it ==~ /[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?/) }) {
+            throw new IllegalArgumentException("A paged NetSuite query must end ORDER BY one or two key columns, got: ...${query.takeRight(80)}".toString())
+        }
+        return keys
+    }
+
+    /** The query for the page after last (null: the first page): the keys selected as PAGE_KEY/PAGE_KEY_2 and the rows after last. */
+    static String pagedQuery(String query, List<String> keys, List<String> last) {
+        java.util.regex.Matcher head = query =~ /^SELECT (DISTINCT )?/
+        if (!head.find()) throw new IllegalArgumentException("A paged NetSuite query must start with SELECT")
+        StringBuilder selected = new StringBuilder()
+        for (int i = 0; i < keys.size(); i++) selected.append(keys[i]).append(" AS ").append(i == 0 ? PAGE_KEY : PAGE_KEY_2).append(", ")
+        String out = query.substring(0, head.end()) + selected + query.substring(head.end())
+        if (last == null) return out
+        String after = keys.size() == 1 ? "${keys[0]} > ${last[0]}".toString() :
+                "(${keys[0]} > ${last[0]} OR (${keys[0]} = ${last[0]} AND ${keys[1]} > ${last[1]}))".toString()
+        int at = out.lastIndexOf("ORDER BY ")
+        String before = out.substring(0, at)
+        return before + (before.endsWith(" ") ? "" : " ") + "AND " + after + " " + out.substring(at)
+    }
+
+    /** A row's page key: the digits a SuiteQL internal id is (it reaches the next query's text, so nothing else passes). */
+    private static List<String> pageKeyOf(Map row, int parts) {
+        List<String> key = []
+        for (int i = 0; i < parts; i++) {
+            String name = i == 0 ? PAGE_KEY : PAGE_KEY_2
+            String value = row?.get(name)?.toString()?.trim()
+            if (!(value ==~ /-?\d+/)) throw new IllegalStateException("A NetSuite row came back with ${name} ${value}, not an internal id".toString())
+            key.add(value)
+        }
+        return key
     }
 
     /**
@@ -1889,7 +1953,7 @@ class NsSuiteQlOrderSupport {
      *
      * `pageFetcher` is injected rather than called directly so the paging and projection logic is
      * testable without a NetSuite account: it receives (query, limit, offset) and returns a Map with
-     * `items` and `hasMore`.
+     * `items` and `hasMore`. The query is each page's (eachPage: keyset, so offset is always 0).
      *
      * DAR-BE-318 (plan 3b-2b, Task 20): nothing is filtered here. A tenant's source filters and the unkeyed payment lines are
      * Keep, run once in Spark over this file (KeepPlanSupport, Ruling 3b2b-23): the extract service no longer declares the
@@ -1916,17 +1980,11 @@ class NsSuiteQlOrderSupport {
         boolean salesLines = spec.get("queryTemplate") == TEMPLATE_SALES_LINES
         // A conclusion lookup compares nothing, so no Spark Keep follows it: it answers without the unkeyed lines, as before.
         boolean leaveOutUnkeyed = salesLines && spec.get("lookupKeys") && options.get("conclusionLookup") == true
-        int pageCount = 0
-        int offset = 0
-        boolean hasMore = true
-
         // DAR-BE-157: ACTIVE_ITEMS reads the items NetSuite used for HotWax first; each item row is then live Y or N.
         Set<String> usedItems = spec.get("queryTemplate") == TEMPLATE_ACTIVE_ITEMS ? readUsedItems(spec, asOfDate, pageSize, maxPages, pageFetcher) : null
         writer.write('{"records":[')
-        while (hasMore && pageCount < maxPages) {
-            Map page = (Map) pageFetcher.call(query, pageSize, offset)
-            pageCount++
-            List<Map<String, Object>> mapped = ((List) (page?.get("items") ?: [])).collect { Object rawRow ->
+        int pageCount = eachPage(query, pageSize, maxPages, pageFetcher) { List items ->
+            List<Map<String, Object>> mapped = items.collect { Object rawRow ->
                 Map<String, Object> row = (Map<String, Object>) rawRow
                 if (usedItems != null) {
                     row = new LinkedHashMap<String, Object>(row)
@@ -1948,10 +2006,7 @@ class NsSuiteQlOrderSupport {
                 writer.write(JsonOutput.toJson(record))
                 recordCount++
             }
-            hasMore = page?.get("hasMore") == true
-            offset += pageSize
         }
-        if (hasMore) throw pageCeiling(maxPages, pageSize)
         writer.write('],"metadata":')
         Map<String, Object> metadata = [
                 source       : "NETSUITE_SUITEQL",

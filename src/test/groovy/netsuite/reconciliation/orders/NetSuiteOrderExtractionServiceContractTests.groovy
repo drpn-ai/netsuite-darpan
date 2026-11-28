@@ -207,8 +207,11 @@ class NetSuiteOrderExtractionServiceContractTests {
     /** The real extract#NetSuiteOrders over these rows, three to a page; returns the extract file. */
     private File extractThroughTheService(Map scenario) {
         List<Map> rows = (List<Map>) scenario.rows
-        NsSuiteQlPageRetry.requestForTests = { int offset ->
-            suiteQlPage(rows.subList(Math.min(offset, rows.size()), Math.min(offset + 3, rows.size())), offset + 3 < rows.size())
+        // DAR-OPS-029 S41a (OC109): pages are keyset, so the stand-in answers the rows after the query's last key; a row's key is
+        // its place in the list, so the pages walk the rows in the order written here
+        NsSuiteQlPageRetry.requestForTests = { String query ->
+            Map page = SuiteQlKeysetFake.page(rows, query, 3, { Map r -> [(rows.indexOf(r) + 1) as Long, 0L] })
+            suiteQlPage((List<Map>) page.items, page.hasMore == true)
         } as Closure<HttpResponse<String>>
         NsTokenCache.put(KEEP_AUTH, PEAK_TOKEN_URL, "test-token", (long) (System.currentTimeMillis() / 1000L) + 3600L)
         try {
@@ -509,12 +512,12 @@ class NetSuiteOrderExtractionServiceContractTests {
         boolean[] waiterRanBeforePage2 = [false]
         try {
             serialFor(owner)
-            NsSuiteQlPageRetry.requestForTests = { int offset ->
+            NsSuiteQlPageRetry.requestForTests = { String query ->
                 if (pages.incrementAndGet() == 1) {
                     waiter[0] = Thread.start { NetSuiteReadGate.run(owner) { -> waiterRan.countDown() } }
                     // Queued behind page 1's turn: it does not run while this request is out.
                     waiterHeldOffDuringPage1[0] = !waiterRan.await(500, TimeUnit.MILLISECONDS)
-                    return suiteQlPage([[nsid: "1001"]], true)
+                    return suiteQlPage([[nsid: "1001", darpan_page_key: "1001"]], true)
                 }
                 // Page 2's request is out only once the waiter has had its turn (it cannot get in during this one).
                 waiterRanBeforePage2[0] = waiterRan.await(3, TimeUnit.SECONDS)
@@ -564,7 +567,7 @@ class NetSuiteOrderExtractionServiceContractTests {
         })
         try {
             serialFor(owner)
-            NsSuiteQlPageRetry.requestForTests = { int offset -> suiteQlPage([[nsid: "1001"]], false) } as Closure<HttpResponse<String>>
+            NsSuiteQlPageRetry.requestForTests = { String query -> suiteQlPage([[nsid: "1001"]], false) } as Closure<HttpResponse<String>>
             armed.set(true)
             Map result = peakExtract("NS_PEAK_ENRICH", owner)
             assertTrue(((List) result.errors)?.any { it.toString().contains("HotWax order status lookup failed") },
@@ -600,7 +603,7 @@ class NetSuiteOrderExtractionServiceContractTests {
         }
         resetPeak()
         int[] requests = [0]
-        NsSuiteQlPageRetry.requestForTests = { int offset -> requests[0]++; suiteQlPage([], false) } as Closure<HttpResponse<String>>
+        NsSuiteQlPageRetry.requestForTests = { String query -> requests[0]++; suiteQlPage([], false) } as Closure<HttpResponse<String>>
         Closure<Map> readByChange = { ->
             (Map) ec.service.sync().name("reconciliation.NetSuiteOrderExtractionServices.extract#NetSuiteOrders")
                     .parameters([nsSuiteQlSourceQueryId: "${t}_Q".toString(), companyUserGroupId: t, windowStart: "2026-11-01",

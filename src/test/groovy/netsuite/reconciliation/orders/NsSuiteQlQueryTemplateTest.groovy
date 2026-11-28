@@ -1185,19 +1185,18 @@ class NsSuiteQlQueryTemplateTest {
     void salesLinesPagesEveryLineAndKeepFieldsStillProjects() {
         StringWriter out = new StringWriter()
         List<Integer> offsets = []
+        // DAR-OPS-029 S41a (OC109): paged by (order, line) key, so the fake answers the rows after the last key, offset 0
+        List<Map> rows = [[t: 1, l: 11, custbody_hc_order_id: "M1", order_line_id: "01", quantity_shipped: "1"],
+                          [t: 1, l: 12, custbody_hc_order_id: "M1", order_line_id: "02", quantity_shipped: "0"],
+                          [t: 2, l: 21, custbody_hc_order_id: "M2", order_line_id: "01", quantity_shipped: "2"]]
         Map result = NsSuiteQlOrderSupport.streamOrdersToWriter(out,
                 [spec: salesLinesSpec(), fromDate: "2026-09-15", toDate: "2026-09-18", pageSize: 2,
                  keepFields: ["orderId", "orderLineId", "quantityShipped"]],
                 { String q, int limit, int offset ->
                     offsets << offset
-                    offset == 0
-                            ? [items: [[custbody_hc_order_id: "M1", order_line_id: "01", quantity_shipped: "1"],
-                                       [custbody_hc_order_id: "M1", order_line_id: "02", quantity_shipped: "0"]],
-                               hasMore: true]
-                            : [items: [[custbody_hc_order_id: "M2", order_line_id: "01", quantity_shipped: "2"]],
-                               hasMore: false]
+                    SuiteQlKeysetFake.page(rows, q, limit, { Map r -> [r.t as Long, r.l as Long] })
                 })
-        assertEquals([0, 2], offsets)
+        assertEquals([0, 0], offsets)
         assertEquals(3, result.recordCount)
         Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
         assertEquals([[orderId: "M1", orderLineId: "01", quantityShipped: "1"],
@@ -1541,7 +1540,7 @@ class NsSuiteQlQueryTemplateTest {
             sent << query
             return [items: [[tranid: "SO1", darpan_header_stamp: "2026-11-20 09:15:00"]], hasMore: false]
         })
-        assertEquals([q], sent)
+        assertEquals([q], sent.collect { SuiteQlKeysetFake.baseQuery(it) }, "one page, the query as built plus its page key (OC109)")
         Map doc = (Map) new groovy.json.JsonSlurper().parseText(out.toString())
         assertNull(doc.metadata.windowThru)
         assertEquals(true, doc.metadata.changedSince)

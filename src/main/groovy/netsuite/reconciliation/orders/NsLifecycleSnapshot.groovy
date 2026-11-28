@@ -210,19 +210,9 @@ class NsLifecycleSnapshot {
         return "${kind}|${JsonOutput.toJson(spec.get('matchRules'))}".toString()
     }
 
+    /** Every row of a query, paged by key (NsSuiteQlOrderSupport.eachPage): fails rather than truncate at maxPages. */
     private static void eachRow(String query, Closure pageFetcher, int maxPages, int size, Closure onRow) {
-        int offset = 0, pages = 0
-        boolean hasMore = true
-        while (hasMore) {
-            if (pages >= maxPages) {
-                throw new IllegalStateException("The lifecycle's records ran past ${maxPages} pages of ${size}; narrow the window.")
-            }
-            Map page = (Map) pageFetcher.call(query, size, offset)
-            pages++
-            ((List) (page?.get("items") ?: [])).each { onRow.call((Map) it) }
-            hasMore = page?.get("hasMore") == true
-            offset += size
-        }
+        NsSuiteQlOrderSupport.eachPage(query, size, maxPages, pageFetcher) { List items -> items.each { onRow.call((Map) it) } }
     }
 
     /** The row key the id column comes back under, or null when the spec does not select it. */

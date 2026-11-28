@@ -281,15 +281,16 @@ Closure livePage = { String query, int limit, int offset ->
     long pageStartedAt = System.currentTimeMillis()
     try {
         String token = NsTokenCache.getValidAccessToken(authCacheKey, tokenUrl) ?: mintToken()
+        // DAR-OPS-029 S41a (OC109): the query names the page (keyset paging; offset is always 0)
         resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, token, query, limit, offset) },
-                offset, pageRetryWarnings)
+                query, pageRetryWarnings)
         if (resp.statusCode() == 401) {
             // Token revoked or rotated NetSuite-side. Evict so the next mint is fresh,
             // then retry ONCE — a second 401 is a real credential problem, not a race.
             NsTokenCache.evict(authCacheKey)
             String freshToken = mintToken()
             resp = NsSuiteQlPageRetry.send({ -> sendSuiteQl(httpClient, suiteQlUrl, freshToken, query, limit, offset) },
-                    offset, pageRetryWarnings)
+                    query, pageRetryWarnings)
         }
     } finally {
         netsuiteTurn.close()
