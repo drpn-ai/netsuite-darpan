@@ -158,7 +158,7 @@ class NsStageReachQueryTest {
         String w = NsSuiteQlOrderSupport.buildConditionIdQuery(waived, NsSuiteQlOrderSupport.CONDITION_WAIVED, null, "2026-10-12", "2026-10-15")
         // Parenthesised: the rules are OR-ed and must not bind to the window's ANDs.
         assertTrue(w.contains("AND t.trandate < TO_DATE('2026-10-15', 'YYYY-MM-DD') " +
-                "AND (BUILTIN.DF(t.shipmethod) IN ('Store Pickup') OR t.custbody_hc_sales_channel IN ('POS Channel')) ORDER BY t.id"), w)
+                "AND ((BUILTIN.DF(t.shipmethod) IS NOT NULL AND BUILTIN.DF(t.shipmethod) IN ('Store Pickup')) OR (t.custbody_hc_sales_channel IS NOT NULL AND t.custbody_hc_sales_channel IN ('POS Channel'))) ORDER BY t.id"), w)
 
         Map<String, Object> matching = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "SalesOrd",
                 queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "itemsbackordered", op: "GT", values: ["0"]]]],

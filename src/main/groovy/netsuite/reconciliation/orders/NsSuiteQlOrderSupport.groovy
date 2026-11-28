@@ -1172,7 +1172,10 @@ class NsSuiteQlOrderSupport {
                     "AND woi.itemtype IN (${SHIPPED_ITEM_TYPES.collect { "'${it}'" }.join(', ')}) AND woi.itemid NOT IN (${named})))"
         }
         String column = field.startsWith("custbody") ? "t.${field}" : "BUILTIN.DF(t.${field})"
-        return "${column} IN (${named})"
+        // DAR-OPS-029 S41a (OC138): two-valued, never NULL. "column IN (...)" is NULL on an empty field, and inside
+        // NOT (has OR waived) that dropped a record with no stage and no exception value from every place (missing, past,
+        // excused), where the snapshot found it missing. An empty field does not excuse, on both paths.
+        return "(${column} IS NOT NULL AND ${column} IN (${named}))"
     }
 
     private static String linkedChildPredicate(boolean present, String childRecordType, String suffix, Map<String, Object> spec = null) {

@@ -704,15 +704,15 @@ class NsSuiteQlQueryTemplateTest {
         String absent = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
                                waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": [\"Store Pickup\"]}]"])
         assertTrue(absent.contains("AND NOT (EXISTS (SELECT 1 FROM nexttransactionlink l JOIN transaction c ON c.id = l.nextdoc " +
-                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C') OR BUILTIN.DF(t.shipmethod) IN ('Store Pickup'))"), absent)
+                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C') OR (BUILTIN.DF(t.shipmethod) IS NOT NULL AND BUILTIN.DF(t.shipmethod) IN ('Store Pickup')))"), absent)
         String present = query([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip",
                                 waiveRules: "[{\"fieldId\": \"shipmethod\", \"values\": [\"Store Pickup\", \"In Studio\"]}]"])
         assertTrue(present.contains("AND (EXISTS (SELECT 1 FROM nexttransactionlink l JOIN transaction c ON c.id = l.nextdoc " +
-                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C') OR BUILTIN.DF(t.shipmethod) IN ('Store Pickup', 'In Studio'))"), present)
+                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C') OR (BUILTIN.DF(t.shipmethod) IS NOT NULL AND BUILTIN.DF(t.shipmethod) IN ('Store Pickup', 'In Studio')))"), present)
         // A custom text field is compared as the text it holds.
         String custom = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
                                waiveRules: "[{\"fieldId\": \"custbody_hc_sales_channel\", \"values\": [\"POS Channel\"]}]"])
-        assertTrue(custom.contains("OR t.custbody_hc_sales_channel IN ('POS Channel'))"), custom)
+        assertTrue(custom.contains("OR (t.custbody_hc_sales_channel IS NOT NULL AND t.custbody_hc_sales_channel IN ('POS Channel')))"), custom)
     }
 
     // DAR-UI-050: an exception by item. A gift card (GFT-CP) never ships, so an order holding one and nothing else
@@ -734,7 +734,7 @@ class NsSuiteQlQueryTemplateTest {
         String excused = query([queryTemplate: "LINKED_CHILD_EXCUSED", absentChildRecordType: "ItemShip",
                                 waiveRules: [[fieldId: "shipmethod", values: ["Store Pickup"]], [fieldId: "item", values: ["GFT-CP"]]]])
         assertTrue(excused.contains("AND NOT EXISTS (SELECT 1 FROM nexttransactionlink l JOIN transaction c ON c.id = l.nextdoc " +
-                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C') AND (BUILTIN.DF(t.shipmethod) IN ('Store Pickup') OR (EXISTS"), excused)
+                "WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C') AND ((BUILTIN.DF(t.shipmethod) IS NOT NULL AND BUILTIN.DF(t.shipmethod) IN ('Store Pickup')) OR (EXISTS"), excused)
         String none = query([queryTemplate: "LINKED_CHILD_EXCUSED", absentChildRecordType: "ItemShip"])
         assertTrue(none.contains("c.type = 'ItemShip' AND c.status = 'C') AND 1 = 0"), none)
     }
@@ -744,7 +744,7 @@ class NsSuiteQlQueryTemplateTest {
     void aStageHoldsExceptionsOnSeveralFields() {
         String absent = query([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip",
                                waiveRules: [[fieldId: "shipmethod", values: ["Store Pickup"]], [fieldId: "item", values: ["GFT-CP"]]]])
-        assertTrue(absent.contains("c.type = 'ItemShip' AND c.status = 'C') OR BUILTIN.DF(t.shipmethod) IN ('Store Pickup') OR (EXISTS (SELECT 1 FROM transactionline wl"), absent)
+        assertTrue(absent.contains("c.type = 'ItemShip' AND c.status = 'C') OR (BUILTIN.DF(t.shipmethod) IS NOT NULL AND BUILTIN.DF(t.shipmethod) IN ('Store Pickup')) OR (EXISTS (SELECT 1 FROM transactionline wl"), absent)
         assertThrows(IllegalArgumentException) { spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", waiveRules: "{\"fieldId\":\"item\"}"]) }
     }
 
