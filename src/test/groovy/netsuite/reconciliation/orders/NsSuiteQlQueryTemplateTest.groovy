@@ -1079,6 +1079,33 @@ class NsSuiteQlQueryTemplateTest {
         assertFalse(query([:]).contains("transactionline"))
     }
 
+    // OC199: the line gate and the collection-method exclusion are refused wherever no branch reads them (the class's
+    // "refused rather than ignored" rule, as requireOverdueShipDate), never dropped so an operator believes a filter applies.
+    @Test
+    void theLineGateIsRefusedWhereNoBranchReadsIt() {
+        Map<String, Object> matching = [queryTemplate: "RECORDS_MATCHING", matchRules: [[fieldId: "status", values: ["Closed"]]]]
+        [[queryTemplate: "RECORDS"], matching, [queryTemplate: "STATE_CONTRADICTION", pendingStates: "B"]].each { Map<String, Object> shape ->
+            IllegalArgumentException e = assertThrows(IllegalArgumentException, { spec(shape + [requireFulfillableOpenLine: "Y"]) }, "${shape}")
+            assertTrue(e.message.contains("requireFulfillableOpenLine"), e.message)
+        }
+        // read by every linked-child template (the present one included) and by a shipment expectation
+        spec([queryTemplate: "LINKED_CHILD_PRESENT", presentChildRecordType: "ItemShip", requireFulfillableOpenLine: "Y"])
+        spec([queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip", requireFulfillableOpenLine: "Y"])
+        stateSpec([requireFulfillableOpenLine: "Y"])
+        // "N" is off, not a misplaced flag
+        spec([queryTemplate: "RECORDS", requireFulfillableOpenLine: "N"])
+    }
+
+    @Test
+    void theCollectionMethodExclusionIsRefusedOutsideTheOverdueBranch() {
+        [[queryTemplate: "RECORDS"], [queryTemplate: "LINKED_CHILD_ABSENT", absentChildRecordType: "ItemShip"],
+         [queryTemplate: "STATE_CONTRADICTION", statesExpectingShipment: "D,E"]].each { Map<String, Object> shape ->
+            IllegalArgumentException e = assertThrows(IllegalArgumentException, { spec(shape + [overdueExcludedShipMethods: "Store Pickup"]) }, "${shape}")
+            assertTrue(e.message.contains("overdueExcludedShipMethods"), e.message)
+        }
+        stateSpec([overdueExcludedShipMethods: "Store Pickup"])   // the pending (overdue) branch reads it
+    }
+
     // ---------------------------------------------------------------- the fences that must survive
 
     @Test

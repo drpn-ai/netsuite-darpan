@@ -427,12 +427,25 @@ class NsSuiteQlOrderSupport {
             throw new IllegalArgumentException("status expectations are only meaningful on " +
                     "${TEMPLATE_STATE_CONTRADICTION}; queryTemplate is ${queryTemplate}")
         }
+        // OC199: refused wherever no branch reads it, like requireOverdueShipDate. Every linked-child template appends the
+        // line gate, and STATE_CONTRADICTION's shipment branch carries it; RECORDS, RECORDS_MATCHING, ACTIVE_ITEMS and a
+        // state map with no shipment expectation would silently drop it.
+        if (requireFulfillableOpenLine && !(queryTemplate in LINK_TEMPLATES || queryTemplate == TEMPLATE_LINKED_CHILD_PRESENT
+                || (queryTemplate == TEMPLATE_STATE_CONTRADICTION && statesExpectingShipment))) {
+            throw new IllegalArgumentException("requireFulfillableOpenLine is only meaningful on a linked-child template or on " +
+                    "${TEMPLATE_STATE_CONTRADICTION} with statesExpectingShipment; queryTemplate is ${queryTemplate}")
+        }
 
         List<String> overdueExcludedShipMethods = parseShipMethodList(
                 query.get("overdueExcludedShipMethods"), "overdueExcludedShipMethods")
         if (overdueExcludedShipMethods && queryTemplate == TEMPLATE_SALES_LINES) {
             throw new IllegalArgumentException("overdueExcludedShipMethods is not meaningful on " +
                     "${TEMPLATE_SALES_LINES}; queryTemplate is ${queryTemplate}")
+        }
+        // OC199: only the overdue (pendingStates) branch excludes collection methods; anywhere else it would be dropped.
+        if (overdueExcludedShipMethods && !(queryTemplate == TEMPLATE_STATE_CONTRADICTION && pendingStates)) {
+            throw new IllegalArgumentException("overdueExcludedShipMethods is only meaningful on ${TEMPLATE_STATE_CONTRADICTION} " +
+                    "with pendingStates (the overdue branch); queryTemplate is ${queryTemplate}")
         }
 
         boolean requireOverdueShipDate = "Y".equalsIgnoreCase(text(query.get("requireOverdueShipDate")) ?: "N")
