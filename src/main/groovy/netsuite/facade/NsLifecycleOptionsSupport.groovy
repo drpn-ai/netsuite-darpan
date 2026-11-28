@@ -277,6 +277,7 @@ class NsLifecycleOptionsSupport {
     }
 
     static Map ruleOptionsForAccount(def ec, String authId, String recordType, String fieldId, String scope = null) {
+        if (!mayReadNetSuite(ec)) return [:]
         def auth = accessibleAccount(ec, authId)
         if (auth == null) return [:]
         try {
@@ -288,6 +289,15 @@ class NsLifecycleOptionsSupport {
         } catch (Exception e) {
             ec.message.addError("Could not read NetSuite account '${authId}': ${e.message}"); return [:]
         }
+    }
+
+    /**
+     * OC205: these options are live field values read with the account's credentials, so reading them takes run access on
+     * the active tenant, as the preview does; a view-only member (or its CLI key) is refused before any NetSuite call.
+     */
+    private static boolean mayReadNetSuite(def ec) {
+        return darpan.facade.common.TenantAccessSupport.requireActiveTenantRunAccess(
+                ec, "Your active tenant only has view access, so it cannot read NetSuite.")
     }
 
     /** The account when the active tenant may read through it (its own or shared, and not turned off); null with the error otherwise. */
@@ -303,6 +313,7 @@ class NsLifecycleOptionsSupport {
 
     /** The service: the account must be the active tenant's own or shared with it, as for every NetSuite read. */
     static Map forAccount(def ec, String authId, String recordType) {
+        if (!mayReadNetSuite(ec)) return [:]
         def auth = accessibleAccount(ec, authId)
         if (auth == null) return [:]
         try {

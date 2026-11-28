@@ -247,6 +247,51 @@ class NsSuiteQlQueryFacadeSupportTests {
         }
     }
 
+    private void grantSharedAccount(String configId, java.sql.Timestamp thru) {
+        ec.entity.makeValue("moqui.basic.EnumerationType").setAll([enumTypeId: "DarpanSharedConfigType",
+                description: "Darpan API source config types"]).createOrUpdate()
+        ec.entity.makeValue("moqui.basic.Enumeration").setAll([enumId: "SCFG_NS_AUTH", enumTypeId: "DarpanSharedConfigType",
+                description: "NetSuite auth config"]).createOrUpdate()
+        ec.entity.makeValue("darpan.auth.ConfigTenantAccess").setAll([configTypeEnumId: "SCFG_NS_AUTH", configId: configId,
+                tenantUserGroupId: "KREWE", fromDate: java.sql.Timestamp.valueOf("2026-01-01 00:00:00"), thruDate: thru]).createOrUpdate()
+    }
+
+    /** OC179: an existing check cannot be pointed at an account the tenant cannot use, and a granted one is usable until revoked. */
+    @Test
+    void anUpdateIsGatedTooAndAGrantCountsUntilItIsRevoked() {
+        ec.entity.makeValue("moqui.security.UserGroup").setAll([userGroupId: "GORJANA", description: "Gorjana"]).createOrUpdate()
+        def other = ec.entity.makeValue("darpan.reconciliation.NsAuthConfig").setAll([nsAuthConfigId: "GRANTED_NS_AUTH",
+                companyUserGroupId: "GORJANA", description: "another tenant's account", authType: "NONE", isActive: "Y"])
+        other.createOrUpdate()
+        try {
+            save(ctx([:]))
+            assertFalse(ec.message.hasError(), ec.message.errorsString)
+            // update: pointing the saved check at an account the tenant cannot use is refused, and the stored row keeps its own
+            save(ctx([nsAuthConfigId: "GRANTED_NS_AUTH"]))
+            assertTrue(ec.message.errorsString.contains("NetSuite account 'GRANTED_NS_AUTH' was not found."), ec.message.errorsString)
+            assertEquals(AUTH_ID, NsSuiteQlQueryFacadeSupport.getQuery(ec, lastId).get("nsAuthConfigId"))
+
+            // granted: the other tenant shares the account with this one, so the check may use it
+            ec.message.clearErrors()
+            grantSharedAccount("GRANTED_NS_AUTH", null)
+            save(ctx([nsAuthConfigId: "GRANTED_NS_AUTH"]))
+            assertFalse(ec.message.hasError(), ec.message.errorsString)
+            assertEquals("GRANTED_NS_AUTH", NsSuiteQlQueryFacadeSupport.getQuery(ec, lastId).get("nsAuthConfigId"))
+
+            // revoked: a grant that has ended no longer lets a check save on it
+            ec.message.clearErrors()
+            ec.entity.find("darpan.auth.ConfigTenantAccess").condition("configId", "GRANTED_NS_AUTH").disableAuthz().deleteAll()
+            grantSharedAccount("GRANTED_NS_AUTH", java.sql.Timestamp.valueOf("2026-02-01 00:00:00"))
+            save(ctx([nsAuthConfigId: "GRANTED_NS_AUTH", description: DESCRIPTION]))
+            assertTrue(ec.message.errorsString.contains("was not found"), ec.message.errorsString)
+        } finally {
+            ec.message.clearErrors()
+            ec.entity.find("darpan.auth.ConfigTenantAccess").condition("configId", "GRANTED_NS_AUTH").disableAuthz().deleteAll()
+            resetState()
+            other.delete()
+        }
+    }
+
     /** OC179: a check is saved only against an account the tenant may read through, so a saved check is one that runs. */
     @Test
     void aCheckOnAnAccountTheTenantCannotUseIsRefusedAndNotSaved() {

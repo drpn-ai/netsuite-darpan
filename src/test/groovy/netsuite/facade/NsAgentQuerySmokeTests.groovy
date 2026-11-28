@@ -277,6 +277,33 @@ class NsAgentQuerySmokeTests {
         }
     }
 
+    /**
+     * OC205: the lifecycle builder's dropdowns read live field values through the account's credentials, so a view-only
+     * member (or its CLI key) is refused before any NetSuite call, as the preview is. The seeded accounts hold no key, so
+     * a member who passes the gate stops at the local key check: nothing here reaches NetSuite.
+     */
+    @Test
+    void "OC205: a view-only member cannot read the lifecycle options through the account"() {
+        Map viewer = lifecycle(TENANT_VIEW, "get#LifecycleOptions", [nsAuthConfigId: "NSA_V"])
+        assertFalse(viewer.ok as boolean)
+        assertTrue("${viewer.errors}".contains("only has view access"), "${viewer.errors}")
+        Map viewerRules = lifecycle(TENANT_VIEW, "get#LifecycleRuleOptions", [nsAuthConfigId: "NSA_V", recordType: "SalesOrd"])
+        assertFalse(viewerRules.ok as boolean)
+        assertTrue("${viewerRules.errors}".contains("only has view access"), "${viewerRules.errors}")
+        // positive control: an editor passes the gate (and stops at the missing key, locally)
+        Map editor = lifecycle(TENANT_A, "get#LifecycleOptions", [nsAuthConfigId: "NSA_A"])
+        assertFalse("${editor.errors}".contains("only has view access"), "${editor.errors}")
+    }
+
+    private Map lifecycle(String tenant, String verbNoun, Map params) {
+        ec.user.setPreference(TenantAccessSupport.ACTIVE_TENANT_PREFERENCE_KEY, tenant)
+        ec.message.clearErrors()
+        Map out = (Map) ec.service.sync().name("facade.NetSuiteLifecycleFacadeServices.${verbNoun}".toString())
+                .parameters(params).disableAuthz().call()
+        ec.message.clearErrors()
+        return out
+    }
+
     @Test
     void "the client page method sits beside query"() {
         assertNotNull(NsSuiteQlClient.getDeclaredMethod("queryPage", String, int, int))
