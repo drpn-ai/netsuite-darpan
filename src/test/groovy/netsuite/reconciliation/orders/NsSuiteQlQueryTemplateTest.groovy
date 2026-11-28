@@ -85,8 +85,9 @@ class NsSuiteQlQueryTemplateTest {
     void invoiceExpectationIsItsOwnBranch() {
         String q = NsSuiteQlOrderSupport.buildRecordsQuery(stateSpec(), "2026-08-01", "2026-09-01", "2026-09-29")
 
-        assertTrue(q.contains("t.status IN ('D','G')"), q)
-        assertTrue(q.contains("c2.type = 'CustInvc'") || q.contains("'CustInvc'"), q)
+        // The branch itself: these states with no invoice linked (S41b: the old check also passed on any 'CustInvc').
+        assertTrue(q.contains("t.status IN ('D','G') AND NOT EXISTS (SELECT 1 FROM nexttransactionlink l2 " +
+                "JOIN transaction c2 ON c2.id = l2.nextdoc WHERE l2.previousdoc = t.id AND c2.type = 'CustInvc')"), q)
     }
 
     /** A status in no list is not reported. H closes with neither child and that is legitimate. */
@@ -94,7 +95,10 @@ class NsSuiteQlQueryTemplateTest {
     void unlistedStatesAreExcludedRatherThanReported() {
         String q = NsSuiteQlOrderSupport.buildRecordsQuery(stateSpec(), "2026-08-01", "2026-09-01", "2026-09-29")
 
-        assertFalse(q.contains("'H'"), q)
+        // Every status the query names is one the map lists (S41b: H was never configured, so its absence proved nothing).
+        Set<String> named = (q =~ /t\.status IN \(([^)]*)\)/).collect { List m -> ((String) m[1]).split(",")*.trim()*.replace("'", "") }
+                .flatten() as Set<String>
+        assertEquals(["B", "D", "E", "F", "G"] as Set, named, q)
     }
 
     /** Every finding says WHICH contradiction it is; a list of ids is not an actionable report. */
@@ -103,9 +107,10 @@ class NsSuiteQlQueryTemplateTest {
         String q = NsSuiteQlOrderSupport.buildRecordsQuery(stateSpec(), "2026-08-01", "2026-09-01", "2026-09-29")
 
         assertTrue(q.contains("AS contradiction"), q)
-        assertTrue(q.contains("OVERDUE_NOT_SHIPPED"), q)
-        assertTrue(q.contains("NOT_SHIPPED"), q)
-        assertTrue(q.contains("NOT_INVOICED"), q)
+        // Quoted: "NOT_SHIPPED" alone is also inside OVERDUE_NOT_SHIPPED and would pass without its own branch (S41b).
+        assertTrue(q.contains("'OVERDUE_NOT_SHIPPED'"), q)
+        assertTrue(q.contains("'NOT_SHIPPED'"), q)
+        assertTrue(q.contains("'NOT_INVOICED'"), q)
     }
 
     /**
@@ -657,7 +662,8 @@ class NsSuiteQlQueryTemplateTest {
         // "Shipped but never billed" — the revenue leak. Needs both, or it reports every unshipped order.
         String q = query([queryTemplate: "LINKED_CHILD_PRESENT_ABSENT",
                           presentChildRecordType: "ItemShip", absentChildRecordType: "CustInvc"])
-        assertTrue(q.contains("EXISTS (SELECT 1 FROM nexttransactionlink l " +
+        // "AND EXISTS": a bare "EXISTS (" also matches inside "NOT EXISTS (" (S41b).
+        assertTrue(q.contains("AND EXISTS (SELECT 1 FROM nexttransactionlink l " +
                 "JOIN transaction c ON c.id = l.nextdoc WHERE l.previousdoc = t.id AND c.type = 'ItemShip' AND c.status = 'C')"), q)
         assertTrue(q.contains("NOT EXISTS (SELECT 1 FROM nexttransactionlink l2 " +
                 "JOIN transaction c2 ON c2.id = l2.nextdoc WHERE l2.previousdoc = t.id AND c2.type = 'CustInvc')"), q)
@@ -1287,7 +1293,7 @@ class NsSuiteQlQueryTemplateTest {
     // ------------------------------------------------- ACTIVE_ITEMS (DAR-BE-157)
 
     // The item read: every non-inactive stock item, kit and non-inventory item. Whether NetSuite used it for HotWax is read
-    // apart (ACTIVE_ITEMS_USED_SQL) and joined in the extract: as one query, the per-item test timed out at 180 s a page.
+    // apart (buildActiveItemsUsedQuery) and joined in the extract: as one query, the per-item test timed out at 180 s a page.
     // No stock: nothing reads it since live stopped counting it, and its per-item sub-select was a quarter of the read.
     private static final String ACTIVE_ITEMS_SQL = "SELECT i.id, i.itemid, i.itemtype, TO_CHAR(i.createddate, 'YYYY-MM-DD') AS created " +
             "FROM item i WHERE i.isinactive = 'F' AND i.itemtype IN ('InvtPart', 'Kit', 'NonInvtPart') "
@@ -1609,8 +1615,9 @@ class NsSuiteQlQueryTemplateTest {
                 assertTrue(e.message.contains(template), e.message)
                 assertTrue(e.message.contains("RECORDS") && e.message.contains("SALES_LINES"), e.message)
             }
-            // the query builder refuses too, however the spec came to be marked
-            assertThrows(IllegalArgumentException, { sql(s + [changedSince: true, stamped: true]) }, template)
+            // the query builder refuses too, however the spec came to be marked, and for the same reason
+            IllegalArgumentException built = assertThrows(IllegalArgumentException, { sql(s + [changedSince: true, stamped: true]) }, template)
+            assertTrue(built.message.contains(template), built.message)
         }
         // RECORDS on a table with no lines has no line stamp to read
         Map<String, Object> customers = NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q1", recordType: "Customer",
@@ -1643,7 +1650,8 @@ class NsSuiteQlQueryTemplateTest {
                 }, "${named} ${mode}")
                 assertTrue(e.message.contains(named) && e.message.contains("cannot be kept"), e.message)
             }
-            assertThrows(IllegalArgumentException, { sql(s + [changedSince: true, stamped: true]) }, named)
+            IllegalArgumentException built = assertThrows(IllegalArgumentException, { sql(s + [changedSince: true, stamped: true]) }, named)
+            assertTrue(built.message.contains(named) && built.message.contains("cannot be kept"), built.message)
             // a run read sends the same query as before
             assertFalse(NsSuiteQlOrderSupport.applyReadMode(new LinkedHashMap(s), "trandate", false).containsKey("stamped"), named)
         }
@@ -1708,7 +1716,9 @@ class NsSuiteQlQueryTemplateTest {
                 NsSuiteQlOrderSupport.applyChangedSince(new LinkedHashMap(s), "2026-11-24")
             }, named)
             assertTrue(e.message.startsWith("Not read by what changed: ") && e.message.contains(named), e.message)
-            assertThrows(IllegalArgumentException, { sql(new LinkedHashMap(s) + [changedFrom: "2026-11-24"]) }, "${named}: however the spec was marked")
+            IllegalArgumentException built = assertThrows(IllegalArgumentException, { sql(new LinkedHashMap(s) + [changedFrom: "2026-11-24"]) },
+                    "${named}: however the spec was marked")
+            assertTrue(built.message.startsWith("Not read by what changed: ") && built.message.contains(named), built.message)
         }
         Map<String, Object> byKey = spec([:]) + [lookupKeys: ["SO1"], lookupKeyField: "tranId"]
         assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.applyChangedSince(byKey, "2026-11-24") }
