@@ -1347,7 +1347,7 @@ class NsSuiteQlOrderSupport {
      * DAR-BE-318 (plan 3b-2b, Ruling 3b2b-12): the field a SALES_LINES line with no HotWax line id is written with ("Y"),
      * after the projection. The connector's declared Keep line (data/NetSuiteConnectorSeedData.xml, keepLinesJson) sets it
      * aside in Spark as "0:orderLineId", as the extractor did. It is a field like any other: downloads and the run builder
-     * show it (AutomationFacadeSupport.SUITEQL_TEMPLATE_FIELDS; NsSuiteQlTemplateFieldsSyncTests keeps the two equal).
+     * show it (AutomationSourceOptionsSupport.SUITEQL_TEMPLATE_FIELDS; NsSuiteQlTemplateFieldsSyncTests keeps the two equal).
      */
     static final String UNKEYED_LINE_FIELD = "nsUnkeyedLine"
     /** The fields SALES_LINES derives itself, beside the template's row columns (TEMPLATE_RECORD_COLUMNS). */
