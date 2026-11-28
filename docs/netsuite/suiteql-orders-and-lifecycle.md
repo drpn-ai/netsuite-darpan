@@ -21,8 +21,8 @@ the inventory RESTlet services, which never went live and were deleted (DAR-OPS-
 
 Entities are not defined here. `NsAuthConfig`, `NsSuiteQlSourceQuery`, `NsSuiteQlSourceQueryField` and
 `NsRestletConfig` live in the `darpan` component's `entity/ReconciliationEntities.xml`.
-`entity/NetSuiteConfigEntities.xml` in this component is intentionally empty: a definition added there
-would silently overwrite the canonical one. The `NETSUITE_SUITEQL` connector row is seeded by darpan's
+This component defines no entities (its empty entity file was deleted, DAR-OPS-029 S41b): a definition
+added here would silently overwrite the canonical one. The `NETSUITE_SUITEQL` connector row is seeded by darpan's
 `data/SourceSystemConnectorSeedData.xml`.
 
 Lifecycle authoring (`save#Lifecycle`, `save#LifecycleStages`, stage exceptions, findings,
