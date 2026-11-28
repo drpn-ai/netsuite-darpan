@@ -186,13 +186,6 @@ class NsLifecycleOptionsSupport {
     static final String NO_VALUE = "NO_VALUE"
 
     /**
-     * The rule dropdowns: the text fields NetSuite shows on this record type, by their own names, and, given one of
-     * them, what it holds over the last 30 days, most common first, empty as "No value". A field with a value per
-     * record (an order id) has more than a page of values; the first page is enough, since "No value" sorts first.
-     *
-     * @param suiteQl (sql, firstPageOnly) -> rows
-     */
-    /**
      * Standard list fields a stage exception may name, read by display name (BUILTIN.DF): Store Pickup orders never
      * ship, and Shipping Method is how NetSuite says so. Not offered for leaving records out, whose column cannot wrap
      * BUILTIN.DF in NVL. Item names items on the record's lines (a gift card never ships): see NsSuiteQlOrderSupport's
@@ -218,6 +211,13 @@ class NsLifecycleOptionsSupport {
     static final Map<String, List<String>> FINDING_THRESHOLDS = [itemsbackordered: ["0", "1", "2", "5", "10"],
                                                                  total: ["0", "50", "100", "500", "1000"]].asImmutable()
 
+    /**
+     * The rule dropdowns: the text fields NetSuite shows on this record type, by their own names, and, given one of
+     * them, what it holds over the last 30 days, most common first, empty as "No value". A field with a value per
+     * record (an order id) has more than a page of values; the first page is enough, since "No value" sorts first.
+     *
+     * @param suiteQl (sql, firstPageOnly) -> rows
+     */
     static Map ruleOptions(String recordType, String fieldId, LocalDate today, Closure<List<Map>> suiteQl, boolean forStage = false,
                            boolean forFinding = false) {
         LifecycleStageCompiler.words(recordType)
@@ -271,7 +271,7 @@ class NsLifecycleOptionsSupport {
     }
 
     /** A status reads "Sales Order : Closed"; the record type is already known, so the label is "Closed". */
-    static String standardValueLabel(String value) {
+    private static String standardValueLabel(String value) {
         int at = value.indexOf(" : ")
         return at > 0 ? value.substring(at + 3) : value
     }
@@ -281,7 +281,7 @@ class NsLifecycleOptionsSupport {
         if (auth == null) return [:]
         try {
             NsSuiteQlClient client = new NsSuiteQlClient(auth)
-            return ruleOptions(recordType, fieldId, ec.user.nowTimestamp.toLocalDateTime().toLocalDate(), { String q, boolean firstPage ->
+            return ruleOptions(recordType, fieldId, tenantToday(ec), { String q, boolean firstPage ->
                 client.query(q, firstPage) }, scope == "STAGE", scope == "FINDING")
         } catch (IllegalArgumentException e) {
             ec.message.addError(e.message); return [:]
@@ -307,12 +307,18 @@ class NsLifecycleOptionsSupport {
         if (auth == null) return [:]
         try {
             NsSuiteQlClient client = new NsSuiteQlClient(auth)
-            return options(recordType, ec.user.nowTimestamp.toLocalDateTime().toLocalDate()) { String q -> client.query(q) }
+            return options(recordType, tenantToday(ec)) { String q -> client.query(q) }
         } catch (IllegalArgumentException e) {
             ec.message.addError(e.message); return [:]
         } catch (Exception e) {
             ec.message.addError("Could not read NetSuite account '${authId}': ${e.message}"); return [:]
         }
+    }
+
+    /** Today in the active tenant's zone, as previewQuery reads it; the server's own date is a day off near midnight (S41b F4). */
+    private static LocalDate tenantToday(def ec) {
+        return ec.user.nowTimestamp.toInstant().atZone(java.time.ZoneId.of(
+                darpan.facade.common.TenantAccessSupport.resolveActiveTenantTimeZone(ec) as String)).toLocalDate()
     }
 
     private static String window(String col, LocalDate from, LocalDate thruExclusive) {

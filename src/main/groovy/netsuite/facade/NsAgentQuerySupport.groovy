@@ -20,8 +20,12 @@ class NsAgentQuerySupport {
     static final int NS_PAGE_MAX = NsSuiteQlClient.PAGE_LIMIT
     static final Duration HTTP_TIMEOUT = Duration.ofSeconds(45)
 
+    private static final Closure DEFAULT_CLIENT_FACTORY = { def auth, Duration timeout -> new NsSuiteQlClient(auth, timeout) }
     /** Test seam: (authConfig, requestTimeout) -> client. */
-    static Closure clientFactory = { def auth, Duration timeout -> new NsSuiteQlClient(auth, timeout) }
+    static Closure clientFactory = DEFAULT_CLIENT_FACTORY
+
+    /** Puts the client seam back (StaticSeamResetGuardTests rule for a mutable static). */
+    static void resetForTests() { clientFactory = DEFAULT_CLIENT_FACTORY }
 
     /** The AgentQuerySupport.run answer, or null with an error on ec when the caller may not read through this account. */
     static Map runAgentQuery(def ec, Map context) {
