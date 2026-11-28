@@ -162,6 +162,9 @@ class NsLifecycleSnapshotTest {
         assertFalse(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "trandate", true)))
         assertFalse(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", true)))
         assertFalse(NsLifecycleSnapshot.canAnswer(NsSuiteQlOrderSupport.applyReadMode(spec([:]), "darpanStamp", null)))
+        // QA D4: an audit's read by change holds only the changed records, never a whole window's (keyFor does not name it)
+        assertFalse(NsLifecycleSnapshot.canAnswer(spec([:]) + [changedFrom: "2026-10-12"]))
+        assertFalse(NsLifecycleSnapshot.canAnswer(spec([:]) + [changedOrderIds: ["M1"]]))
     }
 
     // Snapshots are kept per exactly what was read: another window, record type or account is another snapshot.

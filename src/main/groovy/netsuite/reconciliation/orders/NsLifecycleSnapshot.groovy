@@ -23,9 +23,8 @@ import java.nio.charset.StandardCharsets
  * Exact or not at all: a question is answered here only when its template is one of the shapes below, it carries none
  * of the gates the shapes do not model, and every column it selects was read. Anything else is asked live.
  *
- * One deliberate difference from the live SQL, three-valued logic: live, "NOT (has OR waived)" is NULL when the
- * exception's field is empty (BUILTIN.DF(t.shipmethod) IN (...) on an order with no shipping method), so that record
- * was found by no question and sat in no place. Here an empty field does not excuse, so it is found missing the stage.
+ * The live SQL answers the same (DAR-OPS-029 OC138: an exception is two-valued there too, so an empty field does not excuse on
+ * either path); NsLifecycleLiveSqlParityTest runs the live templates against these admits.
  */
 class NsLifecycleSnapshot {
 
@@ -63,6 +62,8 @@ class NsLifecycleSnapshot {
         if (!(spec.get("queryTemplate") in TEMPLATES)) return false
         // DAR-BE-318: a dataset read carries stamps (and may read by what changed) that a window snapshot does not hold
         if (spec.get("stamped") || spec.get("changedSince")) return false
+        // an audit's read by change holds only what changed, never the window (DAR-BE-320; keyFor does not name it)
+        if (spec.get("changedFrom") || spec.get("changedOrderIds")) return false
         if (spec.get("fromTable") != NsSuiteQlOrderSupport.DEFAULT_FROM_TABLE) return false
         if (spec.get("requireFulfillableOpenLine") || spec.get("requireOverdueShipDate")) return false
         if (spec.get("requireParentRecordType") || spec.get("amountColumn") || spec.get("lineKeyColumn")) return false

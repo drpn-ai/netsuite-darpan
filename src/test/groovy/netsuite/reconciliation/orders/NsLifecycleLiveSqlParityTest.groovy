@@ -81,7 +81,8 @@ class NsLifecycleLiveSqlParityTest {
         assertTrue(live.past.containsAll(live.excused), "an excused record passes the stage")
         assertEquals([5L, 6L] as Set, live.missing, "an empty exception field does not excuse")
 
-        NsLifecycleSnapshot snapshot = NsLifecycleSnapshot.read(spec("RECORDS", [:]), FROM, TO, dir, fetcher)
+        assertTrue(pagesRun.any { it.contains(" > ") }, "later pages ran as SQL: ${pagesRun}")
+        NsLifecycleSnapshot snapshot = NsLifecycleSnapshot.read(spec("RECORDS", [:]), FROM, TO, dir, fetcher, 10, 2)
         try {
             [missing: spec("LINKED_CHILD_ABSENT", [absentChildRecordType: "ItemShip"]),
              past   : spec("LINKED_CHILD_PRESENT", [presentChildRecordType: "ItemShip"]),
@@ -94,18 +95,41 @@ class NsLifecycleLiveSqlParityTest {
         }
     }
 
+    /**
+     * DAR-OPS-029 S41a (QA D1): the two-column page key as SQL. An order's lines fall either side of every page break at one row a
+     * page; each line is read once and in (order, line) order, so the composite condition is exactly "after (order, line)".
+     */
+    @Test
+    void aTwoColumnKeyPagesEveryLineOnceAsSql() {
+        run("CREATE TABLE transactionline (id BIGINT, transaction BIGINT, mainline VARCHAR(1))")
+        [[1, 11], [1, 12], [1, 13], [2, 21], [4, 41], [4, 42]].each { List<Integer> l ->
+            run("INSERT INTO transactionline VALUES (${l[1]}, ${l[0]}, 'F')".toString())
+        }
+        String query = "SELECT tl.id AS line FROM transaction t JOIN transactionline tl ON tl.transaction = t.id " +
+                "WHERE t.type = 'SalesOrd' AND tl.mainline = 'F' ORDER BY t.id, tl.id"
+        List<String> lines = []
+        [1, 2, 4].each { int pageSize ->
+            lines.clear()
+            NsSuiteQlOrderSupport.eachPage(query, pageSize, 20, fetcher) { List items -> items.each { lines << ((Map) it).line } }
+            assertEquals(["11", "12", "13", "21", "41", "42"], lines, "page size ${pageSize}")
+        }
+        assertTrue(pagesRun.any { it.contains("(t.id > 1 OR (t.id = 1 AND tl.id > 12))") }, pagesRun.join("\n"))
+    }
+
     // ---- the stand-in NetSuite ----
 
     private Set<Long> liveIds(Map<String, Object> spec) {
         Set<Long> ids = [] as Set
-        NsSuiteQlOrderSupport.eachPage(NsSuiteQlOrderSupport.buildRecordsQuery(spec, FROM, TO), 1000, 10, fetcher) { List items ->
+        NsSuiteQlOrderSupport.eachPage(NsSuiteQlOrderSupport.buildRecordsQuery(spec, FROM, TO), 2, 10, fetcher) { List items ->
             items.each { ids.add(((Map) it).id as Long) }
         }
         return ids
     }
 
-    /** Runs the page's SuiteQL on H2 and answers every row (one page: the windows here are small). */
+    /** Runs the page's SuiteQL on H2 and answers its first limit rows, saying whether more follow, as SuiteQL does at offset 0. */
     private Closure fetcher = { String query, int limit, int offset ->
+        assertEquals(0, offset, "keyset pages never move the offset")
+        pagesRun << query
         List<Map> rows = []
         db.createStatement().withCloseable { st ->
             ResultSet rs = st.executeQuery(query)
@@ -116,8 +140,10 @@ class NsLifecycleLiveSqlParityTest {
                 rows << row
             }
         }
-        return [items: rows, hasMore: false]
+        return [items: rows.take(limit), hasMore: rows.size() > limit]
     }
+
+    private List<String> pagesRun = []
 
     private static Map<String, Object> spec(String template, Map<String, Object> extra) {
         Map<String, Object> query = [nsSuiteQlSourceQueryId: "Q", recordType: "SalesOrd", fromTable: "transaction", dateColumn: "trandate",

@@ -1351,7 +1351,9 @@ class NsSuiteQlQueryTemplateTest {
     void theUsedItemsAreHotWaxOrderAndTransferOrderLinesOfTheYear() {
         assertEquals("SELECT DISTINCT tl.item AS item FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
                 "WHERE t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') " +
-                "AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL) OR t.type IN ('TrnfrOrd', 'PurchOrd')) ORDER BY tl.item",
+                "AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL) OR t.type IN ('TrnfrOrd', 'PurchOrd')) " +
+                // DAR-OPS-029 S41a (QA D5): no line without an item, so the read's rows do not depend on its page size
+                "AND tl.item IS NOT NULL ORDER BY tl.item",
                 NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec(), "2026-10-28"))
         Map<String, Object> s = activeItemsSpec()
         s.lookupKeyField = "field1"
@@ -1365,9 +1367,9 @@ class NsSuiteQlQueryTemplateTest {
     @Test
     void aQueryMayCountUseOnSomeOrderTypesOnly() {
         String used = NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec([usedTransactionTypes: "TrnfrOrd, PurchOrd"]), "2026-10-28")
-        assertTrue(used.contains("WHERE t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') AND t.type IN ('TrnfrOrd', 'PurchOrd') ORDER BY tl.item"), used)
+        assertTrue(used.contains("WHERE t.trandate >= TO_DATE('2025-10-28', 'YYYY-MM-DD') AND t.type IN ('TrnfrOrd', 'PurchOrd') AND tl.item IS NOT NULL ORDER BY tl.item"), used)
         assertTrue(NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec([usedTransactionTypes: "SalesOrd"]), "2026-10-28")
-                .contains("AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL)) ORDER BY"), "a sales order still counts only when HotWax sent it")
+                .contains("AND ((t.type = 'SalesOrd' AND t.custbody_hc_order_id IS NOT NULL)) AND tl.item IS NOT NULL ORDER BY"), "a sales order still counts only when HotWax sent it")
         assertEquals(NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec(), "2026-10-28"),
                 NsSuiteQlOrderSupport.buildActiveItemsUsedQuery(activeItemsSpec([usedTransactionTypes: "SalesOrd,TrnfrOrd,PurchOrd"]), "2026-10-28"),
                 "blank means all three")

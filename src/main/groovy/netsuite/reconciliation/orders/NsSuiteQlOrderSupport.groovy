@@ -292,6 +292,15 @@ class NsSuiteQlOrderSupport {
         }
 
         String queryTemplate = (text(query.get("queryTemplate")) ?: TEMPLATE_RECORDS).toUpperCase()
+        // DAR-OPS-029 S41a (QA D3): RECORDS sorts and pages by the bare name id (eachPage). A field aliased id that is not the id
+        // column would make ORDER BY id sort by that alias while the page key reads the real id, and rows would be skipped.
+        if (queryTemplate == TEMPLATE_RECORDS) {
+            Map<String, Object> aliasedId = normalized.find { it.get("rowKey") == "id" && ((String) it.get("sourceColumn")).trim() != "id" }
+            if (aliasedId) {
+                throw new IllegalArgumentException("Field ${aliasedId.get('recordFieldName')} is read AS id from ${aliasedId.get('sourceColumn')}; " +
+                        "a ${TEMPLATE_RECORDS} query sorts and pages by its id column, so only id may be read as id")
+            }
+        }
         if (!QUERY_TEMPLATES.contains(queryTemplate)) {
             // Deliberately not defaulting to RECORDS: a typo'd template would silently run a plain
             // windowed extract and report every row as a finding.
@@ -1434,6 +1443,9 @@ class NsSuiteQlOrderSupport {
         String use = uses.size() == 1 && !types.contains("SalesOrd") ? uses[0] : "(${uses.join(' OR ')})"
         return ("SELECT DISTINCT tl.item AS item FROM transactionline tl JOIN transaction t ON t.id = tl.transaction " +
                 "WHERE t.trandate >= TO_DATE('${cutoff}', 'YYYY-MM-DD') AND ${use} " +
+                // a line with no item (a header or a summary line) is no item's use; kept out, a NULL would sort last and be
+                // read or not by page size alone (DAR-OPS-029 S41a)
+                "AND tl.item IS NOT NULL " +
                 byKey + "ORDER BY tl.item").toString()
     }
 

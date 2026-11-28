@@ -367,6 +367,43 @@ class NsSuiteQlOrderSupportTest {
         assertEquals(4, result.recordCount)
     }
 
+    /** QA D1: the page queries exactly, so a wrong operator or a swapped column in the key condition cannot pass unseen. */
+    @Test
+    void thePagedQueryTextIsExact() {
+        String one = "SELECT tranid FROM transaction WHERE type = 'SalesOrd' ORDER BY id"
+        assertEquals("SELECT id AS darpan_page_key, tranid FROM transaction WHERE type = 'SalesOrd' ORDER BY id",
+                NsSuiteQlOrderSupport.pagedQuery(one, ["id"], null))
+        assertEquals("SELECT id AS darpan_page_key, tranid FROM transaction WHERE type = 'SalesOrd' AND id > 2000 ORDER BY id",
+                NsSuiteQlOrderSupport.pagedQuery(one, ["id"], ["2000"]))
+        String two = "SELECT t.tranid FROM transaction t JOIN transactionline tl ON tl.transaction = t.id WHERE t.type = 'SalesOrd' ORDER BY t.id, tl.id"
+        assertEquals("SELECT t.id AS darpan_page_key, tl.id AS darpan_page_key2, t.tranid FROM transaction t JOIN transactionline tl " +
+                "ON tl.transaction = t.id WHERE t.type = 'SalesOrd' AND (t.id > 10 OR (t.id = 10 AND tl.id > 102)) ORDER BY t.id, tl.id",
+                NsSuiteQlOrderSupport.pagedQuery(two, NsSuiteQlOrderSupport.pageKeys(two), ["10", "102"]))
+        String distinct = "SELECT DISTINCT tl.item AS item FROM transactionline tl WHERE tl.item IS NOT NULL ORDER BY tl.item"
+        assertEquals("SELECT DISTINCT tl.item AS darpan_page_key, tl.item AS item FROM transactionline tl WHERE tl.item IS NOT NULL " +
+                "AND tl.item > 7 ORDER BY tl.item", NsSuiteQlOrderSupport.pagedQuery(distinct, ["tl.item"], ["7"]))
+        // the outer ORDER BY is the key, not one inside a LISTAGG ... WITHIN GROUP (ORDER BY ...) in the select list
+        assertEquals(["t.id"], NsSuiteQlOrderSupport.pageKeys("SELECT (SELECT LISTAGG(x, '|') WITHIN GROUP (ORDER BY l.id) FROM l) AS y FROM transaction t WHERE 1 = 1 ORDER BY t.id"))
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.pageKeys("SELECT a FROM t WHERE 1 = 1 ORDER BY a, b, c") }
+        assertThrows(IllegalArgumentException) { NsSuiteQlOrderSupport.pageKeys("SELECT a FROM t WHERE 1 = 1 ORDER BY UPPER(a)") }
+    }
+
+    /**
+     * QA D3: RECORDS sorts by the bare name id. A field aliased id that is not the id column would make ORDER BY id sort by the
+     * alias while the page key reads the real id, and keyset paging would skip rows; such a field is refused.
+     */
+    @Test
+    void aRecordsFieldAliasedIdThatIsNotTheIdColumnIsRefused() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException) {
+            NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q", recordType: "SalesOrd"],
+                    [[recordFieldName: "orderName", sourceColumn: "tranid AS id", sequenceNum: 1]])
+        }
+        assertTrue(thrown.message.contains("id"), thrown.message)
+        // the id column itself, aliased or not, stays legal
+        NsSuiteQlOrderSupport.normalizeSpec([nsSuiteQlSourceQueryId: "Q", recordType: "SalesOrd"],
+                [[recordFieldName: "internalId", sourceColumn: "id", sequenceNum: 1]])
+    }
+
     /** OC109: NetSuite answering more to come with an empty page would leave no key to continue from: the read fails. */
     @Test
     void anEmptyPageThatSaysMoreFails() {
